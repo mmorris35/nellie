@@ -36,7 +36,7 @@ sqlite-vec = "0.1"
 
 # Embeddings (ONNX Runtime)
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
-ndarray = "0.16"
+ndarray = "0.17"
 tokenizers = "0.20"
 
 # File watching
