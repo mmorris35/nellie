@@ -1,0 +1,83 @@
+# Nellie Configuration Example
+# Copy to config.yaml and customize for your environment
+
+# Server configuration
+server:
+  # Bind address for HTTP server
+  host: "127.0.0.1"
+  # Port for HTTP server (MCP endpoints, REST API, dashboard)
+  port: 8765
+
+# Data persistence
+data:
+  # Where Nellie stores its SQLite database and vector indexes
+  # Supports tilde expansion: ~ expands to home directory
+  dir: "~/.local/share/nellie"
+
+# File watching and indexing
+watch:
+  # Directories to index for semantic code search
+  # Paths are scanned recursively with gitignore patterns respected
+  # Examples:
+  #   - "/home/user/projects/my-app"
+  #   - "/home/user/github/nellie"
+  # Leave empty to disable auto-watching (use index_repo MCP tool instead)
+  paths: []
+
+# Knowledge graph configuration
+graph:
+  # Enable/disable the knowledge graph (Nellie-V)
+  # When enabled, relationships between entities are tracked and expanded in search
+  enabled: true
+
+# Structural code analysis
+structural:
+  # Enable/disable tree-sitter based structural code search
+  # Extracts function/class definitions and enables symbol-aware querying
+  # Supported languages: Python, TypeScript, JavaScript, Rust, Go
+  enabled: false
+
+# Claude Code Deep Hooks integration
+deep_hooks:
+  # Enable/disable Deep Hooks sync and ingest daemon
+  # When enabled, Nellie automatically syncs memories to Claude Code
+  # and ingests completed session transcripts
+  enabled: true
+  # How often to check for new transcripts (minutes)
+  sync_interval: 30
+
+# Optional: Restrict which hostname can run this instance
+# Prevents accidental startup on the wrong machine
+# Leave empty or comment out to allow any hostname
+# allowed_hostname: ""
+
+# Embedding service configuration (optional)
+# embeddings:
+#   # Use remote embedding service instead of local ONNX model
+#   # Useful for low-memory systems or cloud deployments
+#   remote_url: "http://localhost:8000/embed"
+#   # API key if required
+#   api_key: ""
+
+# Claude Code paths (usually auto-detected, override only if needed)
+# claude_code:
+#   # Base directory for Claude Code projects and memory
+#   projects_dir: "~/.claude/projects"
+#   # Directory for global rules
+#   rules_dir: "~/.claude/rules"
+
+# Logging configuration (optional)
+# tracing:
+#   # Log level: trace, debug, info, warn, error
+#   level: "info"
+#   # Output format: compact, pretty, json
+#   format: "compact"
+
+# API configuration (optional)
+# api:
+#   # Enable REST API (in addition to MCP)
+#   enabled: true
+#   # Enable web dashboard at http://host:port/dashboard
+#   dashboard: true
+#   # API key for authentication (if empty, no auth required)
+#   api_key: ""

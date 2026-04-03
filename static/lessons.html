@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie - Lessons</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui">Dashboard</a>
+            <a href="/ui/search">Search</a>
+            <a href="/ui/lessons" class="active">Lessons</a>
+            <a href="/ui/checkpoints">Checkpoints</a>
+            <a href="/ui/files">Files</a>
+            <a href="/ui/graph">Graph</a>
+            <a href="/ui/metrics">Metrics</a>
+        </div>
+    </nav>
+
+    <main>
+        <h1>Lessons Learned</h1>
+
+        <details class="add-form-toggle">
+            <summary class="btn btn-secondary">+ Add Lesson</summary>
+            <form class="add-form"
+                  hx-post="/api/v1/lessons"
+                  hx-target="#lesson-list"
+                  hx-swap="innerHTML"
+                  hx-on::after-request="if(event.detail.successful) { this.reset(); this.parentElement.open=false; refreshLessons(); }">
+                <label>Title
+                    <input type="text" name="title" required placeholder="Brief lesson title">
+                </label>
+                <label>Content
+                    <textarea name="content" required rows="4" placeholder="Detailed description..."></textarea>
+                </label>
+                <label>Severity
+                    <select name="severity">
+                        <option value="info">Info</option>
+                        <option value="warning">Warning</option>
+                        <option value="critical">Critical</option>
+                    </select>
+                </label>
+                <label>Tags (comma-separated)
+                    <input type="text" name="tags" placeholder="rust, performance, bug">
+                </label>
+                <button type="submit" class="btn">Save Lesson</button>
+            </form>
+        </details>
+
+        <div class="filter-bar">
+            <button class="btn btn-small" onclick="filterLessons('')">All</button>
+            <button class="btn btn-small" onclick="filterLessons('critical')">Critical</button>
+            <button class="btn btn-small" onclick="filterLessons('warning')">Warning</button>
+            <button class="btn btn-small" onclick="filterLessons('info')">Info</button>
+        </div>
+
+        <div id="lesson-list"
+             hx-get="/api/v1/lessons?limit=50"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+            <p class="muted">Loading lessons...</p>
+        </div>
+    </main>
+
+    <script>
+    function refreshLessons(severity) {
+        let url = '/api/v1/lessons?limit=50';
+        if (severity) url += '&severity=' + severity;
+        htmx.ajax('GET', url, '#lesson-list');
+    }
+
+    function filterLessons(severity) {
+        refreshLessons(severity);
+    }
+
+    function deleteLesson(id) {
+        if (!confirm('Delete this lesson?')) return;
+        fetch('/api/v1/lessons/' + id, { method: 'DELETE' })
+            .then(function() { refreshLessons(); });
+    }
+
+    document.body.addEventListener('htmx:beforeSwap', function(event) {
+        if (event.detail.target.id === 'lesson-list') {
+            try {
+                const data = JSON.parse(event.detail.serverResponse);
+                if (data.lessons.length === 0) {
+                    event.detail.serverResponse = '<p class="muted">No lessons yet.</p>';
+                    return;
+                }
+
+                let html = '<p class="result-count">' + data.total + ' lessons</p>';
+                data.lessons.forEach(function(l) {
+                    const date = new Date(l.created_at * 1000).toLocaleDateString();
+                    const tags = l.tags.map(function(t) {
+                        return '<span class="tag">' + escapeHtml(t) + '</span>';
+                    }).join(' ');
+
+                    html += '<div class="lesson-card severity-' + l.severity + '">' +
+                        '<div class="lesson-header">' +
+                            '<strong>' + escapeHtml(l.title) + '</strong>' +
+                            '<span class="severity-badge severity-' + l.severity + '">' + l.severity + '</span>' +
+                            '<button class="btn btn-small btn-danger" onclick="deleteLesson(\'' + l.id + '\')">Delete</button>' +
+                        '</div>' +
+                        '<p>' + escapeHtml(l.content) + '</p>' +
+                        '<div class="lesson-meta">' + date + ' ' + tags + '</div>' +
+                        '</div>';
+                });
+                event.detail.serverResponse = html;
+            } catch(e) {}
+        }
+    });
+
+    // Handle form submission - convert tags string to JSON array
+    document.body.addEventListener('htmx:configRequest', function(event) {
+        if (event.detail.path === '/api/v1/lessons' && event.detail.verb === 'post') {
+            const params = event.detail.parameters;
+            if (typeof params.tags === 'string') {
+                params.tags = params.tags.split(',').map(function(t) { return t.trim(); }).filter(Boolean);
+            }
+            event.detail.headers['Content-Type'] = 'application/json';
+            event.detail.parameters = JSON.stringify(params);
+        }
+    });
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    </script>
+</body>
+</html>

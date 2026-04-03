@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie - Search</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui">Dashboard</a>
+            <a href="/ui/search" class="active">Search</a>
+            <a href="/ui/lessons">Lessons</a>
+            <a href="/ui/checkpoints">Checkpoints</a>
+            <a href="/ui/files">Files</a>
+            <a href="/ui/graph">Graph</a>
+            <a href="/ui/metrics">Metrics</a>
+        </div>
+    </nav>
+
+    <main>
+        <h1>Code Search</h1>
+
+        <div class="search-toggle" role="radiogroup" aria-label="Search mode">
+            <label class="search-toggle-option active">
+                <input type="radio" name="search-mode" value="semantic" checked>
+                <span>Semantic</span>
+            </label>
+            <label class="search-toggle-option">
+                <input type="radio" name="search-mode" value="hybrid">
+                <span>Hybrid</span>
+            </label>
+        </div>
+
+        <form class="search-form" id="search-form"
+              hx-get="/api/v1/search" hx-target="#results" hx-indicator="#search-spinner">
+            <input type="text" name="q" placeholder="Search code semantically..." autofocus
+                   class="search-input">
+            <input type="hidden" name="limit" value="20">
+            <input type="hidden" name="expansion_depth" value="2" id="expansion-depth" disabled>
+            <button type="submit" class="btn">Search</button>
+            <span id="search-spinner" class="htmx-indicator">Searching...</span>
+        </form>
+
+        <div id="results"></div>
+        <div id="graph-context"></div>
+    </main>
+
+    <script>
+    // Track current search mode
+    var searchMode = 'semantic';
+
+    // Toggle handler: swap hx-get and enable/disable expansion_depth
+    document.querySelectorAll('.search-toggle-option input').forEach(function(radio) {
+        radio.addEventListener('change', function() {
+            var form = document.getElementById('search-form');
+            var depthInput = document.getElementById('expansion-depth');
+
+            // Update active styling
+            document.querySelectorAll('.search-toggle-option').forEach(function(opt) {
+                opt.classList.remove('active');
+            });
+            this.closest('.search-toggle-option').classList.add('active');
+
+            searchMode = this.value;
+            if (searchMode === 'hybrid') {
+                form.setAttribute('hx-get', '/api/v1/search/hybrid');
+                depthInput.disabled = false;
+            } else {
+                form.setAttribute('hx-get', '/api/v1/search');
+                depthInput.disabled = true;
+            }
+
+            // Re-process htmx attributes after changing hx-get
+            htmx.process(form);
+        });
+    });
+
+    // Transform JSON responses into HTML cards
+    document.body.addEventListener('htmx:beforeSwap', function(event) {
+        if (event.detail.target.id === 'results') {
+            try {
+                var data = JSON.parse(event.detail.serverResponse);
+                var graphContextEl = document.getElementById('graph-context');
+
+                // Detect response format: HybridSearchResponse has graph_context
+                var results = data.results || [];
+                var query = data.query || '';
+                var total = data.total || 0;
+                var graphContext = data.graph_context || [];
+
+                if (results.length === 0) {
+                    event.detail.serverResponse =
+                        '<p class="muted">No results found for "' + escapeHtml(query) + '"</p>';
+                    graphContextEl.innerHTML = '';
+                    return;
+                }
+
+                var html = '<p class="result-count">' + total + ' results for "' +
+                    escapeHtml(query) + '"</p>';
+                results.forEach(function(r) {
+                    html += '<div class="result-card">' +
+                        '<div class="result-path">' + escapeHtml(r.file_path) +
+                        ' <span class="result-score">score: ' + r.score.toFixed(3) + '</span></div>' +
+                        '<pre class="result-content"><code>' + escapeHtml(r.content) + '</code></pre>' +
+                        '</div>';
+                });
+                event.detail.serverResponse = html;
+
+                // Render graph context section if hybrid mode returned entities
+                if (graphContext.length > 0) {
+                    var gcHtml = '<div class="graph-context-card">' +
+                        '<h3>Graph Context <span class="muted">(' +
+                        graphContext.length + ' related entities)</span></h3>' +
+                        '<div class="graph-entity-list">';
+                    graphContext.forEach(function(entry) {
+                        gcHtml += '<div class="graph-entity">' +
+                            '<span class="graph-entity-type type-' +
+                            escapeHtml(entry.entity_type) + '">' +
+                            escapeHtml(entry.entity_type) + '</span>' +
+                            '<span class="graph-entity-label">' +
+                            escapeHtml(entry.label) + '</span>';
+                        if (entry.related_to && entry.related_to.length > 0) {
+                            gcHtml += '<span class="graph-entity-relations">';
+                            entry.related_to.forEach(function(rel) {
+                                gcHtml += '<span class="tag">' + escapeHtml(rel) + '</span>';
+                            });
+                            gcHtml += '</span>';
+                        }
+                        gcHtml += '</div>';
+                    });
+                    gcHtml += '</div></div>';
+                    graphContextEl.innerHTML = gcHtml;
+                } else {
+                    graphContextEl.innerHTML = '';
+                }
+            } catch(e) {}
+        }
+    });
+
+    function escapeHtml(text) {
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    </script>
+</body>
+</html>
