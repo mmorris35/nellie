@@ -31,7 +31,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+rusqlite = { version = "0.39", features = ["bundled", "blob"] }
 sqlite-vec = "0.1"
 
 # Embeddings (ONNX Runtime)
