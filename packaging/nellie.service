@@ -1,0 +1,56 @@
+[Unit]
+Description=Nellie Production - Semantic Code Memory System
+Documentation=https://github.com/sequeldata/nellie-rs
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nellie
+Group=nellie
+WorkingDirectory=/var/lib/nellie
+
+# Main executable
+ExecStart=/usr/local/bin/nellie \
+    --data-dir /var/lib/nellie \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --log-level info
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nellie /var/log/nellie
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=4G
+
+# Environment
+Environment="RUST_LOG=info"
+Environment="RUST_BACKTRACE=1"
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

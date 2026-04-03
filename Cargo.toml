@@ -1,0 +1,119 @@
+[package]
+name = "nellie"
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Mike Morris"]
+description = "Semantic code memory for AI agents — persistent lessons, knowledge graph, and Deep Hooks for Claude Code"
+license = "Apache-2.0"
+repository = "https://github.com/mmorris35/nellie"
+keywords = ["semantic-search", "code-search", "mcp", "embeddings"]
+categories = ["development-tools", "database"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Random
+rand = "0.8"
+
+# Async utilities
+futures = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# MCP Protocol
+rmcp = { version = "0.14", features = ["server", "transport-streamable-http-server"] }
+
+# HTTP Server
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+sqlite-vec = "0.1"
+
+# Embeddings (ONNX Runtime)
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
+ndarray = "0.16"
+tokenizers = "0.20"
+
+# File watching
+notify = { version = "6.0", default-features = false, features = ["macos_fsevent"] }
+notify-debouncer-mini = "0.4"
+ignore = "0.4"
+walkdir = "2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI
+clap = { version = "4.0", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging & Metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = "0.14.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+once_cell = "1.0"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+blake3 = "1.5"
+tokio-util = "0.7.18"
+# Graph memory (Nellie-V)
+petgraph = "0.6"
+strsim = "0.11"
+# Tree-sitter structural parsing
+tree-sitter = "=0.25.10"
+tree-sitter-python = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-go = "=0.25.0"
+dirs = "5.0"
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio-test = "0.4"
+criterion = "0.5"
+insta = "1.0"
+
+[[bench]]
+name = "search_benchmark"
+harness = false
+
+[[bench]]
+name = "structural_bench"
+harness = false
+
+[[example]]
+name = "soak"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cognitive_complexity = "allow"

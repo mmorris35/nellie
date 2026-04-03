@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie - Files</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui">Dashboard</a>
+            <a href="/ui/search">Search</a>
+            <a href="/ui/lessons">Lessons</a>
+            <a href="/ui/checkpoints">Checkpoints</a>
+            <a href="/ui/files" class="active">Files</a>
+            <a href="/ui/graph">Graph</a>
+            <a href="/ui/metrics">Metrics</a>
+        </div>
+    </nav>
+
+    <main>
+        <h1>Indexed Files</h1>
+
+        <div id="file-list"
+             hx-get="/api/v1/files?limit=50&offset=0"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+            <p class="muted">Loading files...</p>
+        </div>
+
+        <div class="pagination">
+            <button class="btn btn-small" id="prev-btn" onclick="changePage(-1)" disabled>Previous</button>
+            <span id="page-info">Page 1</span>
+            <button class="btn btn-small" id="next-btn" onclick="changePage(1)">Next</button>
+        </div>
+    </main>
+
+    <script>
+    let currentOffset = 0;
+    const pageSize = 50;
+
+    function changePage(direction) {
+        currentOffset = Math.max(0, currentOffset + direction * pageSize);
+        htmx.ajax('GET', '/api/v1/files?limit=' + pageSize + '&offset=' + currentOffset, '#file-list');
+        document.getElementById('page-info').textContent = 'Page ' + (Math.floor(currentOffset / pageSize) + 1);
+        document.getElementById('prev-btn').disabled = currentOffset === 0;
+    }
+
+    document.body.addEventListener('htmx:beforeSwap', function(event) {
+        if (event.detail.target.id === 'file-list') {
+            try {
+                const data = JSON.parse(event.detail.serverResponse);
+                if (data.files.length === 0) {
+                    event.detail.serverResponse = '<p class="muted">No indexed files.</p>';
+                    document.getElementById('next-btn').disabled = true;
+                    return;
+                }
+
+                document.getElementById('next-btn').disabled =
+                    (currentOffset + pageSize) >= data.total;
+
+                let html = '<p class="result-count">' + data.total + ' tracked files</p>' +
+                    '<table class="file-table"><thead><tr>' +
+                    '<th>File Path</th><th>Chunks</th></tr></thead><tbody>';
+                data.files.forEach(function(f) {
+                    html += '<tr><td class="file-path">' + escapeHtml(f.path) +
+                        '</td><td class="file-chunks">' + f.chunks + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                event.detail.serverResponse = html;
+            } catch(e) {}
+        }
+    });
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    </script>
+</body>
+</html>

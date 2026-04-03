@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie - Graph Explorer</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui">Dashboard</a>
+            <a href="/ui/search">Search</a>
+            <a href="/ui/lessons">Lessons</a>
+            <a href="/ui/checkpoints">Checkpoints</a>
+            <a href="/ui/files">Files</a>
+            <a href="/ui/graph" class="active">Graph</a>
+            <a href="/ui/metrics">Metrics</a>
+        </div>
+    </nav>
+
+    <main class="graph-main">
+        <h1>Knowledge Graph Explorer</h1>
+
+        <div class="graph-controls">
+            <form class="search-form" id="graph-search-form" onsubmit="searchGraph(event)">
+                <input type="text" id="graph-search" placeholder="Search entity label..."
+                       class="search-input">
+                <button type="submit" class="btn">Focus</button>
+                <button type="button" class="btn btn-secondary" onclick="resetGraph()">Reset</button>
+            </form>
+            <div class="graph-stats" id="graph-stats">
+                <span class="muted">Loading graph...</span>
+            </div>
+        </div>
+
+        <div class="graph-wrapper">
+            <div id="graph-container"></div>
+            <div class="graph-info-panel" id="graph-info-panel" style="display:none">
+                <div class="graph-info-header">
+                    <h3 id="info-label">Node</h3>
+                    <button class="btn btn-small btn-secondary"
+                            onclick="closeInfoPanel()">Close</button>
+                </div>
+                <div class="graph-info-body">
+                    <div class="graph-info-row">
+                        <span class="graph-info-key">Type</span>
+                        <span class="graph-info-value" id="info-type"></span>
+                    </div>
+                    <div class="graph-info-row">
+                        <span class="graph-info-key">Weight</span>
+                        <span class="graph-info-value" id="info-weight"></span>
+                    </div>
+                    <div class="graph-info-row">
+                        <span class="graph-info-key">Connections</span>
+                        <span class="graph-info-value" id="info-connections"></span>
+                    </div>
+                    <h4>Connected Nodes</h4>
+                    <div id="info-neighbors"></div>
+                </div>
+                <div class="graph-info-actions">
+                    <button class="btn btn-small"
+                            onclick="focusSelected()">Explore Neighborhood</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="graph-legend">
+            <span class="graph-legend-item">
+                <span class="graph-legend-dot" style="background:#7aa2f7"></span> Tool
+            </span>
+            <span class="graph-legend-item">
+                <span class="graph-legend-dot" style="background:#f7768e"></span> Problem
+            </span>
+            <span class="graph-legend-item">
+                <span class="graph-legend-dot" style="background:#9ece6a"></span> Solution
+            </span>
+            <span class="graph-legend-item">
+                <span class="graph-legend-dot" style="background:#e0af68"></span> Concept
+            </span>
+        </div>
+    </main>
+
+    <script>
+    var network = null;
+    var nodesDataSet = null;
+    var edgesDataSet = null;
+    var selectedNodeId = null;
+    var allGraphData = null;
+
+    var NODE_COLORS = {
+        tool: '#7aa2f7',
+        problem: '#f7768e',
+        solution: '#9ece6a',
+        concept: '#e0af68'
+    };
+
+    var NODE_COLOR_DEFAULT = '#565f89';
+
+    function nodeSize(weight) {
+        var min = 15;
+        var max = 50;
+        var clamped = Math.max(0, Math.min(weight, 10));
+        return min + (clamped / 10) * (max - min);
+    }
+
+    function nodeColor(entityType) {
+        return NODE_COLORS[entityType] || NODE_COLOR_DEFAULT;
+    }
+
+    function convertToVisData(data) {
+        var nodes = data.nodes.map(function(n) {
+            var color = nodeColor(n.entity_type);
+            return {
+                id: n.id,
+                label: n.label,
+                color: {
+                    background: color,
+                    border: color,
+                    highlight: { background: color, border: '#c0caf5' },
+                    hover: { background: color, border: '#c0caf5' }
+                },
+                size: nodeSize(n.weight),
+                title: n.label + ' (' + n.entity_type + ', weight: ' +
+                       n.weight.toFixed(2) + ')',
+                font: { color: '#c0caf5', size: 12 },
+                borderWidth: 2,
+                _entityType: n.entity_type,
+                _weight: n.weight
+            };
+        });
+
+        var edges = data.edges.map(function(e, i) {
+            return {
+                id: 'edge-' + i,
+                from: e.from,
+                to: e.to,
+                label: e.relationship,
+                arrows: 'to',
+                color: { color: '#3b4261', highlight: '#7aa2f7', hover: '#565f89' },
+                font: { color: '#565f89', size: 10, strokeWidth: 0 },
+                width: Math.max(1, Math.min(e.weight * 2, 5)),
+                smooth: { type: 'continuous' }
+            };
+        });
+
+        return { nodes: nodes, edges: edges };
+    }
+
+    function initNetwork(visData) {
+        var container = document.getElementById('graph-container');
+        nodesDataSet = new vis.DataSet(visData.nodes);
+        edgesDataSet = new vis.DataSet(visData.edges);
+
+        var options = {
+            nodes: {
+                shape: 'dot',
+                scaling: { min: 15, max: 50 }
+            },
+            edges: {
+                smooth: { type: 'continuous' },
+                font: { align: 'middle' }
+            },
+            physics: {
+                solver: 'barnesHut',
+                barnesHut: {
+                    gravitationalConstant: -3000,
+                    centralGravity: 0.3,
+                    springLength: 120,
+                    springConstant: 0.04,
+                    damping: 0.09
+                },
+                stabilization: { iterations: 150 }
+            },
+            interaction: {
+                hover: true,
+                tooltipDelay: 200,
+                navigationButtons: false,
+                keyboard: true
+            },
+            layout: {
+                improvedLayout: true
+            }
+        };
+
+        network = new vis.Network(container,
+            { nodes: nodesDataSet, edges: edgesDataSet }, options);
+
+        network.on('click', function(params) {
+            if (params.nodes.length > 0) {
+                var nodeId = params.nodes[0];
+                showNodeInfo(nodeId);
+            } else {
+                closeInfoPanel();
+            }
+        });
+
+        network.on('doubleClick', function(params) {
+            if (params.nodes.length > 0) {
+                var nodeId = params.nodes[0];
+                var node = nodesDataSet.get(nodeId);
+                if (node) {
+                    loadGraph(node.label);
+                }
+            }
+        });
+    }
+
+    function showNodeInfo(nodeId) {
+        selectedNodeId = nodeId;
+        var node = nodesDataSet.get(nodeId);
+        if (!node) return;
+
+        document.getElementById('info-label').textContent = node.label;
+
+        var typeEl = document.getElementById('info-type');
+        typeEl.textContent = node._entityType;
+        typeEl.className = 'graph-info-value type-badge type-' + node._entityType;
+
+        document.getElementById('info-weight').textContent =
+            node._weight.toFixed(2);
+
+        var connectedEdges = edgesDataSet.get({
+            filter: function(e) {
+                return e.from === nodeId || e.to === nodeId;
+            }
+        });
+        document.getElementById('info-connections').textContent =
+            connectedEdges.length;
+
+        var neighborsHtml = '';
+        connectedEdges.forEach(function(edge) {
+            var otherId = edge.from === nodeId ? edge.to : edge.from;
+            var otherNode = nodesDataSet.get(otherId);
+            if (otherNode) {
+                var dir = edge.from === nodeId ? ' -> ' : ' <- ';
+                neighborsHtml += '<div class="graph-info-neighbor">' +
+                    '<span class="graph-legend-dot" style="background:' +
+                    nodeColor(otherNode._entityType) + '"></span> ' +
+                    escapeHtml(otherNode.label) +
+                    '<span class="muted"> (' + escapeHtml(edge.label) + ')</span>' +
+                    '</div>';
+            }
+        });
+        document.getElementById('info-neighbors').innerHTML = neighborsHtml;
+
+        document.getElementById('graph-info-panel').style.display = 'flex';
+
+        // Highlight selected node and connections
+        var connectedNodeIds = connectedEdges.map(function(e) {
+            return e.from === nodeId ? e.to : e.from;
+        });
+        connectedNodeIds.push(nodeId);
+
+        network.selectNodes(connectedNodeIds);
+    }
+
+    function closeInfoPanel() {
+        document.getElementById('graph-info-panel').style.display = 'none';
+        selectedNodeId = null;
+        if (network) network.unselectAll();
+    }
+
+    function focusSelected() {
+        if (!selectedNodeId) return;
+        var node = nodesDataSet.get(selectedNodeId);
+        if (node) {
+            loadGraph(node.label);
+        }
+    }
+
+    function updateStats(data) {
+        document.getElementById('graph-stats').innerHTML =
+            '<span class="muted">' + data.total_nodes + ' nodes, ' +
+            data.total_edges + ' edges' +
+            (data.nodes.length < data.total_nodes
+                ? ' (showing ' + data.nodes.length + ')'
+                : '') +
+            '</span>';
+    }
+
+    function loadGraph(label) {
+        var url = '/api/v1/graph?limit=100';
+        if (label) url += '&label=' + encodeURIComponent(label);
+
+        document.getElementById('graph-stats').innerHTML =
+            '<span class="muted">Loading...</span>';
+
+        fetch(url)
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                allGraphData = data;
+                var visData = convertToVisData(data);
+                updateStats(data);
+
+                if (data.nodes.length === 0) {
+                    document.getElementById('graph-stats').innerHTML =
+                        '<span class="muted">No graph data available.' +
+                        ' The knowledge graph builds as you use Nellie.</span>';
+                    if (network) {
+                        nodesDataSet.clear();
+                        edgesDataSet.clear();
+                    }
+                    return;
+                }
+
+                if (network) {
+                    nodesDataSet.clear();
+                    edgesDataSet.clear();
+                    nodesDataSet.add(visData.nodes);
+                    edgesDataSet.add(visData.edges);
+                    network.fit({ animation: true });
+                } else {
+                    initNetwork(visData);
+                }
+
+                closeInfoPanel();
+
+                if (label) {
+                    document.getElementById('graph-search').value = label;
+                }
+            })
+            .catch(function(err) {
+                document.getElementById('graph-stats').innerHTML =
+                    '<span class="muted">Error loading graph data.</span>';
+            });
+    }
+
+    function searchGraph(e) {
+        e.preventDefault();
+        var query = document.getElementById('graph-search').value.trim();
+        if (!query) {
+            resetGraph();
+            return;
+        }
+        loadGraph(query);
+    }
+
+    function resetGraph() {
+        document.getElementById('graph-search').value = '';
+        closeInfoPanel();
+        loadGraph(null);
+    }
+
+    function escapeHtml(text) {
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Load graph on page init
+    loadGraph(null);
+    </script>
+</body>
+</html>

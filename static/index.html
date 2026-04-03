@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie Dashboard</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui" class="active">Dashboard</a>
+            <a href="/ui/search">Search</a>
+            <a href="/ui/lessons">Lessons</a>
+            <a href="/ui/checkpoints">Checkpoints</a>
+            <a href="/ui/files">Files</a>
+            <a href="/ui/graph">Graph</a>
+            <a href="/ui/metrics">Metrics</a>
+        </div>
+    </nav>
+
+    <main>
+        <h1>Dashboard</h1>
+
+        <div class="stats-grid"
+             hx-get="/api/v1/dashboard"
+             hx-trigger="load, every 10s"
+             hx-swap="innerHTML">
+            <div class="stat-card loading">Loading...</div>
+        </div>
+
+        <h2>Tool Metrics</h2>
+        <div class="stats-grid tool-metrics-grid"
+             hx-get="/api/v1/metrics"
+             hx-trigger="load, every 10s"
+             hx-swap="innerHTML">
+            <div class="stat-card loading">Loading...</div>
+        </div>
+
+        <h2>Activity Feed</h2>
+        <div id="activity-feed"
+             hx-ext="sse"
+             sse-connect="/api/v1/activity"
+             sse-swap="activity"
+             hx-swap="afterbegin">
+            <p class="muted">Waiting for activity...</p>
+        </div>
+    </main>
+
+    <script>
+    function escapeHtml(str) {
+        var div = document.createElement('div');
+        div.appendChild(document.createTextNode(str));
+        return div.innerHTML;
+    }
+
+    function formatNumber(n) {
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+        return n.toLocaleString();
+    }
+
+    function formatTokens(n) {
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+        return Math.round(n).toLocaleString();
+    }
+
+    function formatPercent(numerator, denominator) {
+        if (denominator === 0) return '0%';
+        return (numerator / denominator * 100).toFixed(1) + '%';
+    }
+
+    // Format dashboard stats response into cards
+    document.body.addEventListener('htmx:beforeSwap', function(event) {
+        if (event.detail.target.classList.contains('stats-grid') &&
+            !event.detail.target.classList.contains('tool-metrics-grid')) {
+            try {
+                var data = JSON.parse(event.detail.serverResponse);
+                var dbSize = data.db_size_bytes > 1048576
+                    ? (data.db_size_bytes / 1048576).toFixed(1) + ' MB'
+                    : (data.db_size_bytes / 1024).toFixed(1) + ' KB';
+                var uptime = data.uptime_seconds > 3600
+                    ? Math.floor(data.uptime_seconds / 3600) + 'h ' + Math.floor((data.uptime_seconds % 3600) / 60) + 'm'
+                    : Math.floor(data.uptime_seconds / 60) + 'm ' + (data.uptime_seconds % 60) + 's';
+
+                event.detail.serverResponse =
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + data.chunks.toLocaleString() + '</div>' +
+                        '<div class="stat-label">Code Chunks</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + data.tracked_files.toLocaleString() + '</div>' +
+                        '<div class="stat-label">Tracked Files</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + data.lessons.toLocaleString() + '</div>' +
+                        '<div class="stat-label">Lessons</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + dbSize + '</div>' +
+                        '<div class="stat-label">Database Size</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + uptime + '</div>' +
+                        '<div class="stat-label">Uptime</div>' +
+                    '</div>' +
+                    '<div class="stat-card ' + (data.embeddings_enabled ? 'status-ok' : 'status-warn') + '">' +
+                        '<div class="stat-value">' + (data.embeddings_enabled ? 'Active' : 'Disabled') + '</div>' +
+                        '<div class="stat-label">Embeddings</div>' +
+                    '</div>';
+            } catch(e) {
+                // Let htmx handle non-JSON responses normally
+            }
+        }
+
+        // Format tool metrics response into cards
+        if (event.detail.target.classList.contains('tool-metrics-grid')) {
+            try {
+                var data = JSON.parse(event.detail.serverResponse);
+                var mostUsedName = '-';
+                var mostUsedCount = '';
+                if (data.tools && data.tools.length > 0) {
+                    mostUsedName = escapeHtml(data.tools[0].name);
+                    mostUsedCount = ' (' + formatNumber(data.tools[0].invocations) + ')';
+                }
+                var errorRate = formatPercent(data.total_errors, data.total_invocations);
+                var errorClass = (data.total_invocations > 0 && (data.total_errors / data.total_invocations) > 0.05)
+                    ? 'status-warn' : '';
+
+                event.detail.serverResponse =
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + formatNumber(data.total_invocations) + '</div>' +
+                        '<div class="stat-label">Tool Invocations</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + formatTokens(data.estimated_tokens_saved) + '</div>' +
+                        '<div class="stat-label">Est. Tokens Saved</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value stat-value-small">' + mostUsedName + '</div>' +
+                        '<div class="stat-label">Most Used Tool' + mostUsedCount + '</div>' +
+                    '</div>' +
+                    '<div class="stat-card ' + errorClass + '">' +
+                        '<div class="stat-value">' + errorRate + '</div>' +
+                        '<div class="stat-label">Error Rate</div>' +
+                    '</div>';
+            } catch(e) {
+                // Let htmx handle non-JSON responses normally
+            }
+        }
+    });
+
+    // Format SSE activity events
+    document.body.addEventListener('htmx:sseMessage', function(event) {
+        try {
+            var data = JSON.parse(event.detail.data);
+            var time = new Date(data.timestamp * 1000).toLocaleTimeString();
+            var html = '';
+
+            if (data.type === 'stats') {
+                html =
+                    '<span class="activity-time">' + time + '</span> ' +
+                    '<span class="activity-text">' +
+                    data.chunks + ' chunks, ' + data.files + ' files, ' + data.lessons + ' lessons' +
+                    '</span>';
+            } else if (data.type === 'tool_activity') {
+                var toolName = escapeHtml(data.most_active_tool || '-');
+                html =
+                    '<span class="activity-time">' + time + '</span> ' +
+                    '<span class="activity-badge activity-badge-tool">TOOLS</span> ' +
+                    '<span class="activity-text">' +
+                    formatNumber(data.total_invocations) + ' invocations, ' +
+                    'most active: <strong>' + toolName + '</strong>' +
+                    (data.recent_errors > 0 ? ', <span class="metric-error">' + data.recent_errors + ' errors</span>' : '') +
+                    '</span>';
+            }
+
+            if (html) {
+                event.detail.elt = document.createElement('div');
+                event.detail.elt.className = 'activity-item' + (data.type === 'tool_activity' ? ' activity-tool' : '');
+                event.detail.elt.innerHTML = html;
+
+                // Keep feed to 50 items
+                var feed = document.getElementById('activity-feed');
+                while (feed.children.length > 50) {
+                    feed.removeChild(feed.lastChild);
+                }
+            }
+        } catch(e) {}
+    });
+    </script>
+</body>
+</html>

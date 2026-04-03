@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+*~
+.DS_Store
+.env
+config.yaml
+*.db
+*.db-wal
+*.db-shm
