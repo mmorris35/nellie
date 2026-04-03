@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie - Checkpoints</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui">Dashboard</a>
+            <a href="/ui/search">Search</a>
+            <a href="/ui/lessons">Lessons</a>
+            <a href="/ui/checkpoints" class="active">Checkpoints</a>
+            <a href="/ui/files">Files</a>
+            <a href="/ui/graph">Graph</a>
+            <a href="/ui/metrics">Metrics</a>
+        </div>
+    </nav>
+
+    <main>
+        <h1>Checkpoint Browser</h1>
+
+        <div class="checkpoint-controls">
+            <div class="agent-filter">
+                <label for="agent-select">Agent:</label>
+                <select id="agent-select" class="agent-select">
+                    <option value="">All Agents</option>
+                </select>
+            </div>
+            <form class="search-form" id="checkpoint-search-form" onsubmit="searchCheckpoints(event)">
+                <input type="text" id="checkpoint-search" placeholder="Search checkpoints..."
+                       class="search-input">
+                <button type="submit" class="btn">Search</button>
+                <button type="button" class="btn btn-secondary" onclick="clearSearch()">Clear</button>
+            </form>
+        </div>
+
+        <div id="checkpoint-list"
+             hx-get="/api/v1/checkpoints?limit=20"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+            <p class="muted">Loading checkpoints...</p>
+        </div>
+
+        <div class="pagination" id="pagination"></div>
+    </main>
+
+    <script>
+    var currentOffset = 0;
+    var currentLimit = 20;
+    var currentAgent = '';
+    var currentSearch = '';
+
+    // Load agents into the filter dropdown on page load
+    fetch('/api/v1/agents')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var select = document.getElementById('agent-select');
+            data.agents.forEach(function(a) {
+                var opt = document.createElement('option');
+                opt.value = a.name;
+                opt.textContent = a.name + ' (' + a.checkpoint_count + ')';
+                select.appendChild(opt);
+            });
+        })
+        .catch(function() {});
+
+    // Agent filter change handler
+    document.getElementById('agent-select').addEventListener('change', function() {
+        currentAgent = this.value;
+        currentOffset = 0;
+        loadCheckpoints();
+    });
+
+    function searchCheckpoints(e) {
+        e.preventDefault();
+        currentSearch = document.getElementById('checkpoint-search').value.trim();
+        currentOffset = 0;
+        loadCheckpoints();
+    }
+
+    function clearSearch() {
+        document.getElementById('checkpoint-search').value = '';
+        currentSearch = '';
+        currentOffset = 0;
+        loadCheckpoints();
+    }
+
+    function loadCheckpoints() {
+        var url = '/api/v1/checkpoints?limit=' + currentLimit + '&offset=' + currentOffset;
+        if (currentAgent) url += '&agent=' + encodeURIComponent(currentAgent);
+        if (currentSearch) url += '&q=' + encodeURIComponent(currentSearch);
+        htmx.ajax('GET', url, '#checkpoint-list');
+    }
+
+    function goPage(direction) {
+        if (direction === 'next') {
+            currentOffset += currentLimit;
+        } else if (direction === 'prev' && currentOffset >= currentLimit) {
+            currentOffset -= currentLimit;
+        }
+        loadCheckpoints();
+    }
+
+    function toggleState(id) {
+        var el = document.getElementById('state-' + id);
+        if (el) {
+            el.style.display = el.style.display === 'none' ? 'block' : 'none';
+        }
+    }
+
+    function formatTimestamp(ts) {
+        var d = new Date(ts * 1000);
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+    }
+
+    // Transform JSON responses into checkpoint cards
+    document.body.addEventListener('htmx:beforeSwap', function(event) {
+        if (event.detail.target.id === 'checkpoint-list') {
+            try {
+                var data = JSON.parse(event.detail.serverResponse);
+
+                if (data.checkpoints.length === 0) {
+                    event.detail.serverResponse =
+                        '<p class="muted">No checkpoints found.</p>';
+                    document.getElementById('pagination').innerHTML = '';
+                    return;
+                }
+
+                var html = '<p class="result-count">' + data.total +
+                    ' checkpoint' + (data.total !== 1 ? 's' : '') + '</p>' +
+                    '<div class="timeline">';
+
+                data.checkpoints.forEach(function(cp) {
+                    var time = formatTimestamp(cp.created_at);
+                    var stateJson = JSON.stringify(cp.state, null, 2);
+
+                    html += '<div class="checkpoint-card">' +
+                        '<div class="checkpoint-header" onclick="toggleState(\'' +
+                        escapeHtml(cp.id) + '\')">' +
+                            '<div class="checkpoint-meta">' +
+                                '<span class="checkpoint-agent">' +
+                                escapeHtml(cp.agent) + '</span>' +
+                                '<span class="checkpoint-time">' + time + '</span>' +
+                            '</div>' +
+                            '<div class="checkpoint-working-on">' +
+                            escapeHtml(cp.working_on) + '</div>' +
+                            '<span class="checkpoint-expand-hint">Click to ' +
+                            'expand state</span>' +
+                        '</div>' +
+                        '<div class="checkpoint-state" id="state-' +
+                        escapeHtml(cp.id) + '" style="display:none">' +
+                            '<pre><code>' + escapeHtml(stateJson) +
+                            '</code></pre>' +
+                        '</div>' +
+                        '</div>';
+                });
+
+                html += '</div>';
+                event.detail.serverResponse = html;
+
+                // Update pagination
+                var pagHtml = '';
+                if (currentOffset > 0) {
+                    pagHtml += '<button class="btn btn-secondary" ' +
+                        'onclick="goPage(\'prev\')">Previous</button>';
+                }
+                pagHtml += '<span id="page-info">Showing ' +
+                    (currentOffset + 1) + '-' +
+                    Math.min(currentOffset + data.checkpoints.length,
+                    data.total) + ' of ' + data.total + '</span>';
+                if (currentOffset + currentLimit < data.total) {
+                    pagHtml += '<button class="btn btn-secondary" ' +
+                        'onclick="goPage(\'next\')">Next</button>';
+                }
+                document.getElementById('pagination').innerHTML = pagHtml;
+            } catch(e) {
+                // Let htmx handle non-JSON responses normally
+            }
+        }
+    });
+
+    function escapeHtml(text) {
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    </script>
+</body>
+</html>

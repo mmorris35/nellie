@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nellie - Metrics</title>
+    <link rel="stylesheet" href="/ui/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <nav>
+        <div class="nav-brand">Nellie</div>
+        <div class="nav-links">
+            <a href="/ui">Dashboard</a>
+            <a href="/ui/search">Search</a>
+            <a href="/ui/lessons">Lessons</a>
+            <a href="/ui/checkpoints">Checkpoints</a>
+            <a href="/ui/files">Files</a>
+            <a href="/ui/graph">Graph</a>
+            <a href="/ui/metrics" class="active">Metrics</a>
+        </div>
+    </nav>
+
+    <main>
+        <h1>Tool Metrics</h1>
+
+        <div id="metrics-content"
+             hx-get="/api/v1/metrics"
+             hx-trigger="load, every 10s"
+             hx-swap="innerHTML">
+            <div class="stat-card loading">Loading metrics...</div>
+        </div>
+    </main>
+
+    <script>
+    document.body.addEventListener('htmx:beforeSwap', function(event) {
+        if (event.detail.target.id === 'metrics-content') {
+            try {
+                const data = JSON.parse(event.detail.serverResponse);
+
+                // Format token savings with K/M suffix
+                function formatTokens(val) {
+                    if (val >= 1000000) return (val / 1000000).toFixed(1) + 'M';
+                    if (val >= 1000) return (val / 1000).toFixed(1) + 'K';
+                    return Math.round(val).toLocaleString();
+                }
+
+                // Format bytes with KB/MB suffix
+                function formatBytes(bytes) {
+                    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+                    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                    return bytes + ' B';
+                }
+
+                // Stats grid
+                let html = '<div class="stats-grid">' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + data.total_invocations.toLocaleString() + '</div>' +
+                        '<div class="stat-label">Total Invocations</div>' +
+                    '</div>' +
+                    '<div class="stat-card' + (data.total_errors > 0 ? ' status-warn' : '') + '">' +
+                        '<div class="stat-value">' + data.total_errors.toLocaleString() + '</div>' +
+                        '<div class="stat-label">Total Errors</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value metric-highlight">' + formatTokens(data.estimated_tokens_saved) + '</div>' +
+                        '<div class="stat-label">Tokens Saved</div>' +
+                    '</div>' +
+                    '<div class="stat-card">' +
+                        '<div class="stat-value">' + formatBytes(data.total_response_bytes) + '</div>' +
+                        '<div class="stat-label">Response Bytes</div>' +
+                    '</div>' +
+                    '</div>';
+
+                // Per-tool table
+                html += '<h2>Per-Tool Breakdown</h2>';
+                if (data.tools.length === 0) {
+                    html += '<p class="muted">No tool invocations recorded yet.</p>';
+                } else {
+                    html += '<table class="metrics-table"><thead><tr>' +
+                        '<th>Tool</th>' +
+                        '<th>Invocations</th>' +
+                        '<th>Errors</th>' +
+                        '<th>Avg Latency</th>' +
+                        '<th>P95 Latency</th>' +
+                        '<th>Tokens Saved</th>' +
+                        '</tr></thead><tbody>';
+                    data.tools.forEach(function(t) {
+                        html += '<tr>' +
+                            '<td>' + escapeHtml(t.name) + '</td>' +
+                            '<td>' + t.invocations.toLocaleString() + '</td>' +
+                            '<td' + (t.errors > 0 ? ' class="metric-error"' : '') + '>' + t.errors.toLocaleString() + '</td>' +
+                            '<td>' + t.avg_latency_ms.toFixed(1) + ' ms</td>' +
+                            '<td>' + t.p95_latency_ms.toFixed(1) + ' ms</td>' +
+                            '<td class="metric-highlight">' + formatTokens(t.tokens_saved) + '</td>' +
+                            '</tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+
+                // Per-agent table
+                html += '<h2>Per-Agent Breakdown</h2>';
+                if (data.agents.length === 0) {
+                    html += '<p class="muted">No agent activity recorded yet.</p>';
+                } else {
+                    html += '<table class="metrics-table"><thead><tr>' +
+                        '<th>Agent</th>' +
+                        '<th>Invocations</th>' +
+                        '<th>Tokens Saved</th>' +
+                        '</tr></thead><tbody>';
+                    data.agents.forEach(function(a) {
+                        html += '<tr>' +
+                            '<td>' + escapeHtml(a.agent) + '</td>' +
+                            '<td>' + a.invocations.toLocaleString() + '</td>' +
+                            '<td class="metric-highlight">' + formatTokens(a.tokens_saved) + '</td>' +
+                            '</tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+
+                event.detail.serverResponse = html;
+            } catch(e) {
+                // Let htmx handle non-JSON responses normally
+            }
+        }
+    });
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    </script>
+</body>
+</html>
