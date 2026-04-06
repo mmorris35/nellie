@@ -118,11 +118,13 @@ Nellie integrates directly into Claude Code's lifecycle. Install hooks once:
 nellie hooks-install
 ```
 
-This configures two automatic hooks:
+This configures three automatic hooks:
 
 1. **SessionStart** — Runs `nellie sync` to pull lessons and checkpoints into memory files before your first prompt. Critical/warning lessons become conditional rules.
 
-2. **Stop** — Runs `nellie ingest` to parse the session transcript for new patterns and automatically record lessons.
+2. **UserPromptSubmit** — Runs `nellie inject` to search for context relevant to your prompt and inject it as a temporary rules file. Nellie finds related lessons and gotchas before Claude processes your prompt. Fail-open: if the server is down or slow, injection is silently skipped.
+
+3. **Stop** — Runs `nellie ingest` to parse the session transcript for new patterns and automatically record lessons.
 
 Your lessons pre-load as memory files at `~/.claude/projects/<project>/memory/`. Critical and warning lessons also appear as conditional rules at `~/.claude/rules/`.
 
@@ -137,6 +139,9 @@ nellie sync [--project DIR] [--rules] [--dry-run] [--server URL]
 
 # Parse session transcripts and record new lessons
 nellie ingest [--project DIR] [--since 1h] [--dry-run] [--server URL]
+
+# Inject prompt-relevant context as temporary rules
+nellie inject --query "your prompt text" [--limit N] [--threshold F] [--server URL]
 
 # Manage Deep Hooks
 nellie hooks-install
