@@ -10,7 +10,7 @@
 //! The injection pipeline:
 //! 1. Accept a query (typically the user's prompt text)
 //! 2. Search Nellie (local or remote) for relevant lessons
-//! 3. Filter results by relevance threshold (default 0.6)
+//! 3. Filter results by relevance score (default threshold 0.4, higher=more relevant)
 //! 4. Deduplicate against existing session memory files
 //! 5. Format as Claude Code rules file with YAML frontmatter
 //! 6. Write atomically to `~/.claude/rules/nellie-inject.md`
@@ -18,9 +18,9 @@
 //!
 //! # Configuration
 //!
-//! - Default timeout: 500ms
+//! - Default timeout: 800ms
 //! - Default limit: 3 results
-//! - Default threshold: 0.6 (0=most relevant, 1=least relevant)
+//! - Default threshold: 0.4 (score-based, 0.0-1.0, higher=more relevant)
 //! - Output budget: 500 tokens (~2000 chars)
 //!
 //! # Fail Open Design
@@ -214,7 +214,8 @@ pub async fn execute_inject(
             }
         }
     } else {
-        // Local search path (not yet implemented)
+        // Local search not yet implemented — requires --server
+        tracing::warn!("No --server URL provided. nellie inject requires a remote server (use --server http://host:port)");
         vec![]
     };
 
@@ -241,13 +242,9 @@ pub async fn execute_inject(
     let mut skipped_count = 0;
 
     for result in filtered {
-        // Skip if title or content matches an existing memory file name
-        // Check both the title and content snippet against memory names
-        if existing_names.contains(&result.title)
-            || existing_names
-                .iter()
-                .any(|name| result.content.contains(name.as_str()))
-        {
+        // Skip if title matches an existing memory file name (title-only dedup
+        // to avoid false positives from short names matching unrelated content)
+        if existing_names.contains(&result.title) {
             skipped_count += 1;
             continue;
         }
@@ -667,31 +664,29 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_by_content_match() {
+    fn test_dedup_by_title_match() {
         let existing_names: HashSet<String> =
             vec!["Known Bug Fix".to_string()].into_iter().collect();
 
         let results = vec![
             test_result("new.md", "Something new", 0.8),
+            // Title-only dedup: this has matching content but different title — NOT skipped
             test_result("old.md", "This is about Known Bug Fix details", 0.7),
+            // This has matching title — skipped
+            test_result("Known Bug Fix", "Different content", 0.6),
         ];
 
         let mut deduped = Vec::new();
         let mut skipped = 0;
         for result in results {
-            if existing_names.contains(&result.title)
-                || existing_names
-                    .iter()
-                    .any(|name| result.content.contains(name.as_str()))
-            {
+            if existing_names.contains(&result.title) {
                 skipped += 1;
                 continue;
             }
             deduped.push(result);
         }
 
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(skipped, 1);
-        assert_eq!(deduped[0].title, "new.md");
+        assert_eq!(deduped.len(), 2); // new.md and old.md pass
+        assert_eq!(skipped, 1); // Only "Known Bug Fix" title match skipped
     }
 }
