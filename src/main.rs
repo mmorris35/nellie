@@ -204,7 +204,7 @@ enum Commands {
         /// When set, queries lessons and checkpoints from the remote
         /// server instead of the local database. Memory files are
         /// still written locally.
-        /// Example: --server http://localhost:8765
+        /// Example: --server http://100.87.147.89:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -246,9 +246,44 @@ enum Commands {
         ///
         /// When set, POSTs extracted lessons to the remote server
         /// instead of storing in the local database.
-        /// Example: --server http://localhost:8765
+        /// Example: --server http://100.87.147.89:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
+    },
+
+    /// Inject Nellie context into Claude Code for the current prompt
+    ///
+    /// Searches Nellie for lessons and context relevant to the user's prompt,
+    /// filters by relevance threshold, and writes them to a temporary rules file
+    /// that Claude Code loads before processing the prompt.
+    /// This enables automatic knowledge enrichment without explicit memory files.
+    ///
+    /// Designed to be called via the UserPromptSubmit hook with the user's
+    /// prompt text as the query.
+    Inject {
+        /// Search query (typically the user's prompt text)
+        #[arg(long)]
+        query: String,
+
+        /// Maximum number of results to inject
+        #[arg(long, default_value = "3")]
+        limit: usize,
+
+        /// Minimum relevance score (0.0-1.0, higher = more relevant)
+        #[arg(long, default_value = "0.4")]
+        threshold: f64,
+
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "800")]
+        timeout: u64,
+
+        /// Nellie server URL for remote operation
+        #[arg(long, env = "NELLIE_SERVER")]
+        server: Option<String>,
+
+        /// Show what would be injected without writing files
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Install Nellie hooks in Claude Code settings.json
@@ -377,6 +412,24 @@ async fn main() -> Result<()> {
             dry_run,
             server,
         }) => ingest_command(cli.data_dir, transcript, project, since, dry_run, server).await,
+        Some(Commands::Inject {
+            query,
+            limit,
+            threshold,
+            timeout,
+            server,
+            dry_run,
+        }) => {
+            inject_command(
+                &query,
+                limit,
+                threshold,
+                timeout,
+                server.as_deref(),
+                dry_run,
+            )
+            .await
+        }
         Some(Commands::HooksInstall { force, server }) => {
             hooks_install_command(force, server.as_deref())
         }
@@ -1335,6 +1388,85 @@ fn status_command(_server: String, format: String) -> Result<()> {
     Ok(())
 }
 
+/// Inject command: Inject Nellie context for the current prompt
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+async fn inject_command(
+    query: &str,
+    limit: usize,
+    threshold: f64,
+    timeout_ms: u64,
+    server: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    use nellie::claude_code::inject::{execute_inject, InjectConfig};
+
+    let start = std::time::Instant::now();
+
+    // Build inject config
+    let config = InjectConfig {
+        query: query.to_string(),
+        limit,
+        threshold,
+        timeout_ms,
+        dry_run,
+    };
+
+    tracing::info!(
+        query = %config.query,
+        limit = config.limit,
+        threshold = config.threshold,
+        timeout_ms = config.timeout_ms,
+        dry_run = config.dry_run,
+        server = server.unwrap_or("local"),
+        "Starting context injection"
+    );
+
+    // Run the injection pipeline
+    let result = execute_inject(&config, server).await?;
+
+    let elapsed = start.elapsed();
+    let total_ms = elapsed.as_millis() as u64;
+
+    if dry_run {
+        println!("=== Dry Run ===");
+        println!("Query: {}", config.query);
+        println!("Limit: {}", config.limit);
+        println!("Threshold: {}", config.threshold);
+        println!("Timeout: {}ms", config.timeout_ms);
+        println!("Server: {}", server.unwrap_or("local"));
+        println!();
+        println!(
+            "Results: {} injected, {} skipped",
+            result.injected_count, result.skipped_count
+        );
+        println!("Elapsed: {total_ms}ms");
+    } else {
+        if result.injected_count > 0 {
+            println!(
+                "Injected {} lessons ({} skipped, threshold={})",
+                result.injected_count, result.skipped_count, threshold
+            );
+            if let Some(path) = &result.file_path {
+                println!("File: {path}");
+            }
+        } else {
+            println!("No relevant context found (threshold={threshold})");
+        }
+        tracing::info!(
+            injected = result.injected_count,
+            skipped = result.skipped_count,
+            elapsed_ms = total_ms,
+            "Injection complete"
+        );
+
+        // Write last_inject_time timestamp for hooks-status
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let _ = nellie::claude_code::paths::write_state_timestamp(&cwd, "last_inject_time");
+    }
+
+    Ok(())
+}
+
 /// Hooks Install command: Install Nellie hooks to Claude Code settings.json
 fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
     use nellie::claude_code::hooks::install_hooks;
@@ -1382,6 +1514,12 @@ fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
         let server_info = server.map_or(String::new(), |s| format!(" --server {s}"));
         println!("  ✓ Stop (nellie ingest --project \"$PWD\" --since 1h{server_info})");
     }
+    if report.user_prompt_submit_installed {
+        let server_info = server.map_or(String::new(), |s| format!(" --server {s}"));
+        println!(
+            "  ✓ UserPromptSubmit (nellie inject --query \"$CC_USER_PROMPT\" --limit 3{server_info})"
+        );
+    }
     if report.backup_created {
         println!();
         println!("Backup created: {}.bak", report.settings_path.display());
@@ -1401,23 +1539,26 @@ fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
     // Run initial sync
     println!();
     println!("Running initial sync...");
-    let mut sync_cmd = std::process::Command::new("nellie");
-    sync_cmd.arg("sync").arg("--rules");
-    if let Some(url) = server {
-        sync_cmd.arg("--server").arg(url);
-    }
-    match sync_cmd.status() {
+    let sync_cmd = server.map_or_else(
+        || "nellie sync --rules".to_string(),
+        |url| format!("nellie sync --rules --server {url}"),
+    );
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sync_cmd)
+        .status()
+    {
         Ok(status) if status.success() => {
             println!("  ✓ Initial sync complete");
         }
         Ok(status) => {
             eprintln!(
-                "  ✗ Initial sync failed (exit {})",
+                "  ✗ Initial sync failed (exit {}). Run manually: {sync_cmd}",
                 status.code().unwrap_or(-1)
             );
         }
         Err(e) => {
-            eprintln!("  ✗ Could not run initial sync: {e}");
+            eprintln!("  ✗ Could not run initial sync: {e}. Run manually: {sync_cmd}");
         }
     }
 
