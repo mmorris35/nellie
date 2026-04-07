@@ -6,6 +6,68 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::Result;
 
+/// Directories that should always be excluded from indexing,
+/// regardless of .gitignore. These are common dependency, build,
+/// and cache directories that never contain useful source code.
+pub const EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "target",
+    "build",
+    "dist",
+    ".next",
+    ".nuxt",
+    "vendor",
+    ".cargo",
+    ".rustup",
+    "Pods",
+    ".gradle",
+    ".idea",
+    ".vs",
+    ".vscode",
+    "coverage",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".tox",
+    "eggs",
+    ".sass-cache",
+    "bower_components",
+    ".terraform",
+    "obj",
+    "bin",
+    "site-packages",
+];
+
+/// Check if a directory name matches one of the excluded directory names.
+/// Also handles glob-style patterns like `*.egg-info`.
+///
+/// This is used at walk-time to prune entire directory subtrees
+/// before they are traversed, preventing 97K+ symbol indexing
+/// from directories like `node_modules/`.
+#[must_use]
+pub fn is_excluded_dir(name: &str) -> bool {
+    // Exact match against exclusion list
+    if EXCLUDED_DIRS.contains(&name) {
+        return true;
+    }
+    // Glob-style suffixes
+    if name.ends_with(".egg-info") {
+        return true;
+    }
+    // Evidence directories
+    if name.starts_with("Raw_Evidence")
+        || name.starts_with("RawEvidence")
+        || name.starts_with("Evidence_")
+        || name.starts_with("Evidence ")
+    {
+        return true;
+    }
+    false
+}
+
 /// Supported code file extensions and their languages.
 const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("rs", "rust"),
@@ -196,30 +258,9 @@ impl FileFilter {
             }
         }
 
-        // Non-dot directories to ignore
-        let ignored_dirs = [
-            "/node_modules/",
-            "/target/",
-            "/build/",
-            "/dist/",
-            "/__pycache__/",
-            "/venv/",
-            "/vendor/",
-            "/obj/",
-            "/bin/",
-            "/coverage/",
-            "/egg-info/",
-            "/Raw_Evidence/",
-            "/RawEvidence/",
-            "/Evidence_",
-            "/.terraform/",
-            "/bower_components/",
-            "/.venv/",
-            "/site-packages/",
-        ];
-
-        for dir in ignored_dirs {
-            if path_str.contains(dir) {
+        // Check path components against shared exclusion list
+        for component in path_str.split('/') {
+            if !component.is_empty() && is_excluded_dir(component) {
                 return true;
             }
         }
@@ -356,5 +397,42 @@ mod tests {
 
         assert!(filter.should_index(&tmp.path().join("main.rs")));
         assert!(!filter.should_index(&tmp.path().join("test.rs")));
+    }
+
+    #[test]
+    fn test_is_excluded_dir() {
+        // Common dependency/build directories
+        assert!(is_excluded_dir("node_modules"));
+        assert!(is_excluded_dir("target"));
+        assert!(is_excluded_dir("build"));
+        assert!(is_excluded_dir("dist"));
+        assert!(is_excluded_dir("__pycache__"));
+        assert!(is_excluded_dir("venv"));
+        assert!(is_excluded_dir(".venv"));
+        assert!(is_excluded_dir("vendor"));
+        assert!(is_excluded_dir(".git"));
+        assert!(is_excluded_dir(".next"));
+        assert!(is_excluded_dir(".nuxt"));
+        assert!(is_excluded_dir(".cargo"));
+        assert!(is_excluded_dir(".terraform"));
+        assert!(is_excluded_dir("bower_components"));
+        assert!(is_excluded_dir("site-packages"));
+
+        // Glob-style patterns
+        assert!(is_excluded_dir("my_lib.egg-info"));
+        assert!(is_excluded_dir("package.egg-info"));
+
+        // Evidence directories
+        assert!(is_excluded_dir("Raw_Evidence"));
+        assert!(is_excluded_dir("RawEvidence"));
+        assert!(is_excluded_dir("Evidence_20251002"));
+        assert!(is_excluded_dir("Evidence 2025"));
+
+        // Source directories should NOT be excluded
+        assert!(!is_excluded_dir("src"));
+        assert!(!is_excluded_dir("lib"));
+        assert!(!is_excluded_dir("app"));
+        assert!(!is_excluded_dir("tests"));
+        assert!(!is_excluded_dir(".github"));
     }
 }

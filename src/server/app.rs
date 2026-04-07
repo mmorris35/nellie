@@ -137,31 +137,60 @@ impl App {
                 "Graph memory loaded"
             );
             state.set_graph(graph);
-
-            // Structural bootstrap (if graph is enabled)
-            // This is best-effort -- if symbols table is empty, stats will be zero
-            if let Some(ref graph_lock) = state.graph {
-                let mut graph = graph_lock.write();
-                match crate::graph::bootstrap::bootstrap_structural(&mut graph, &db) {
-                    Ok(stats) => {
-                        tracing::info!(
-                            nodes = stats.nodes_created,
-                            edges = stats.edges_created,
-                            files = stats.files_processed,
-                            "Structural graph bootstrap complete"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Structural graph bootstrap failed (non-fatal)");
-                    }
-                }
-            }
         }
 
         // Set structural parsing from config
         state.set_enable_structural(config.enable_structural);
 
         let state = Arc::new(state);
+
+        // Structural bootstrap in background (if graph is enabled)
+        // This can take minutes with large symbol counts — don't block HTTP startup.
+        if config.graph.enabled {
+            if let Some(ref graph_lock) = state.graph {
+                let graph_arc = Arc::clone(graph_lock);
+                let db_clone = db.clone();
+                let bootstrapping = Arc::clone(&state.structural_bootstrapping);
+                bootstrapping.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                tracing::info!("Starting structural graph bootstrap in background task");
+
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut graph = graph_arc.write();
+                        crate::graph::bootstrap::bootstrap_structural(&mut graph, &db_clone)
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(stats)) => {
+                            tracing::info!(
+                                nodes = stats.nodes_created,
+                                edges = stats.edges_created,
+                                files = stats.files_processed,
+                                "Background structural graph bootstrap complete"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Background structural graph bootstrap failed \
+                                 (non-fatal)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Structural bootstrap task panicked"
+                            );
+                        }
+                    }
+
+                    bootstrapping.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        }
+
         Ok(Self { config, state })
     }
 

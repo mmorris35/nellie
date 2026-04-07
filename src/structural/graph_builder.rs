@@ -40,31 +40,43 @@ pub fn build_structural_graph(
 ) -> StructuralGraphStats {
     let mut stats = StructuralGraphStats::default();
     let mut files_seen = std::collections::HashSet::new();
+    let start_time = std::time::Instant::now();
+    let mut last_progress_log = std::time::Instant::now();
 
-    // Create entity nodes for each symbol
-    let mut symbol_id_to_entity: std::collections::HashMap<i64, String> =
+    // Phase 1: Build indexes for O(1) lookups (avoids O(n²) scans)
+    // name -> list of symbol IDs with that name (for test heuristic + edge matching)
+    let mut name_to_ids: std::collections::HashMap<&str, Vec<usize>> =
         std::collections::HashMap::new();
+    for (idx, symbol) in symbols.iter().enumerate() {
+        name_to_ids
+            .entry(&symbol.symbol_name)
+            .or_default()
+            .push(idx);
+    }
 
-    // Create StructModule entities for each unique file_path
+    // Phase 2: Create entity nodes for each symbol
+    let mut symbol_id_to_entity: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::with_capacity(symbols.len());
     let mut module_id_to_entity: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
+    // Create StructModule entities for each unique file_path
     for symbol in symbols {
-        if !files_seen.contains(&symbol.file_path) {
-            files_seen.insert(symbol.file_path.clone());
+        if files_seen.insert(symbol.file_path.clone()) {
             let module_id = ensure_entity(graph, EntityType::StructModule, &symbol.file_path);
             module_id_to_entity.insert(symbol.file_path.clone(), module_id);
             stats.nodes_created += 1;
         }
     }
 
+    // Create entity nodes for each symbol + scope/contains edges
     for symbol in symbols {
         let entity_type = symbol_kind_to_entity_type(symbol.symbol_kind);
         let label = format!("{}:{}", symbol.file_path, symbol.symbol_name);
         let entity_id = ensure_entity(graph, entity_type, &label);
         symbol_id_to_entity.insert(symbol.id, entity_id.clone());
 
-        // Create Contains edge from module to symbol
+        // Contains edge from module to symbol
         if let Some(module_id) = module_id_to_entity.get(&symbol.file_path) {
             ensure_edge(
                 graph,
@@ -92,41 +104,66 @@ pub fn build_structural_graph(
             stats.edges_created += 1;
         }
 
-        // Tests edge: if test function, link to tested function (heuristic)
-        if symbol.symbol_kind == super::extractor::SymbolKind::TestFunction {
-            let tested_name = symbol
-                .symbol_name
-                .strip_prefix("test_")
-                .or_else(|| symbol.symbol_name.strip_prefix("Test"))
-                .unwrap_or(&symbol.symbol_name);
+        // Log progress every 10K symbols or every 30 seconds
+        let now = std::time::Instant::now();
+        if stats.nodes_created % 10_000 == 0
+            || now.duration_since(last_progress_log).as_secs() >= 30
+        {
+            tracing::info!(
+                nodes = stats.nodes_created,
+                edges = stats.edges_created,
+                elapsed_secs = start_time.elapsed().as_secs(),
+                "Structural graph build progress"
+            );
+            last_progress_log = now;
+        }
+    }
 
-            if !tested_name.is_empty() && tested_name != symbol.symbol_name {
-                // Find matching function by name
-                for other in symbols {
-                    if other.symbol_name == tested_name
-                        && matches!(
-                            other.symbol_kind,
-                            super::extractor::SymbolKind::Function
-                                | super::extractor::SymbolKind::Method
-                        )
-                    {
-                        if let Some(other_entity_id) = symbol_id_to_entity.get(&other.id) {
-                            ensure_edge(
-                                graph,
-                                &entity_id,
-                                other_entity_id,
-                                RelationshipKind::Tests,
-                                Some("structural: test covers function".to_string()),
-                            );
-                            stats.edges_created += 1;
-                        }
+    // Phase 3: Test edges — O(n) with index lookup instead of O(n²)
+    for symbol in symbols {
+        if symbol.symbol_kind != super::extractor::SymbolKind::TestFunction {
+            continue;
+        }
+
+        let tested_name = symbol
+            .symbol_name
+            .strip_prefix("test_")
+            .or_else(|| symbol.symbol_name.strip_prefix("Test"))
+            .unwrap_or(&symbol.symbol_name);
+
+        if tested_name.is_empty() || tested_name == symbol.symbol_name {
+            continue;
+        }
+
+        let test_entity_id = match symbol_id_to_entity.get(&symbol.id) {
+            Some(id) => id.clone(),
+            None => continue,
+        };
+
+        // O(1) lookup by name instead of O(n) scan
+        if let Some(matching_indices) = name_to_ids.get(tested_name) {
+            for &idx in matching_indices {
+                let other = &symbols[idx];
+                if matches!(
+                    other.symbol_kind,
+                    super::extractor::SymbolKind::Function | super::extractor::SymbolKind::Method
+                ) {
+                    if let Some(other_entity_id) = symbol_id_to_entity.get(&other.id) {
+                        ensure_edge(
+                            graph,
+                            &test_entity_id,
+                            other_entity_id,
+                            RelationshipKind::Tests,
+                            Some("structural: test covers function".to_string()),
+                        );
+                        stats.edges_created += 1;
                     }
                 }
             }
         }
     }
 
-    // Create edges from structural_edges table
+    // Phase 4: Structural edges — O(m) with index lookup instead of O(m*n)
     for (source_id, target_name, _target_file, edge_kind) in edges {
         let source_entity = match symbol_id_to_entity.get(source_id) {
             Some(id) => id.clone(),
@@ -140,10 +177,10 @@ pub fn build_structural_graph(
             _ => RelationshipKind::RelatedTo,
         };
 
-        // Find target entity by name match
-        for symbol in symbols {
-            if symbol.symbol_name == *target_name {
-                if let Some(target_entity) = symbol_id_to_entity.get(&symbol.id) {
+        // O(1) lookup by name instead of O(n) scan
+        if let Some(matching_indices) = name_to_ids.get(target_name.as_str()) {
+            if let Some(&idx) = matching_indices.first() {
+                if let Some(target_entity) = symbol_id_to_entity.get(&symbols[idx].id) {
                     ensure_edge(
                         graph,
                         &source_entity,
@@ -152,7 +189,6 @@ pub fn build_structural_graph(
                         Some(format!("structural: {edge_kind}")),
                     );
                     stats.edges_created += 1;
-                    break;
                 }
             }
         }
