@@ -304,7 +304,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let cp = make_checkpoint("mmn/nellie-rs", "implementing graph layer");
+        let cp = make_checkpoint("user/my-project", "implementing graph layer");
         let (nodes, edges) = process_checkpoint(&mut graph, &cp);
         assert!(nodes >= 2); // agent + chunk
         assert!(edges >= 1); // agent -> chunk

@@ -269,7 +269,7 @@ fn truncate_to_words(text: &str, max_chars: usize) -> String {
 /// use nellie::claude_code::mappers::checkpoint_to_memory;
 ///
 /// let cp = CheckpointRecord::new(
-///     "mmn/nellie-rs",
+///     "user/my-project",
 ///     "Implementing deep hooks phase 1",
 ///     serde_json::json!({
 ///         "decisions": ["Use atomic writes", "Tag with [nellie]"],
@@ -279,7 +279,7 @@ fn truncate_to_words(text: &str, max_chars: usize) -> String {
 /// );
 ///
 /// let mf = checkpoint_to_memory(&cp);
-/// assert!(mf.name.starts_with("checkpoint_mmn_nellie-rs_"));
+/// assert!(mf.name.starts_with("checkpoint_user_my-project_"));
 /// assert_eq!(mf.memory_type, MemoryType::Project);
 /// ```
 pub fn checkpoint_to_memory(checkpoint: &CheckpointRecord) -> MemoryFile {
@@ -971,13 +971,13 @@ mod tests {
     fn test_checkpoint_name_format() {
         // 2025-06-16 = Unix 1750032000
         let cp = make_checkpoint(
-            "mmn/nellie-rs",
+            "user/my-project",
             "working on stuff",
             serde_json::json!({}),
             1_750_032_000,
         );
         let name = checkpoint_memory_name(&cp);
-        assert_eq!(name, "checkpoint_mmn_nellie-rs_2025-06-16");
+        assert_eq!(name, "checkpoint_user_my-project_2025-06-16");
     }
 
     #[test]
@@ -1041,7 +1041,7 @@ mod tests {
     #[test]
     fn test_checkpoint_to_memory_basic() {
         let cp = make_checkpoint(
-            "mmn/nellie-rs",
+            "user/my-project",
             "Implementing deep hooks",
             serde_json::json!({
                 "decisions": ["Use atomic writes", "Tag with [nellie]"],
@@ -1053,7 +1053,7 @@ mod tests {
 
         let mf = checkpoint_to_memory(&cp);
 
-        assert_eq!(mf.name, "checkpoint_mmn_nellie-rs_2025-06-16");
+        assert_eq!(mf.name, "checkpoint_user_my-project_2025-06-16");
         assert_eq!(mf.memory_type, MemoryType::Project);
         assert_eq!(mf.description, "Implementing deep hooks");
         assert!(mf.content.contains("## Working On"));
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn test_checkpoint_index_entry_title() {
         let cp = make_checkpoint(
-            "mmn/nellie-rs",
+            "user/my-project",
             "Deep hooks phase 1",
             serde_json::json!({}),
             1_750_032_000,
@@ -1213,13 +1213,13 @@ mod tests {
 
         let (title, _filename, _hook) = checkpoint_to_index_entry(&cp);
 
-        assert_eq!(title, "checkpoint_mmn_nellie-rs_2025-06-16");
+        assert_eq!(title, "checkpoint_user_my-project_2025-06-16");
     }
 
     #[test]
     fn test_checkpoint_index_entry_filename() {
         let cp = make_checkpoint(
-            "mmn/nellie-rs",
+            "user/my-project",
             "work",
             serde_json::json!({}),
             1_750_032_000,
@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn test_checkpoint_roundtrip_memory_and_index() {
         let cp = make_checkpoint(
-            "mmn/nellie-rs",
+            "user/my-project",
             "Implementing checkpoint mapper",
             serde_json::json!({
                 "decisions": ["Parse state JSON", "Use Project type"],
@@ -1501,7 +1501,7 @@ mod tests {
     #[test]
     fn test_checkpoint_filename_is_filesystem_safe() {
         let tricky_agents = [
-            "mmn/nellie-rs",
+            "user/my-project",
             "org/team/deep-project",
             "simple",
             "with spaces",
@@ -1530,7 +1530,11 @@ mod tests {
 
     #[test]
     fn test_distinct_agents_produce_distinct_filenames() {
-        let agents = ["mmn/nellie-rs", "mmn/other-project", "other-user/nellie-rs"];
+        let agents = [
+            "user/my-project",
+            "user/other-project",
+            "other-user/my-project",
+        ];
 
         let filenames: Vec<String> = agents
             .iter()
@@ -1557,7 +1561,7 @@ mod tests {
         let filenames: Vec<String> = dates
             .iter()
             .map(|&ts| {
-                let cp = make_checkpoint("mmn/nellie-rs", "work", serde_json::json!({}), ts);
+                let cp = make_checkpoint("user/my-project", "work", serde_json::json!({}), ts);
                 checkpoint_to_memory(&cp).filename()
             })
             .collect();

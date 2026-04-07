@@ -56,6 +56,16 @@ fn is_default_ignored_path(path: &std::path::Path) -> bool {
     false
 }
 
+/// Filter entry for `ignore::WalkBuilder` — prunes excluded directories at walk-time.
+fn walk_filter_entry(entry: &ignore::DirEntry) -> bool {
+    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+        if let Some(name) = entry.file_name().to_str() {
+            return !crate::watcher::filter::is_excluded_dir(name);
+        }
+    }
+    true
+}
+
 /// Check if a path is on a network mount (NFS, SMB, CIFS, etc.)
 /// This is used to choose between fast walker (network) and gitignore-aware walker (local).
 fn is_network_path(path: &std::path::Path) -> bool {
@@ -2119,14 +2129,7 @@ async fn handle_trigger_reindex(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(|entry| {
-                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            return !crate::watcher::filter::is_excluded_dir(name);
-                        }
-                    }
-                    true
-                })
+                .filter_entry(walk_filter_entry)
                 .build();
 
             let mut indexed = 0u64;
@@ -2398,14 +2401,7 @@ async fn handle_index_repo(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(|entry| {
-                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            return !crate::watcher::filter::is_excluded_dir(name);
-                        }
-                    }
-                    true
-                })
+                .filter_entry(walk_filter_entry)
                 .build();
 
             let mut paths = Vec::new();
@@ -2575,14 +2571,7 @@ async fn handle_diff_index(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(|entry| {
-                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            return !crate::watcher::filter::is_excluded_dir(name);
-                        }
-                    }
-                    true
-                })
+                .filter_entry(walk_filter_entry)
                 .build();
 
             let mut paths = Vec::new();
@@ -2803,14 +2792,7 @@ async fn handle_full_reindex(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(|entry| {
-                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            return !crate::watcher::filter::is_excluded_dir(name);
-                        }
-                    }
-                    true
-                })
+                .filter_entry(walk_filter_entry)
                 .build();
 
             let mut paths = Vec::new();
@@ -4269,8 +4251,8 @@ mod tests {
 
     #[test]
     fn test_extract_agent_present() {
-        let args = serde_json::json!({"agent": "mmn/nellie-rs", "query": "test"});
-        assert_eq!(extract_agent(&args), "mmn/nellie-rs");
+        let args = serde_json::json!({"agent": "user/my-project", "query": "test"});
+        assert_eq!(extract_agent(&args), "user/my-project");
     }
 
     #[test]
