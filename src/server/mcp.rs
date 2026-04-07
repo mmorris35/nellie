@@ -37,47 +37,18 @@ fn should_index_file(path: &std::path::Path) -> bool {
     true
 }
 
-/// Check if a path matches default ignore patterns (mirrors scanner.rs logic).
+/// Check if a path matches default ignore patterns.
+/// Delegates to the shared exclusion list in `watcher::filter`.
 fn is_default_ignored_path(path: &std::path::Path) -> bool {
-    let ignored_dirs = [
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        "venv",
-        ".venv",
-        "vendor",
-        "obj",
-        "bin",
-        "coverage",
-        "egg-info",
-        ".egg-info",
-        "site-packages",
-        "bower_components",
-        ".terraform",
-    ];
-
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
             let name_str = name.to_string_lossy();
-            // Skip dotdirs (except .github)
+            if crate::watcher::filter::is_excluded_dir(&name_str) {
+                return true;
+            }
+            // Skip dotdirs (except .github) — the shared function
+            // handles known dotdirs, but catch any remaining ones
             if name_str.starts_with('.') && name_str.len() > 1 && name_str != ".github" {
-                return true;
-            }
-            // Skip known junk directories
-            if ignored_dirs
-                .iter()
-                .any(|&d| name_str == d || name_str.ends_with(d))
-            {
-                return true;
-            }
-            // Skip evidence directories
-            if name_str.starts_with("Raw_Evidence")
-                || name_str.starts_with("RawEvidence")
-                || name_str.starts_with("Evidence_")
-                || name_str.starts_with("Evidence ")
-            {
                 return true;
             }
         }
@@ -131,35 +102,8 @@ fn is_network_path(path: &std::path::Path) -> bool {
     false
 }
 
-/// Directories to always skip when walking (regardless of .gitignore)
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "target",
-    "build",
-    "dist",
-    ".next",
-    ".nuxt",
-    "vendor",
-    ".cargo",
-    ".rustup",
-    "Pods",
-    ".gradle",
-    ".idea",
-    ".vs",
-    ".vscode",
-    "coverage",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".tox",
-    "eggs",
-    "*.egg-info",
-    ".sass-cache",
-    "bower_components",
-];
+// Exclusion list is now shared via crate::watcher::filter::EXCLUDED_DIRS
+// and crate::watcher::filter::is_excluded_dir().
 
 /// Fast directory walker for network mounts.
 /// Skips gitignore parsing (expensive over network) and uses a simple skip list.
@@ -189,21 +133,13 @@ fn fast_walk_directory(root: &std::path::Path) -> Vec<std::path::PathBuf> {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
 
-            // Skip hidden files/dirs
-            if name.starts_with('.') && name != "." && name != ".." {
+            // Skip hidden files/dirs (except .github)
+            if name.starts_with('.') && name != "." && name != ".." && name != ".github" {
                 continue;
             }
 
-            // Skip known junk directories
-            if SKIP_DIRS.iter().any(|&skip| {
-                if skip.contains('*') {
-                    // Simple glob matching for *.egg-info etc
-                    let pattern = skip.trim_start_matches('*');
-                    name.ends_with(pattern)
-                } else {
-                    name == skip
-                }
-            }) {
+            // Skip excluded directories (node_modules, target, etc.)
+            if crate::watcher::filter::is_excluded_dir(&name) {
                 continue;
             }
 
@@ -236,18 +172,23 @@ pub struct McpState {
     pub graph: Option<std::sync::Arc<parking_lot::RwLock<crate::graph::GraphMemory>>>,
     /// Enable structural parsing (tree-sitter AST analysis)
     pub enable_structural: bool,
+    /// True while structural graph bootstrap is running in the background.
+    pub structural_bootstrapping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpState {
     /// Create new MCP state.
     #[must_use]
-    pub const fn new(db: Database) -> Self {
+    pub fn new(db: Database) -> Self {
         Self {
             db,
             embeddings: None,
             api_key: None,
             graph: None,
             enable_structural: false,
+            structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -261,18 +202,24 @@ impl McpState {
             api_key: None,
             graph: None,
             enable_structural: false,
+            structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
     /// Create MCP state with API key.
     #[must_use]
-    pub const fn with_api_key(db: Database, api_key: Option<String>) -> Self {
+    pub fn with_api_key(db: Database, api_key: Option<String>) -> Self {
         Self {
             db,
             embeddings: None,
             api_key,
             graph: None,
             enable_structural: false,
+            structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -290,6 +237,9 @@ impl McpState {
             api_key,
             graph: None,
             enable_structural: false,
+            structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -2169,6 +2119,14 @@ async fn handle_trigger_reindex(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut indexed = 0u64;
@@ -2300,9 +2258,14 @@ fn handle_get_status(state: &McpState) -> std::result::Result<serde_json::Value,
         .with_conn(|conn| crate::storage::count_tracked_files(conn))
         .unwrap_or(0);
 
+    let bootstrapping = state
+        .structural_bootstrapping
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     Ok(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "structural_bootstrapping": bootstrapping,
         "stats": {
             "chunks": chunk_count,
             "lessons": lesson_count,
@@ -2435,6 +2398,14 @@ async fn handle_index_repo(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut paths = Vec::new();
@@ -2604,6 +2575,14 @@ async fn handle_diff_index(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut paths = Vec::new();
@@ -2824,6 +2803,14 @@ async fn handle_full_reindex(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut paths = Vec::new();
@@ -4282,8 +4269,8 @@ mod tests {
 
     #[test]
     fn test_extract_agent_present() {
-        let args = serde_json::json!({"agent": "test/my-project", "query": "test"});
-        assert_eq!(extract_agent(&args), "test/my-project");
+        let args = serde_json::json!({"agent": "mmn/nellie-rs", "query": "test"});
+        assert_eq!(extract_agent(&args), "mmn/nellie-rs");
     }
 
     #[test]

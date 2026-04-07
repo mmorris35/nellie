@@ -8,7 +8,7 @@
 
 mod chunker;
 mod events;
-mod filter;
+pub mod filter;
 mod handler;
 mod indexer;
 mod scanner;

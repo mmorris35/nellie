@@ -156,11 +156,21 @@ pub fn bootstrap_structural(
     graph: &mut GraphMemory,
     db: &crate::storage::Database,
 ) -> crate::Result<crate::structural::graph_builder::StructuralGraphStats> {
-    // Load all symbols
+    // Load graph-worthy symbols only (skip imports and call_sites — they're queryable from SQLite)
+    // Cap at 10K symbols to keep startup under 2 minutes. Prioritize by kind: functions > classes > methods > tests.
     let symbols: Vec<crate::structural::storage::SymbolRecord> = db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
-                "SELECT id, file_path, symbol_name, symbol_kind, language, start_line, end_line, scope, signature, file_hash, indexed_at FROM symbols",
+                "SELECT id, file_path, symbol_name, symbol_kind, language, start_line, end_line, scope, signature, file_hash, indexed_at \
+                 FROM symbols \
+                 WHERE symbol_kind NOT IN ('import', 'call_site') \
+                 ORDER BY CASE symbol_kind \
+                   WHEN 'function' THEN 1 \
+                   WHEN 'class' THEN 2 \
+                   WHEN 'method' THEN 3 \
+                   WHEN 'test_function' THEN 4 \
+                   ELSE 5 END \
+                 LIMIT 10000",
             )
             .map_err(|e| crate::error::StorageError::Database(format!("failed to prepare symbols query: {e}")))?;
 
@@ -189,13 +199,19 @@ pub fn bootstrap_structural(
         Ok(result)
     })?;
 
-    // Load all structural edges
+    // Load structural edges only for graph-worthy symbols (skip edges from imports/call_sites)
     let edges: Vec<(i64, String, Option<String>, String)> = db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
-                "SELECT source_symbol_id, target_symbol_name, target_file_path, edge_kind FROM structural_edges",
+                "SELECT e.source_symbol_id, e.target_symbol_name, e.target_file_path, e.edge_kind \
+                 FROM structural_edges e \
+                 INNER JOIN symbols s ON s.id = e.source_symbol_id \
+                 WHERE s.symbol_kind NOT IN ('import', 'call_site') \
+                 LIMIT 10000",
             )
-            .map_err(|e| crate::error::StorageError::Database(format!("failed to prepare edges query: {e}")))?;
+            .map_err(|e| {
+                crate::error::StorageError::Database(format!("failed to prepare edges query: {e}"))
+            })?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -206,11 +222,15 @@ pub fn bootstrap_structural(
                     row.get::<_, String>(3)?,
                 ))
             })
-            .map_err(|e| crate::error::StorageError::Database(format!("failed to query edges: {e}")))?;
+            .map_err(|e| {
+                crate::error::StorageError::Database(format!("failed to query edges: {e}"))
+            })?;
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| crate::error::StorageError::Database(format!("failed to read edge: {e}")))?);
+            result.push(row.map_err(|e| {
+                crate::error::StorageError::Database(format!("failed to read edge: {e}"))
+            })?);
         }
         Ok(result)
     })?;
@@ -284,7 +304,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let cp = make_checkpoint("test/my-project", "implementing graph layer");
+        let cp = make_checkpoint("mmn/nellie-rs", "implementing graph layer");
         let (nodes, edges) = process_checkpoint(&mut graph, &cp);
         assert!(nodes >= 2); // agent + chunk
         assert!(edges >= 1); // agent -> chunk

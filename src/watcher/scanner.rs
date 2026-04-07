@@ -70,6 +70,16 @@ pub fn scan_directory(
         .git_exclude(true) // Respect .git/info/exclude
         .ignore(true) // Respect .ignore files
         .parents(true) // Check parent directories for ignore files
+        .filter_entry(|entry| {
+            // Skip excluded directories at walk-time to avoid traversing
+            // into node_modules/, target/, etc. (can contain 97K+ files)
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !super::filter::is_excluded_dir(name);
+                }
+            }
+            true
+        })
         .build();
 
     for entry in walker {
@@ -168,49 +178,11 @@ fn is_default_ignored(path: &Path, base: Option<&Path>) -> bool {
         }
     }
 
-    // Common build/dependency directories
-    let ignored_dirs = [
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        "venv",
-        ".venv",
-        "vendor",
-        "obj",
-        "bin",
-        "coverage",
-        "egg-info",
-        ".egg-info",
-        "site-packages",
-        "bower_components",
-        ".terraform",
-    ];
-
-    // Path prefixes that indicate non-source content
-    let ignored_prefixes = ["Raw_Evidence", "RawEvidence"];
-
+    // Check against shared exclusion list (node_modules, target, etc.)
     for component in check_path.components() {
         if let std::path::Component::Normal(name) = component {
             let name_str = name.to_string_lossy();
-            if ignored_prefixes.iter().any(|&p| name_str.starts_with(p)) {
-                return true;
-            }
-            // Catch "Evidence_YYYYMMDD" style directories
-            if name_str.starts_with("Evidence_") || name_str.starts_with("Evidence ") {
-                return true;
-            }
-        }
-    }
-
-    for component in check_path.components() {
-        if let std::path::Component::Normal(name) = component {
-            let name_str = name.to_string_lossy();
-            if ignored_dirs
-                .iter()
-                .any(|&d| name_str == d || name_str.ends_with(d))
-            {
+            if super::filter::is_excluded_dir(&name_str) {
                 return true;
             }
         }
