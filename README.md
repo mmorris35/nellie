@@ -56,64 +56,47 @@ Per-tool and per-agent metrics: invocation counts, latency histograms, token sav
 
 ### Quick Install (recommended)
 
-Clone and run the install script. It installs Rust, build tools, ONNX Runtime, the embedding model, and builds from source:
-
 ```bash
 git clone https://github.com/mmorris35/nellie.git && cd nellie
 bash packaging/install-universal.sh
 ```
 
-You will be asked for your sudo password once at the start (to install build tools), then the installer runs non-interactively. When it finishes, `nellie serve` starts automatically.
+This handles everything: Rust toolchain, build tools, ONNX Runtime, embedding model, build, service setup, and bootstrap lessons. When it finishes, Nellie is running with all features enabled.
 
 ### Manual Build
 
-**Prerequisites**: Rust 1.75+, C compiler, pkg-config, OpenSSL dev headers, libclang-dev
+**Prerequisites:** Rust 1.75+, C compiler, pkg-config, OpenSSL headers, libclang
 
 ```bash
 # Ubuntu/Debian
 sudo apt install -y build-essential pkg-config libssl-dev libclang-dev
-
-# macOS — Xcode Command Line Tools are installed automatically by rustup/cargo
 ```
-
-Then clone, build, and run `nellie setup` to download the ONNX Runtime and embedding model:
 
 ```bash
 git clone https://github.com/mmorris35/nellie.git && cd nellie
 cargo build --release
-./target/release/nellie setup   # downloads ONNX Runtime + embedding model
+./target/release/nellie setup          # downloads ONNX Runtime + embedding model
+./target/release/nellie bootstrap      # imports starter lessons
 ```
 
-`nellie setup` is idempotent -- running it again skips files that are already present.
-
-### Pre-built Binaries
-
-Pre-built binaries are also available from [GitHub Releases](https://github.com/mmorris35/nellie-rs/releases/latest). After downloading, run `nellie setup` to fetch the ONNX Runtime and embedding model:
-
-- [nellie-macos-aarch64](https://github.com/mmorris35/nellie-rs/releases/latest) -- Apple Silicon (M1/M2/M3)
-- [nellie-macos-x86_64](https://github.com/mmorris35/nellie-rs/releases/latest) -- Intel Mac
-- [nellie-linux-x86_64](https://github.com/mmorris35/nellie-rs/releases/latest) -- Linux x86_64
-- [nellie-linux-aarch64](https://github.com/mmorris35/nellie-rs/releases/latest) -- Linux ARM64
-
-## Quick Start
+### Connect to Claude Code
 
 ```bash
-# Start server with all features enabled, watching your code directories
-nellie serve --enable-graph --enable-structural --enable-deep-hooks --watch ~/code,~/projects --port 8765
+# Start the server (all features enabled)
+./target/release/nellie serve \
+  --host 0.0.0.0 --port 8765 \
+  --data-dir ~/.local/share/nellie \
+  --watch ~/projects \
+  --enable-graph --enable-structural --enable-deep-hooks \
+  --sync-interval 30
 
-# Health check
+# In another terminal:
+claude mcp add nellie --transport sse http://localhost:8765/sse --scope user
+nellie hooks-install --server http://localhost:8765
+
+# Verify
 curl http://localhost:8765/health
-
-# Install Claude Code hooks (auto-sync on session start, auto-ingest on stop)
-nellie hooks-install
-
-# Or sync manually from a remote Nellie instance
-nellie sync --rules --server http://your-server:8765
-
-# Hybrid search (vector + graph expansion)
-curl -X POST http://localhost:8765/mcp/invoke \
-  -H "Content-Type: application/json" \
-  -d '{"name": "search_hybrid", "arguments": {"query": "OAuth authentication", "limit": 5}}'
+nellie list-lessons    # should show bootstrap lessons
 ```
 
 ## Architecture
@@ -159,12 +142,12 @@ When agents save lessons and checkpoints with structured metadata (tools used, p
 
 | Type | Examples |
 |------|----------|
-| **Agent** | `claude`, `user/my-project` |
+| **Agent** | `claude`, `mmn/nellie-rs` |
 | **Tool** | `cargo`, `reqwest`, `git` |
 | **Problem** | `OAuth timeout`, `WAL lock contention` |
 | **Solution** | `use async/await`, `enable WAL2 mode` |
 | **Concept** | `MCP`, `HTTP routing`, `embeddings` |
-| **Person** | `Alice` |
+| **Person** | `Mike` |
 | **Project** | `nellie-rs`, `whag` |
 | **Chunk** | Links to indexed code snippets |
 
@@ -201,7 +184,7 @@ When saving checkpoints and lessons, include graph fields to feed the knowledge 
 **Checkpoint graph fields:**
 ```json
 {
-  "agent": "user/my-project",
+  "agent": "mmn/nellie-rs",
   "working_on": "Fix OAuth timeout",
   "state": { "..." },
   "tools_used": ["reqwest", "cargo"],
@@ -449,14 +432,12 @@ systemctl --user start nellie
 sudo loginctl enable-linger $USER  # Start on boot without login
 ```
 
-> **Upgrade note:** Users with large watch directories may see a one-time initial filesystem scan on first boot after upgrading. This is expected and builds the index. To skip it, pass `--skip-initial-walk` to `nellie serve`.
-
 ## Multi-Machine Sync with Syncthing
 
 For teams or multi-machine setups, use [Syncthing](https://syncthing.net/) to keep code synchronized:
 
 ```
-Server <-> workstation <-> laptop
+BigDev (source) <-> server <-> workstation <-> laptop
                          |
                     Nellie indexes
                     local copy

@@ -219,7 +219,6 @@ async fn download_to_file(
     }
     eprintln!();
     file.flush().await?;
-    file.sync_all().await?;
 
     let digest = hex::encode(hasher.finalize());
     Ok(digest)
@@ -361,9 +360,6 @@ async fn extract_ort_archive(
             if name.starts_with(base)
                 && name != base
                 && f.metadata().map(|m| m.len() > 0).unwrap_or(false)
-                && versioned
-                    .as_ref()
-                    .map_or(true, |v: &String| name.len() > v.len())
             {
                 versioned = Some(name);
             }
