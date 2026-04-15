@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nellie-rs.server</string>
+    <string>com.nellie.server</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -14,7 +14,7 @@
         <string>--port</string>
         <string>8766</string>
         <string>--data-dir</string>
-        <string>/var/lib/nellie-rs</string>
+        <string>/var/lib/nellie</string>
         <string>--watch</string>
         <string>/path/to/your/repos</string>
     </array>
@@ -29,13 +29,13 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/var/lib/nellie-rs</string>
+    <string>/var/lib/nellie</string>
 
     <key>StandardOutPath</key>
-    <string>/var/lib/nellie-rs/logs/nellie.out.log</string>
+    <string>/var/lib/nellie/logs/nellie.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/var/lib/nellie-rs/logs/nellie.err.log</string>
+    <string>/var/lib/nellie/logs/nellie.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

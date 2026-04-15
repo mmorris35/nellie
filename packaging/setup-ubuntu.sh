@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AI Dev Environment Setup for Ubuntu 25.04+
-# Installs: OpenClaw, Claude Code, Nellie-RS, DevPlan MCP
+# Installs: OpenClaw, Claude Code, Nellie, DevPlan MCP
 # =============================================================================
 
 set -euo pipefail
@@ -68,16 +68,16 @@ install_claude_code() {
 }
 
 install_nellie() {
-    step "Installing Nellie-RS..."
-    curl -sSL https://raw.githubusercontent.com/mmorris35/nellie-rs/main/packaging/install-universal.sh | bash
+    step "Installing Nellie..."
+    curl -sSL https://raw.githubusercontent.com/mmorris35/nellie/main/packaging/install-universal.sh | bash
     
     # Wait for service to start
     sleep 3
     
     if curl -s http://localhost:8765/health &>/dev/null; then
-        info "Nellie-RS running on http://localhost:8765"
+        info "Nellie running on http://localhost:8765"
     else
-        warn "Nellie installed but may need configuration. Edit ~/.nellie-rs/config.toml"
+        warn "Nellie installed but may need configuration. Edit ~/.local/share/nellie/config.toml"
     fi
 }
 
@@ -101,7 +101,7 @@ configure_watch_dirs() {
     done
     
     if [[ ${#dirs[@]} -gt 0 ]]; then
-        cat > ~/.nellie-rs/config.toml << EOF
+        cat > ~/.local/share/nellie/config.toml << EOF
 [server]
 host = "127.0.0.1"
 port = 8765
@@ -192,9 +192,9 @@ verify_installation() {
     # Nellie
     if curl -s http://localhost:8765/health &>/dev/null; then
         local stats=$(curl -s http://localhost:8765/health)
-        info "Nellie-RS: running (healthy)"
+        info "Nellie: running (healthy)"
     else
-        error "Nellie-RS: not running"
+        error "Nellie: not running"
     fi
     
     # mcporter
@@ -267,7 +267,7 @@ show_menu() {
     echo "  2) Install Prerequisites (Node.js, build tools)"
     echo "  3) Install OpenClaw"
     echo "  4) Install Claude Code"
-    echo "  5) Install Nellie-RS"
+    echo "  5) Install Nellie"
     echo ""
     echo "  Configuration:"
     echo "  6) Configure Nellie Watch Directories"
@@ -329,7 +329,7 @@ else
             echo "  --prereq    Install prerequisites only"
             echo "  --openclaw  Install OpenClaw only"
             echo "  --claude    Install Claude Code only"
-            echo "  --nellie    Install Nellie-RS only"
+            echo "  --nellie    Install Nellie only"
             echo "  --verify    Verify installation status"
             ;;
         *) error "Unknown option: $1"; exit 1 ;;

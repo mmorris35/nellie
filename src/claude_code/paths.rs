@@ -55,9 +55,9 @@ pub fn resolve_claude_dir() -> crate::Result<PathBuf> {
 /// # use std::path::Path;
 /// # use nellie::claude_code::paths::resolve_project_memory_dir;
 /// let dir = resolve_project_memory_dir(
-///     Path::new("/home/user/github/nellie-rs"),
+///     Path::new("/home/user/github/example"),
 /// )?;
-/// // ~/.claude/projects/-home-user-github-nellie-rs/memory/
+/// // ~/.claude/projects/-home-user-github-example/memory/
 /// ```
 pub fn resolve_project_memory_dir(cwd: &Path) -> crate::Result<PathBuf> {
     let sanitized = sanitize_cwd(cwd);
@@ -113,8 +113,8 @@ pub fn resolve_transcript_dir(cwd: &Path) -> crate::Result<PathBuf> {
 /// 1. Convert the path to a string representation
 /// 2. Replace all `/` characters with `-`
 ///
-/// This produces names like `-home-user-github-nellie-rs` from
-/// `/home/user/github/nellie-rs`.
+/// This produces names like `-home-user-github-example` from
+/// `/home/user/github/example`.
 ///
 /// # Arguments
 ///
@@ -126,8 +126,8 @@ pub fn resolve_transcript_dir(cwd: &Path) -> crate::Result<PathBuf> {
 /// # use std::path::Path;
 /// # use nellie::claude_code::paths::sanitize_cwd;
 /// assert_eq!(
-///     sanitize_cwd(Path::new("/home/user/github/nellie-rs")),
-///     "-home-user-github-nellie-rs"
+///     sanitize_cwd(Path::new("/home/user/github/example")),
+///     "-home-user-github-example"
 /// );
 /// ```
 pub fn sanitize_cwd(cwd: &Path) -> String {
@@ -209,8 +209,8 @@ mod tests {
 
     #[test]
     fn test_sanitize_cwd_basic() {
-        let result = sanitize_cwd(Path::new("/home/user/github/nellie-rs"));
-        assert_eq!(result, "-home-user-github-nellie-rs");
+        let result = sanitize_cwd(Path::new("/home/user/github/example"));
+        assert_eq!(result, "-home-user-github-example");
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn test_resolve_project_memory_dir_structure() {
         // Test that the path has the correct structure
-        let result = resolve_project_memory_dir(Path::new("/home/user/github/nellie-rs"));
+        let result = resolve_project_memory_dir(Path::new("/home/user/github/example"));
         // This should succeed on any system with a home directory
         let path = result.expect("home dir should be resolvable");
         let path_str = path.to_string_lossy();
@@ -258,7 +258,7 @@ mod tests {
         );
         // Should contain the sanitized cwd
         assert!(
-            path_str.contains("-home-user-github-nellie-rs"),
+            path_str.contains("-home-user-github-example"),
             "path should contain sanitized cwd: {path_str}"
         );
         // Should end with /memory
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_resolve_transcript_dir_structure() {
-        let result = resolve_transcript_dir(Path::new("/home/user/github/nellie-rs"));
+        let result = resolve_transcript_dir(Path::new("/home/user/github/example"));
         let path = result.expect("home dir should be resolvable");
         let path_str = path.to_string_lossy();
 
@@ -304,7 +304,7 @@ mod tests {
             "path should contain .claude/projects/: {path_str}"
         );
         assert!(
-            path_str.contains("-home-user-github-nellie-rs"),
+            path_str.contains("-home-user-github-example"),
             "path should contain sanitized cwd: {path_str}"
         );
         // Transcript dir does NOT end with /memory

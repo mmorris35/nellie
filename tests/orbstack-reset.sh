@@ -11,7 +11,7 @@ echo "=== Resetting nellie-test VM to clean state ==="
 run 'pkill -f "nellie serve" 2>/dev/null; pkill -f "nellie" 2>/dev/null; true'
 
 # Remove Nellie data, models, lib, config
-run 'rm -rf ~/.local/share/nellie ~/.nellie-rs ~/.config/nellie /tmp/nellie*'
+run 'rm -rf ~/.local/share/nellie ~/.config/nellie /tmp/nellie*'
 
 # Remove Nellie binary from PATH locations
 run 'rm -f ~/.local/bin/nellie'

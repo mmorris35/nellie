@@ -107,7 +107,7 @@ pub const TOKENS_PER_CHAR: f64 = 0.25;
 /// # Arguments
 ///
 /// * `tool_name` - MCP tool name (e.g., `"search_code"`)
-/// * `agent` - Agent identifier (e.g., `"mmn/nellie-rs"`) or `"unknown"`
+/// * `agent` - Agent identifier (e.g., `"user/example"`) or `"unknown"`
 /// * `status` - `"success"` or `"error"`
 /// * `latency` - Time elapsed for the tool call
 /// * `response_bytes` - Size of the response payload in bytes (0 for errors)

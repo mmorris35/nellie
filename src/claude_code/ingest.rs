@@ -25,7 +25,7 @@
 //! ```rust,ignore
 //! let config = IngestConfig {
 //!     transcript_path: None,
-//!     project_path: Some(Path::new("/home/mmn/github/nellie-rs").to_path_buf()),
+//!     project_path: Some(Path::new("/home/user/github/example").to_path_buf()),
 //!     since: Some(1630000000), // Unix timestamp
 //!     dry_run: false,
 //! };

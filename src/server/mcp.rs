@@ -4304,8 +4304,8 @@ mod tests {
 
     #[test]
     fn test_extract_agent_present() {
-        let args = serde_json::json!({"agent": "mmn/nellie-rs", "query": "test"});
-        assert_eq!(extract_agent(&args), "mmn/nellie-rs");
+        let args = serde_json::json!({"agent": "user/example", "query": "test"});
+        assert_eq!(extract_agent(&args), "user/example");
     }
 
     #[test]
