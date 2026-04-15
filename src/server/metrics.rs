@@ -107,7 +107,7 @@ pub const TOKENS_PER_CHAR: f64 = 0.25;
 /// # Arguments
 ///
 /// * `tool_name` - MCP tool name (e.g., `"search_code"`)
-/// * `agent` - Agent identifier (e.g., `"test/my-project"`) or `"unknown"`
+/// * `agent` - Agent identifier (e.g., `"mmn/nellie-rs"`) or `"unknown"`
 /// * `status` - `"success"` or `"error"`
 /// * `latency` - Time elapsed for the tool call
 /// * `response_bytes` - Size of the response payload in bytes (0 for errors)
@@ -144,8 +144,8 @@ fn get_label_value(metric: &proto::Metric, name: &str) -> String {
     metric
         .get_label()
         .iter()
-        .find(|lp| lp.name() == name)
-        .map_or_else(String::new, |lp| lp.value().to_string())
+        .find(|lp| lp.get_name() == name)
+        .map_or_else(String::new, |lp| lp.get_value().to_string())
 }
 
 /// Estimate p95 latency from a prometheus histogram.
@@ -162,9 +162,9 @@ fn estimate_p95_from_histogram(h: &proto::Histogram) -> f64 {
     let buckets = h.get_bucket();
 
     for bucket in buckets {
-        if bucket.cumulative_count() >= target {
+        if bucket.get_cumulative_count() >= target {
             // Return bucket upper bound in milliseconds
-            return bucket.upper_bound() * 1000.0;
+            return bucket.get_upper_bound() * 1000.0;
         }
     }
 
@@ -208,7 +208,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
             let tool = get_label_value(metric, "tool");
             let agent = get_label_value(metric, "agent");
             let status = get_label_value(metric, "status");
-            let count = metric.counter.value() as u64;
+            let count = metric.get_counter().get_value() as u64;
 
             let tool_entry = tools.entry(tool).or_insert_with(|| ToolAccum {
                 invocations: 0,
@@ -260,7 +260,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
         for metric in family.get_metric() {
             let tool = get_label_value(metric, "tool");
             let agent = get_label_value(metric, "agent");
-            let value = metric.counter.value();
+            let value = metric.get_counter().get_value();
 
             if let Some(entry) = tools.get_mut(&tool) {
                 entry.tokens_saved += value;
@@ -276,7 +276,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
     for family in &bytes_families {
         for metric in family.get_metric() {
             let tool = get_label_value(metric, "tool");
-            let value = metric.counter.value() as u64;
+            let value = metric.get_counter().get_value() as u64;
 
             if let Some(entry) = tools.get_mut(&tool) {
                 entry.response_bytes += value;
@@ -370,7 +370,7 @@ mod tests {
         // Record a successful tool call
         record_tool_call(
             "search_code",
-            "test/test",
+            "mmn/test",
             "success",
             std::time::Duration::from_millis(42),
             1024,
@@ -378,7 +378,7 @@ mod tests {
 
         // Verify counter incremented
         let count = TOOL_INVOCATIONS
-            .with_label_values(&["search_code", "test/test", "success"])
+            .with_label_values(&["search_code", "mmn/test", "success"])
             .get();
         assert!(
             count >= 1,
@@ -387,13 +387,13 @@ mod tests {
 
         // Verify latency recorded
         let latency = TOOL_LATENCY
-            .with_label_values(&["search_code", "test/test"])
+            .with_label_values(&["search_code", "mmn/test"])
             .get_sample_count();
         assert!(latency >= 1, "latency histogram should have >= 1 sample");
 
         // Verify response bytes recorded
         let bytes = TOOL_RESPONSE_BYTES
-            .with_label_values(&["search_code", "test/test"])
+            .with_label_values(&["search_code", "mmn/test"])
             .get();
         assert!(
             bytes >= 1024,
@@ -402,7 +402,7 @@ mod tests {
 
         // Verify token savings estimated
         let tokens = TOKEN_SAVINGS
-            .with_label_values(&["search_code", "test/test"])
+            .with_label_values(&["search_code", "mmn/test"])
             .get();
         assert!(
             tokens >= 256.0,
@@ -435,14 +435,14 @@ mod tests {
         // Record some tool calls so there is data to collect
         record_tool_call(
             "collect_test_tool",
-            "test/collect-test",
+            "mmn/collect-test",
             "success",
             std::time::Duration::from_millis(100),
             512,
         );
         record_tool_call(
             "collect_test_tool",
-            "test/collect-test",
+            "mmn/collect-test",
             "error",
             std::time::Duration::from_millis(5),
             0,
@@ -475,11 +475,8 @@ mod tests {
         let agent = summary
             .agents
             .iter()
-            .find(|a| a.agent == "test/collect-test");
-        assert!(
-            agent.is_some(),
-            "test/collect-test should be in agents list"
-        );
+            .find(|a| a.agent == "mmn/collect-test");
+        assert!(agent.is_some(), "mmn/collect-test should be in agents list");
         let agent = agent.unwrap();
         assert!(agent.invocations >= 2);
     }

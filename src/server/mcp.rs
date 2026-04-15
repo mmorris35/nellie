@@ -56,16 +56,6 @@ fn is_default_ignored_path(path: &std::path::Path) -> bool {
     false
 }
 
-/// Filter entry for `ignore::WalkBuilder` — prunes excluded directories at walk-time.
-fn walk_filter_entry(entry: &ignore::DirEntry) -> bool {
-    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-        if let Some(name) = entry.file_name().to_str() {
-            return !crate::watcher::filter::is_excluded_dir(name);
-        }
-    }
-    true
-}
-
 /// Check if a path is on a network mount (NFS, SMB, CIFS, etc.)
 /// This is used to choose between fast walker (network) and gitignore-aware walker (local).
 fn is_network_path(path: &std::path::Path) -> bool {
@@ -1214,6 +1204,43 @@ fn handle_query_graph(
 
     let graph = graph_lock.read(); // parking_lot RwLock
 
+    // Issue #55 — no-label queries must mirror build_full_graph in src/server/api.rs.
+    // Without a label, GraphQuery has no seed and returns empty. Users running
+    // exploratory queries ("what's in my graph?") need direct entity iteration.
+    if args["label"].as_str().is_none() {
+        let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+
+        let entities: Vec<&crate::graph::Entity> = if let Some(etype) = args["entity_type"].as_str()
+        {
+            crate::graph::EntityType::parse(etype)
+                .map(|t| graph.entities_by_type(t))
+                .unwrap_or_default()
+        } else {
+            graph.all_entities()
+        };
+
+        let formatted: Vec<serde_json::Value> = entities
+            .into_iter()
+            .take(limit)
+            .map(|e| {
+                serde_json::json!({
+                    "entity": {
+                        "id": e.id,
+                        "type": e.entity_type,
+                        "label": e.label,
+                    },
+                    "path": [],
+                    "depth": 0,
+                })
+            })
+            .collect();
+
+        return Ok(serde_json::json!({
+            "results": formatted,
+            "count": formatted.len(),
+        }));
+    }
+
     // Build query from parameters
     let mut query = crate::graph::query::GraphQuery::new(&graph);
 
@@ -2129,7 +2156,14 @@ async fn handle_trigger_reindex(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(walk_filter_entry)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut indexed = 0u64;
@@ -2401,7 +2435,14 @@ async fn handle_index_repo(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(walk_filter_entry)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut paths = Vec::new();
@@ -2571,7 +2612,14 @@ async fn handle_diff_index(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(walk_filter_entry)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut paths = Vec::new();
@@ -2792,7 +2840,14 @@ async fn handle_full_reindex(
                 .git_exclude(true)
                 .ignore(true)
                 .parents(true)
-                .filter_entry(walk_filter_entry)
+                .filter_entry(|entry| {
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            return !crate::watcher::filter::is_excluded_dir(name);
+                        }
+                    }
+                    true
+                })
                 .build();
 
             let mut paths = Vec::new();
@@ -2901,6 +2956,7 @@ async fn handle_full_reindex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GraphConfig;
 
     #[test]
     fn test_tools_defined() {
@@ -4251,8 +4307,8 @@ mod tests {
 
     #[test]
     fn test_extract_agent_present() {
-        let args = serde_json::json!({"agent": "user/my-project", "query": "test"});
-        assert_eq!(extract_agent(&args), "user/my-project");
+        let args = serde_json::json!({"agent": "mmn/nellie-rs", "query": "test"});
+        assert_eq!(extract_agent(&args), "mmn/nellie-rs");
     }
 
     #[test]
@@ -4767,5 +4823,149 @@ mod tests {
         assert!(response["test_coverage"].is_number());
         assert!(response["untested_functions"].is_number());
         assert!(response["changed_symbol_names"].is_array());
+    }
+
+    #[test]
+    fn query_graph_no_label_returns_entities() {
+        // Create an in-memory database and a minimal graph with entities
+        let db = crate::storage::Database::open_in_memory()
+            .expect("Failed to create in-memory database");
+        db.with_conn(|conn| crate::storage::migrate(conn))
+            .expect("Failed to migrate");
+
+        // Create a graph with sample data
+        let mut graph = crate::graph::GraphMemory::new(GraphConfig {
+            enabled: true,
+            ..GraphConfig::default()
+        });
+
+        // Add some test entities
+        graph.add_entity(crate::graph::Entity::new(
+            "e1".to_string(),
+            crate::graph::EntityType::Tool,
+            "reqwest".to_string(),
+        ));
+        graph.add_entity(crate::graph::Entity::new(
+            "e2".to_string(),
+            crate::graph::EntityType::Tool,
+            "tokio".to_string(),
+        ));
+        graph.add_entity(crate::graph::Entity::new(
+            "e3".to_string(),
+            crate::graph::EntityType::Problem,
+            "timeout handling".to_string(),
+        ));
+
+        // Create state with the populated graph
+        let mut state = McpState::new(db);
+        state.set_graph(graph);
+
+        // Call handle_query_graph with no label (empty args triggers the no-label path)
+        let args = serde_json::json!({});
+        let result = handle_query_graph(&state, &args).expect("query_graph failed");
+
+        // Verify response structure
+        assert!(result["results"].is_array());
+        assert!(result["count"].is_number());
+
+        let count = result["count"].as_u64().unwrap_or(0) as usize;
+        assert!(
+            count > 0,
+            "no-label query should return entities, got {count}"
+        );
+        assert_eq!(
+            count, 3,
+            "query should return all 3 entities when no filters applied"
+        );
+
+        // Verify each result has the expected structure
+        let results = result["results"].as_array().unwrap();
+        for item in results {
+            assert!(item["entity"].is_object());
+            assert!(item["entity"]["id"].is_string());
+            assert!(item["entity"]["type"].is_string());
+            assert!(item["entity"]["label"].is_string());
+            assert_eq!(item["path"], serde_json::json!([]));
+            assert_eq!(item["depth"], 0);
+        }
+    }
+
+    #[test]
+    fn query_graph_no_label_respects_entity_type_filter() {
+        let db = crate::storage::Database::open_in_memory()
+            .expect("Failed to create in-memory database");
+        db.with_conn(|conn| crate::storage::migrate(conn))
+            .expect("Failed to migrate");
+
+        // Create a graph with mixed entity types
+        let mut graph = crate::graph::GraphMemory::new(GraphConfig {
+            enabled: true,
+            ..GraphConfig::default()
+        });
+
+        graph.add_entity(crate::graph::Entity::new(
+            "t1".to_string(),
+            crate::graph::EntityType::Tool,
+            "reqwest".to_string(),
+        ));
+        graph.add_entity(crate::graph::Entity::new(
+            "t2".to_string(),
+            crate::graph::EntityType::Tool,
+            "serde".to_string(),
+        ));
+        graph.add_entity(crate::graph::Entity::new(
+            "p1".to_string(),
+            crate::graph::EntityType::Problem,
+            "concurrent access".to_string(),
+        ));
+
+        let mut state = McpState::new(db);
+        state.set_graph(graph);
+
+        // Query with entity_type filter but no label
+        let args = serde_json::json!({
+            "entity_type": "tool"
+        });
+        let result = handle_query_graph(&state, &args).expect("query_graph failed");
+
+        let count = result["count"].as_u64().unwrap_or(0) as usize;
+        assert_eq!(
+            count, 2,
+            "entity_type filter should return only 2 tools, got {count}"
+        );
+    }
+
+    #[test]
+    fn query_graph_no_label_respects_limit() {
+        let db = crate::storage::Database::open_in_memory()
+            .expect("Failed to create in-memory database");
+        db.with_conn(|conn| crate::storage::migrate(conn))
+            .expect("Failed to migrate");
+
+        let mut graph = crate::graph::GraphMemory::new(GraphConfig {
+            enabled: true,
+            ..GraphConfig::default()
+        });
+
+        // Add more than the limit
+        for i in 0..10 {
+            graph.add_entity(crate::graph::Entity::new(
+                format!("e{i}"),
+                crate::graph::EntityType::Tool,
+                format!("tool-{i}"),
+            ));
+        }
+
+        let mut state = McpState::new(db);
+        state.set_graph(graph);
+
+        // Query with limit
+        let args = serde_json::json!({
+            "limit": 3
+        });
+        let result = handle_query_graph(&state, &args).expect("query_graph failed");
+
+        let count = result["count"].as_u64().unwrap_or(0) as usize;
+        assert_eq!(count, 3, "limit should restrict results to 3, got {count}");
     }
 }

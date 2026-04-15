@@ -191,7 +191,7 @@ mod tests {
         // Simulate a tool call
         metrics::record_tool_call(
             "search_code",
-            "test/test-agent",
+            "mmn/test-agent",
             "success",
             std::time::Duration::from_millis(150),
             2048,
@@ -237,7 +237,7 @@ mod tests {
         );
         // Verify agent label is present
         assert!(
-            body_str.contains("test/test-agent"),
+            body_str.contains("mmn/test-agent"),
             "metrics should contain agent label value"
         );
         // Verify tool label is present

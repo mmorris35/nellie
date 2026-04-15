@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn test_real_format_user_entry() {
         // Mirrors the actual Claude Code JSONL format observed.
-        let jsonl = r#"{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"/home/user/projects/my-project","sessionId":"0d74b5ea-5186-4d10-8bda-7820a699573e","version":"2.1.63","gitBranch":"main","type":"user","message":{"role":"user","content":"have we started work on the dev plan v plan yet?"},"uuid":"7886c22d-835e-41a9-86fa-6f28c872ec3e","timestamp":"2026-03-02T03:11:24.649Z","permissionMode":"bypassPermissions"}"#;
+        let jsonl = r#"{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"/home/mmn/github/nellie-rs","sessionId":"0d74b5ea-5186-4d10-8bda-7820a699573e","version":"2.1.63","gitBranch":"main","type":"user","message":{"role":"user","content":"have we started work on the dev plan v plan yet?"},"uuid":"7886c22d-835e-41a9-86fa-6f28c872ec3e","timestamp":"2026-03-02T03:11:24.649Z","permissionMode":"bypassPermissions"}"#;
 
         let entries = parse_transcript_str(jsonl);
         assert_eq!(entries.len(), 1);
@@ -943,7 +943,7 @@ mod tests {
         let e = &entries[0];
         assert_eq!(e.uuid, "7886c22d-835e-41a9-86fa-6f28c872ec3e");
         assert_eq!(e.session_id, "0d74b5ea-5186-4d10-8bda-7820a699573e");
-        assert_eq!(e.cwd.as_deref(), Some("/home/user/projects/my-project"));
+        assert_eq!(e.cwd.as_deref(), Some("/home/mmn/github/nellie-rs"));
         assert_eq!(e.git_branch.as_deref(), Some("main"));
         assert_eq!(e.timestamp, 1_772_421_084);
 
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_real_format_assistant_tool_use() {
-        let jsonl = r#"{"parentUuid":"prev-uuid","isSidechain":false,"userType":"external","cwd":"/home/user/projects/my-project","sessionId":"sess-abc","version":"2.1.63","gitBranch":"main","slug":"peppy-foraging-bonbon","message":{"model":"claude-opus-4-6","id":"msg_abc","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01EQk8c5PRmvnKF1ogQ9EiMu","name":"Read","input":{"file_path":"/home/user/projects/my-project/DEVELOPMENT_PLAN.md","limit":100},"caller":{"type":"direct"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":10}},"requestId":"req_abc","type":"assistant","uuid":"d9fdc723-9f4f-46a6-80a4-e64f12fbcf19","timestamp":"2026-03-02T03:11:29.825Z"}"#;
+        let jsonl = r#"{"parentUuid":"prev-uuid","isSidechain":false,"userType":"external","cwd":"/home/mmn/github/nellie-rs","sessionId":"sess-abc","version":"2.1.63","gitBranch":"main","slug":"peppy-foraging-bonbon","message":{"model":"claude-opus-4-6","id":"msg_abc","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01EQk8c5PRmvnKF1ogQ9EiMu","name":"Read","input":{"file_path":"/home/mmn/github/nellie-rs/DEVELOPMENT_PLAN.md","limit":100},"caller":{"type":"direct"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":10}},"requestId":"req_abc","type":"assistant","uuid":"d9fdc723-9f4f-46a6-80a4-e64f12fbcf19","timestamp":"2026-03-02T03:11:29.825Z"}"#;
 
         let entries = parse_transcript_str(jsonl);
         assert_eq!(entries.len(), 1);
@@ -967,7 +967,7 @@ mod tests {
                 assert_eq!(name, "Read");
                 assert_eq!(
                     input["file_path"],
-                    "/home/user/projects/my-project/DEVELOPMENT_PLAN.md"
+                    "/home/mmn/github/nellie-rs/DEVELOPMENT_PLAN.md"
                 );
             }
             other => panic!("expected ToolUse, got {:?}", other),

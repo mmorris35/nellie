@@ -74,7 +74,7 @@ enum Commands {
         host: String,
 
         /// Port to listen on
-        #[arg(short, long, env = "NELLIE_PORT", default_value = "8080")]
+        #[arg(short, long, env = "NELLIE_PORT", default_value = "8765")]
         port: u16,
 
         /// Directories to watch for code changes (comma-separated)
@@ -104,6 +104,11 @@ enum Commands {
         /// Periodic sync interval in minutes (default: 30)
         #[arg(long, env = "NELLIE_SYNC_INTERVAL", default_value = "30")]
         sync_interval: u64,
+
+        /// Skip the initial filesystem walk on startup (use DB-first reconciliation only).
+        /// Useful for resume-after-crash scenarios where a walk would be wasteful.
+        #[arg(long, default_value_t = false)]
+        skip_initial_walk: bool,
     },
 
     /// Manually index a directory
@@ -115,9 +120,14 @@ enum Commands {
         #[arg(value_name = "PATH")]
         paths: Vec<PathBuf>,
 
-        /// Number of embedding worker threads
-        #[arg(long, env = "NELLIE_EMBEDDING_THREADS", default_value = "4")]
-        embedding_threads: usize,
+        /// Nellie server URL. If set, routes through the running server via HTTP
+        /// instead of opening the DB directly. Avoids dual-writer corruption.
+        #[arg(long, default_value = "http://127.0.0.1:8765")]
+        server: String,
+
+        /// Force local indexing even if a server is reachable
+        #[arg(long, default_value_t = false)]
+        local: bool,
     },
 
     /// Search for code semantically
@@ -138,7 +148,7 @@ enum Commands {
         threshold: f32,
 
         /// Server URL
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        #[arg(long, default_value = "http://127.0.0.1:8765")]
         server: String,
     },
 
@@ -148,7 +158,7 @@ enum Commands {
     /// Requires the server to be running.
     Status {
         /// Server URL
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        #[arg(long, default_value = "http://127.0.0.1:8765")]
         server: String,
 
         /// Output format (text or json)
@@ -204,7 +214,7 @@ enum Commands {
         /// When set, queries lessons and checkpoints from the remote
         /// server instead of the local database. Memory files are
         /// still written locally.
-        /// Example: --server http://localhost:8765
+        /// Example: --server http://100.87.147.89:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -246,9 +256,44 @@ enum Commands {
         ///
         /// When set, POSTs extracted lessons to the remote server
         /// instead of storing in the local database.
-        /// Example: --server http://localhost:8765
+        /// Example: --server http://100.87.147.89:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
+    },
+
+    /// Inject Nellie context into Claude Code for the current prompt
+    ///
+    /// Searches Nellie for lessons and context relevant to the user's prompt,
+    /// filters by relevance threshold, and writes them to a temporary rules file
+    /// that Claude Code loads before processing the prompt.
+    /// This enables automatic knowledge enrichment without explicit memory files.
+    ///
+    /// Designed to be called via the UserPromptSubmit hook with the user's
+    /// prompt text as the query.
+    Inject {
+        /// Search query (typically the user's prompt text)
+        #[arg(long)]
+        query: String,
+
+        /// Maximum number of results to inject
+        #[arg(long, default_value = "3")]
+        limit: usize,
+
+        /// Minimum relevance score (0.0-1.0, higher = more relevant)
+        #[arg(long, default_value = "0.4")]
+        threshold: f64,
+
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "800")]
+        timeout: u64,
+
+        /// Nellie server URL for remote operation
+        #[arg(long, env = "NELLIE_SERVER")]
+        server: Option<String>,
+
+        /// Show what would be injected without writing files
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Install Nellie hooks in Claude Code settings.json
@@ -284,6 +329,24 @@ enum Commands {
         /// Output in JSON format instead of human-readable text
         #[arg(long)]
         json: bool,
+    },
+
+    /// Download ONNX Runtime, embedding model, and tokenizer
+    ///
+    /// For users who build Nellie from source (`cargo build --release`),
+    /// this command downloads the required runtime files. Equivalent to
+    /// what `packaging/install-universal.sh` does for the quick-install path.
+    /// Files are verified with SHA-256 checksums. Re-running is safe
+    /// (existing files are skipped).
+    #[command(name = "setup")]
+    Setup {
+        /// Skip ONNX Runtime download
+        #[arg(long)]
+        skip_runtime: bool,
+
+        /// Skip embedding model download
+        #[arg(long)]
+        skip_model: bool,
     },
 }
 
@@ -321,6 +384,7 @@ async fn main() -> Result<()> {
             enable_structural,
             enable_deep_hooks,
             sync_interval,
+            skip_initial_walk,
         }) => {
             serve_command(ServeCommandArgs {
                 data_dir: cli.data_dir,
@@ -335,13 +399,15 @@ async fn main() -> Result<()> {
                 enable_structural,
                 enable_deep_hooks,
                 sync_interval,
+                skip_initial_walk,
             })
             .await
         }
         Some(Commands::Index {
             paths,
-            embedding_threads,
-        }) => index_command(cli.data_dir, paths, embedding_threads),
+            server,
+            local,
+        }) => index_command(paths, server, local, cli.data_dir).await,
         Some(Commands::Search {
             query,
             limit,
@@ -377,18 +443,40 @@ async fn main() -> Result<()> {
             dry_run,
             server,
         }) => ingest_command(cli.data_dir, transcript, project, since, dry_run, server).await,
+        Some(Commands::Inject {
+            query,
+            limit,
+            threshold,
+            timeout,
+            server,
+            dry_run,
+        }) => {
+            inject_command(
+                &query,
+                limit,
+                threshold,
+                timeout,
+                server.as_deref(),
+                dry_run,
+            )
+            .await
+        }
         Some(Commands::HooksInstall { force, server }) => {
             hooks_install_command(force, server.as_deref())
         }
         Some(Commands::HooksUninstall) => hooks_uninstall_command(),
         Some(Commands::HooksStatus { json }) => hooks_status_command(json),
+        Some(Commands::Setup {
+            skip_runtime,
+            skip_model,
+        }) => setup_command(&cli.data_dir, skip_runtime, skip_model).await,
         None => {
             // Default to serve command for backward compatibility
             tracing::info!("No command specified, starting server (use 'serve' explicitly)");
             serve_command(ServeCommandArgs {
                 data_dir: cli.data_dir,
                 host: "127.0.0.1".to_string(),
-                port: 8080,
+                port: 8765,
                 watch: vec![],
                 embedding_threads: 4,
                 log_level: cli.log_level,
@@ -398,6 +486,7 @@ async fn main() -> Result<()> {
                 enable_structural: false,
                 enable_deep_hooks: false,
                 sync_interval: 30,
+                skip_initial_walk: false,
             })
             .await
         }
@@ -419,6 +508,7 @@ struct ServeCommandArgs {
     enable_structural: bool,
     enable_deep_hooks: bool,
     sync_interval: u64,
+    skip_initial_walk: bool,
 }
 
 /// Background task for transcript watcher.
@@ -663,6 +753,25 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
     // Initialize metrics
     init_metrics();
 
+    // Startup ORT version check (issue #60).
+    // Eagerly load the ONNX Runtime library and validate its version before
+    // creating any Session.  On mismatch the error explains exactly what is
+    // needed — no more silent crash-loops.
+    if !args.disable_embeddings {
+        match nellie::embeddings::version::check_ort_version() {
+            Ok(build_info) => {
+                tracing::info!(
+                    min = nellie::embeddings::version::MIN_ORT_VERSION,
+                    "ONNX Runtime loaded — {build_info}"
+                );
+            }
+            Err(msg) => {
+                tracing::error!("{msg}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Create and run server
     let server_config = ServerConfig {
         host: args.host,
@@ -713,13 +822,22 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
         tokio::spawn(async move {
             indexer_clone.run(index_rx, delete_rx).await;
         });
-        // Startup reconciliation: iterate file_state DB instead of walking NFS tree.
+        // Startup reconciliation: walk filesystem on startup or use DB-first mode.
         // For each known file, stat() it — if gone, delete from index; if changed, re-index.
         // New files are discovered by the watcher (FSEvents).
         let index_tx_scan = index_tx;
         let delete_tx_scan = delete_tx.clone();
+        let skip_walk = args.skip_initial_walk;
+        let watch_dirs = args.watch.clone();
         std::thread::spawn(move || {
-            reconcile_from_db(&scan_db, &index_tx_scan, &delete_tx_scan);
+            if skip_walk {
+                tracing::info!("--skip-initial-walk set, using DB-first reconciliation only");
+                reconcile_from_db(&scan_db, &index_tx_scan, &delete_tx_scan);
+            } else if let Err(e) =
+                reconcile_with_walk(&scan_db, &watch_dirs, &index_tx_scan, &delete_tx_scan)
+            {
+                tracing::error!(error = ?e, "Filesystem walk reconciliation failed");
+            }
         });
 
         // Start file watcher for ongoing changes — uses direct indexer calls
@@ -779,6 +897,138 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
     }
 
     app.run().await
+}
+
+/// Statistics from filesystem walk reconciliation.
+#[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
+struct WalkStats {
+    /// Total files seen during the walk.
+    seen: usize,
+    /// Files queued for indexing.
+    queued: usize,
+    /// Files restaged (changed since last index).
+    restaged: usize,
+}
+
+/// Walk the watch directories on startup, reconcile against the DB (respecting .gitignore),
+/// and queue any new or stale files for indexing. Runs BEFORE the incremental watcher starts.
+///
+/// This is what users expect on a fresh install — point Nellie at an existing repo and have
+/// it indexed automatically.
+///
+/// # Errors
+///
+/// Returns an error if the walk fails or if unable to compute file hashes.
+#[allow(clippy::unnecessary_wraps)]
+fn reconcile_with_walk(
+    db: &Database,
+    watch_dirs: &[PathBuf],
+    index_tx: &tokio::sync::mpsc::Sender<IndexRequest>,
+    delete_tx: &tokio::sync::mpsc::Sender<std::path::PathBuf>,
+) -> Result<WalkStats> {
+    use ignore::WalkBuilder;
+
+    tracing::info!(
+        "Starting filesystem walk reconciliation for {} dirs",
+        watch_dirs.len()
+    );
+    let mut stats = WalkStats::default();
+
+    for dir in watch_dirs {
+        if !dir.exists() {
+            tracing::warn!(path = ?dir, "Watch directory does not exist, skipping");
+            continue;
+        }
+
+        let walker = WalkBuilder::new(dir)
+            .standard_filters(true) // honors .gitignore, hidden, etc.
+            .build();
+
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            stats.seen += 1;
+
+            if !FileFilter::is_code_file(path) || is_default_ignored_path(path) {
+                continue;
+            }
+
+            // Read file and compute hash
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(path = ?path, error = %e, "Failed to read file");
+                    continue;
+                }
+            };
+
+            let file_hash = compute_hash(&content);
+            let path_str = path.to_string_lossy();
+
+            // Check if file is already indexed with the same hash
+            let already_indexed = db
+                .with_conn(
+                    |conn| match nellie::storage::get_file_state(conn, &path_str) {
+                        Ok(Some(file_state)) => Ok(file_state.hash == file_hash),
+                        Ok(None) => Ok(false),
+                        Err(e) => Err(e),
+                    },
+                )
+                .unwrap_or(false);
+
+            if already_indexed {
+                stats.restaged += 1;
+            } else {
+                stats.queued += 1;
+                let language = FileFilter::detect_language(path).map(String::from);
+                let request = IndexRequest {
+                    path: path.to_path_buf(),
+                    language,
+                };
+                if index_tx.blocking_send(request).is_err() {
+                    tracing::warn!("Index channel closed during walk reconciliation");
+                    return Ok(stats);
+                }
+            }
+        }
+    }
+
+    // After the walk, also run DB reconciliation to catch deleted files
+    let paths = match db.with_conn(nellie::storage::list_file_paths) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list file paths from DB during walk");
+            return Ok(stats);
+        }
+    };
+
+    for path_str in paths {
+        let path = PathBuf::from(&path_str);
+        if !path.exists() && delete_tx.blocking_send(path).is_err() {
+            tracing::warn!("Delete channel closed during walk reconciliation");
+            return Ok(stats);
+        }
+    }
+
+    tracing::info!(
+        seen = stats.seen,
+        queued = stats.queued,
+        restaged = stats.restaged,
+        "Filesystem walk reconciliation complete"
+    );
+    Ok(stats)
+}
+
+/// Compute blake3 hash of content.
+fn compute_hash(content: &str) -> String {
+    use blake3::Hasher;
+    let mut hasher = Hasher::new();
+    hasher.update(content.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Reconcile index state from DB on startup (no filesystem walk).
@@ -923,40 +1173,207 @@ fn is_default_ignored_path(path: &std::path::Path) -> bool {
     false
 }
 
-/// Index command: Manually index directories
-#[allow(clippy::unnecessary_wraps)]
-fn index_command(_data_dir: PathBuf, paths: Vec<PathBuf>, embedding_threads: usize) -> Result<()> {
+/// Index command: Manually index directories via HTTP-first, local fallback.
+///
+/// When the server is reachable, routes through the HTTP API. Otherwise falls
+/// back to local indexing which initializes an embedding service directly.
+async fn index_command(
+    paths: Vec<PathBuf>,
+    server: String,
+    force_local: bool,
+    data_dir: PathBuf,
+) -> Result<()> {
     if paths.is_empty() {
-        return Err(nellie::Error::internal(
-            "at least one path must be specified",
-        ));
+        return Err(nellie::Error::internal("nellie index: no paths provided"));
     }
 
-    tracing::info!(
-        "Starting manual indexing of {} directories with {} threads",
-        paths.len(),
-        embedding_threads
-    );
+    for path in &paths {
+        if !path.exists() {
+            return Err(nellie::Error::internal(format!(
+                "Path does not exist: {}",
+                path.display()
+            )));
+        }
+    }
 
-    // Initialize database
-    let db = Database::open(Config::default().database_path())?;
-    init_storage(&db)?;
+    // Prefer routing through the running server (avoids dual-DB writes).
+    if !force_local {
+        match try_index_via_server(&server, &paths).await {
+            Ok(summary) => {
+                println!(
+                    "Indexing complete via {}: {} files, {} chunks, {:.1}s",
+                    server, summary.files, summary.chunks, summary.elapsed_secs
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "Could not reach server at {}, falling back to local indexing",
+                    server
+                );
+            }
+        }
+    }
 
-    // Initialize metrics
-    init_metrics();
+    // Local path: walk, embed, persist directly. Uses an exclusive DB lock.
+    index_locally(&paths, &data_dir).await
+}
+
+/// Summary of indexing results.
+#[derive(Debug)]
+struct IndexSummary {
+    files: usize,
+    chunks: usize,
+    elapsed_secs: f64,
+}
+
+/// Attempt to index via HTTP POST to the running server.
+async fn try_index_via_server(server: &str, paths: &[PathBuf]) -> Result<IndexSummary> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| nellie::Error::internal(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut total_files = 0usize;
+    let mut total_chunks = 0usize;
+    let start = std::time::Instant::now();
 
     for path in paths {
-        if !path.exists() {
-            tracing::warn!("Path does not exist: {:?}", path);
-            continue;
-        }
+        let body = serde_json::json!({
+            "name": "index_repo",
+            "arguments": { "path": path.to_string_lossy() }
+        });
+        let resp = client
+            .post(format!("{}/mcp/invoke", server.trim_end_matches('/')))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| nellie::Error::internal(format!("HTTP request failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| nellie::Error::internal(format!("Server returned error: {e}")))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| nellie::Error::internal(format!("Failed to parse response: {e}")))?;
 
-        tracing::info!("Indexing: {:?}", path);
-        // TODO: Implement directory indexing
-        // This will be called from watcher module with actual indexing logic
+        if let Some(files) = resp
+            .pointer("/content/files_indexed")
+            .and_then(serde_json::Value::as_u64)
+        {
+            total_files += files as usize;
+        }
+        if let Some(chunks) = resp
+            .pointer("/content/chunks_created")
+            .and_then(serde_json::Value::as_u64)
+        {
+            total_chunks += chunks as usize;
+        }
     }
 
-    tracing::info!("Indexing complete");
+    Ok(IndexSummary {
+        files: total_files,
+        chunks: total_chunks,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+/// Index locally by walking paths and calling the Indexer directly.
+///
+/// Initializes the embedding service so files are actually chunked and embedded.
+///
+/// WARNING: This function assumes the server is NOT running. Concurrent writes
+/// to the database will result in corruption. Only use --local when the server
+/// is down.
+async fn index_locally(paths: &[PathBuf], data_dir: &Path) -> Result<()> {
+    use ignore::WalkBuilder;
+    use nellie::embeddings::{EmbeddingConfig, EmbeddingService};
+
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let db = Database::open(config.database_path())?;
+    init_storage(&db)?;
+
+    // Validate ONNX Runtime version before creating any Session (issue #60).
+    match nellie::embeddings::version::check_ort_version() {
+        Ok(build_info) => {
+            tracing::info!(
+                min = nellie::embeddings::version::MIN_ORT_VERSION,
+                "ONNX Runtime loaded — {build_info}"
+            );
+        }
+        Err(msg) => {
+            return Err(nellie::Error::internal(msg));
+        }
+    }
+
+    // Initialize the embedding service so chunks actually get embeddings.
+    let emb_config = EmbeddingConfig::from_data_dir(data_dir, 4);
+    if !emb_config.model_path.exists() {
+        return Err(nellie::Error::internal(format!(
+            "Embedding model not found at {}. \
+             Run `nellie setup` or start the server first.",
+            emb_config.model_path.display()
+        )));
+    }
+    if !emb_config.tokenizer_path.exists() {
+        return Err(nellie::Error::internal(format!(
+            "Tokenizer not found at {}. \
+             Run `nellie setup` or start the server first.",
+            emb_config.tokenizer_path.display()
+        )));
+    }
+
+    let embedding_service = EmbeddingService::new(emb_config);
+    embedding_service.init().await.map_err(|e| {
+        nellie::Error::internal(format!(
+            "Failed to initialize embedding service: {e}. \
+             Ensure ONNX Runtime is installed \
+             (set ORT_DYLIB_PATH or run `nellie setup`)."
+        ))
+    })?;
+    tracing::info!("Embedding service initialized for local indexing");
+
+    let indexer = Indexer::new(db.clone(), Some(embedding_service), false);
+
+    let mut total_files = 0usize;
+    let mut total_chunks = 0usize;
+    let start = std::time::Instant::now();
+
+    for path in paths {
+        let walker = WalkBuilder::new(path).standard_filters(true).build();
+        for entry in walker.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            // Detect language and create index request
+            let language = FileFilter::detect_language(p).map(String::from);
+            let request = IndexRequest {
+                path: p.to_path_buf(),
+                language,
+            };
+            match indexer.index_file(&request).await {
+                Ok(chunks) => {
+                    if chunks > 0 {
+                        total_files += 1;
+                        total_chunks += chunks;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = ?p, error = ?e, "Local index failed for file");
+                }
+            }
+        }
+    }
+
+    println!(
+        "Local indexing complete: {} files, {} chunks in {:.1}s",
+        total_files,
+        total_chunks,
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -1335,6 +1752,85 @@ fn status_command(_server: String, format: String) -> Result<()> {
     Ok(())
 }
 
+/// Inject command: Inject Nellie context for the current prompt
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+async fn inject_command(
+    query: &str,
+    limit: usize,
+    threshold: f64,
+    timeout_ms: u64,
+    server: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    use nellie::claude_code::inject::{execute_inject, InjectConfig};
+
+    let start = std::time::Instant::now();
+
+    // Build inject config
+    let config = InjectConfig {
+        query: query.to_string(),
+        limit,
+        threshold,
+        timeout_ms,
+        dry_run,
+    };
+
+    tracing::info!(
+        query = %config.query,
+        limit = config.limit,
+        threshold = config.threshold,
+        timeout_ms = config.timeout_ms,
+        dry_run = config.dry_run,
+        server = server.unwrap_or("local"),
+        "Starting context injection"
+    );
+
+    // Run the injection pipeline
+    let result = execute_inject(&config, server).await?;
+
+    let elapsed = start.elapsed();
+    let total_ms = elapsed.as_millis() as u64;
+
+    if dry_run {
+        println!("=== Dry Run ===");
+        println!("Query: {}", config.query);
+        println!("Limit: {}", config.limit);
+        println!("Threshold: {}", config.threshold);
+        println!("Timeout: {}ms", config.timeout_ms);
+        println!("Server: {}", server.unwrap_or("local"));
+        println!();
+        println!(
+            "Results: {} injected, {} skipped",
+            result.injected_count, result.skipped_count
+        );
+        println!("Elapsed: {total_ms}ms");
+    } else {
+        if result.injected_count > 0 {
+            println!(
+                "Injected {} lessons ({} skipped, threshold={})",
+                result.injected_count, result.skipped_count, threshold
+            );
+            if let Some(path) = &result.file_path {
+                println!("File: {path}");
+            }
+        } else {
+            println!("No relevant context found (threshold={threshold})");
+        }
+        tracing::info!(
+            injected = result.injected_count,
+            skipped = result.skipped_count,
+            elapsed_ms = total_ms,
+            "Injection complete"
+        );
+
+        // Write last_inject_time timestamp for hooks-status
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let _ = nellie::claude_code::paths::write_state_timestamp(&cwd, "last_inject_time");
+    }
+
+    Ok(())
+}
+
 /// Hooks Install command: Install Nellie hooks to Claude Code settings.json
 fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
     use nellie::claude_code::hooks::install_hooks;
@@ -1382,6 +1878,12 @@ fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
         let server_info = server.map_or(String::new(), |s| format!(" --server {s}"));
         println!("  ✓ Stop (nellie ingest --project \"$PWD\" --since 1h{server_info})");
     }
+    if report.user_prompt_submit_installed {
+        let server_info = server.map_or(String::new(), |s| format!(" --server {s}"));
+        println!(
+            "  ✓ UserPromptSubmit (nellie inject --query \"$CC_USER_PROMPT\" --limit 3{server_info})"
+        );
+    }
     if report.backup_created {
         println!();
         println!("Backup created: {}.bak", report.settings_path.display());
@@ -1401,23 +1903,26 @@ fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
     // Run initial sync
     println!();
     println!("Running initial sync...");
-    let mut sync_cmd = std::process::Command::new("nellie");
-    sync_cmd.arg("sync").arg("--rules");
-    if let Some(url) = server {
-        sync_cmd.arg("--server").arg(url);
-    }
-    match sync_cmd.status() {
+    let sync_cmd = server.map_or_else(
+        || "nellie sync --rules".to_string(),
+        |url| format!("nellie sync --rules --server {url}"),
+    );
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sync_cmd)
+        .status()
+    {
         Ok(status) if status.success() => {
             println!("  ✓ Initial sync complete");
         }
         Ok(status) => {
             eprintln!(
-                "  ✗ Initial sync failed (exit {})",
+                "  ✗ Initial sync failed (exit {}). Run manually: {sync_cmd}",
                 status.code().unwrap_or(-1)
             );
         }
         Err(e) => {
-            eprintln!("  ✗ Could not run initial sync: {e}");
+            eprintln!("  ✗ Could not run initial sync: {e}. Run manually: {sync_cmd}");
         }
     }
 
@@ -1465,6 +1970,14 @@ fn hooks_status_command(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Run the `nellie setup` command: download ORT, model, and tokenizer.
+async fn setup_command(data_dir: &Path, skip_runtime: bool, skip_model: bool) -> Result<()> {
+    nellie::setup::run_setup(data_dir, skip_runtime, skip_model)
+        .await
+        .map_err(|e| nellie::Error::internal(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1485,6 +1998,7 @@ mod tests {
             enable_structural,
             enable_deep_hooks,
             sync_interval,
+            skip_initial_walk,
         }) = cli.command
         {
             assert_eq!(host, "0.0.0.0");
@@ -1496,6 +2010,7 @@ mod tests {
             assert!(!enable_structural);
             assert!(!enable_deep_hooks);
             assert_eq!(sync_interval, 30);
+            assert!(!skip_initial_walk);
         } else {
             panic!("Expected Serve command");
         }
@@ -1509,11 +2024,13 @@ mod tests {
         let cli = cli.unwrap();
         if let Some(Commands::Index {
             paths,
-            embedding_threads,
+            server,
+            local,
         }) = cli.command
         {
             assert_eq!(paths.len(), 1);
-            assert_eq!(embedding_threads, 4);
+            assert_eq!(server, "http://127.0.0.1:8765");
+            assert!(!local);
         } else {
             panic!("Expected Index command");
         }
@@ -1535,7 +2052,7 @@ mod tests {
             assert_eq!(query, "find auth handler");
             assert_eq!(limit, 10);
             assert_eq!(threshold, 0.5);
-            assert_eq!(server, "http://127.0.0.1:8080");
+            assert_eq!(server, "http://127.0.0.1:8765");
         } else {
             panic!("Expected Search command");
         }
@@ -1548,7 +2065,7 @@ mod tests {
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         if let Some(Commands::Status { server, format }) = cli.command {
-            assert_eq!(server, "http://127.0.0.1:8080");
+            assert_eq!(server, "http://127.0.0.1:8765");
             assert_eq!(format, "text");
         } else {
             panic!("Expected Status command");
@@ -1710,11 +2227,89 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parsing_setup_defaults() {
+        let args = vec!["nellie", "setup"];
+        let cli = Cli::try_parse_from(args);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Setup {
+            skip_runtime,
+            skip_model,
+        }) = cli.command
+        {
+            assert!(!skip_runtime);
+            assert!(!skip_model);
+            // data_dir comes from the global Cli.data_dir (with default)
+            assert!(!cli.data_dir.as_os_str().is_empty());
+        } else {
+            panic!("Expected Setup command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_setup_all_flags() {
+        let args = vec![
+            "nellie",
+            "setup",
+            "--data-dir",
+            "/tmp/nellie-data",
+            "--skip-runtime",
+            "--skip-model",
+        ];
+        let cli = Cli::try_parse_from(args);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Setup {
+            skip_runtime,
+            skip_model,
+        }) = cli.command
+        {
+            // --data-dir is a global arg on Cli, accessible via cli.data_dir
+            assert_eq!(cli.data_dir, PathBuf::from("/tmp/nellie-data"));
+            assert!(skip_runtime);
+            assert!(skip_model);
+        } else {
+            panic!("Expected Setup command");
+        }
+    }
+
+    #[test]
     fn test_cli_help_message() {
         // Test that help parsing doesn't crash
         let args = vec!["nellie", "--help"];
         let _cli = Cli::try_parse_from(args);
         // --help causes exit, so we just verify parsing doesn't panic
         // Real test would need to capture output
+    }
+
+    #[test]
+    fn test_walk_stats_default() {
+        let stats = WalkStats::default();
+        assert_eq!(stats.seen, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.restaged, 0);
+    }
+
+    #[test]
+    fn default_port_matches_config_example() {
+        const CONFIG_EXAMPLE: &str = include_str!("../config.example.yaml");
+        // Parse enough of the YAML to find the `port:` line
+        let port_line = CONFIG_EXAMPLE
+            .lines()
+            .find(|l| l.trim_start().starts_with("port:"))
+            .expect("config.example.yaml missing port:");
+        assert!(
+            port_line.contains("8765"),
+            "config.example.yaml port does not match CLI default 8765: {port_line}"
+        );
+    }
+
+    #[test]
+    fn readme_mentions_port_8765() {
+        const README: &str = include_str!("../README.md");
+        let count_8765 = README.matches("localhost:8765").count();
+        let count_8080 = README.matches("localhost:8080").count();
+        assert!(count_8765 >= 1, "README should reference localhost:8765");
+        assert_eq!(count_8080, 0, "README still references localhost:8080");
     }
 }

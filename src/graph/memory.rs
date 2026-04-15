@@ -513,7 +513,7 @@ mod tests {
         let mut graph = GraphMemory::new(test_config());
         graph.add_entity(make_entity("n1", EntityType::Tool, "reqwest"));
         graph.add_entity(make_entity("n2", EntityType::Tool, "serde"));
-        graph.add_entity(make_entity("n3", EntityType::Person, "alice"));
+        graph.add_entity(make_entity("n3", EntityType::Person, "mike"));
         let tools = graph.entities_by_type(EntityType::Tool);
         assert_eq!(tools.len(), 2);
     }

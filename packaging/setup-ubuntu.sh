@@ -69,7 +69,7 @@ install_claude_code() {
 
 install_nellie() {
     step "Installing Nellie-RS..."
-    curl -sSL https://raw.githubusercontent.com/mmorris35/nellie/main/packaging/install-universal.sh | bash
+    curl -sSL https://raw.githubusercontent.com/mmorris35/nellie-rs/main/packaging/install-universal.sh | bash
     
     # Wait for service to start
     sleep 3

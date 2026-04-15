@@ -16,7 +16,7 @@
         <string>--data-dir</string>
         <string>/var/lib/nellie-rs</string>
         <string>--watch</string>
-        <string>/path/to/your/repos</string>
+        <string>/Volumes/mike-github/github,/Volumes/lono-github/github,/Volumes/mmn-github/github</string>
     </array>
 
     <key>RunAtLoad</key>
