@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nellie-RS macOS Installation Script
-# macOS install script for Nellie-RS
+# macOS install script for Nellie
 
 set -e
 

@@ -361,11 +361,16 @@ async fn extract_ort_archive(
             if name.starts_with(base)
                 && name != base
                 && f.metadata().map(|m| m.len() > 0).unwrap_or(false)
-                && versioned
-                    .as_ref()
-                    .map_or(true, |v: &String| name.len() > v.len())
             {
-                versioned = Some(name);
+                // Pick the longest filename (e.g. libonnxruntime.so.1.24.4
+                // over libonnxruntime.so.1) to ensure we symlink to the
+                // fully-versioned real file, not a shorter intermediate.
+                if versioned
+                    .as_ref()
+                    .map_or(true, |prev| name.len() > prev.len())
+                {
+                    versioned = Some(name);
+                }
             }
         }
         if let Some(ref real_name) = versioned {

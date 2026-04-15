@@ -6,9 +6,8 @@
 //! that a version mismatch produces a clear, actionable error instead of a
 //! cryptic crash-loop.
 //!
-//! The `RECOMMENDED_ORT_VERSION` constant must stay in sync with the version
-//! pinned in `packaging/install-universal.sh` (`ORT_VERSION`).
-//! `MIN_ORT_VERSION` is the compatibility floor.
+//! The `MIN_ORT_VERSION` constant must stay in sync with the version pinned in
+//! `packaging/install-universal.sh` (`ORT_VERSION`).
 
 /// Minimum supported ONNX Runtime version.
 ///
@@ -110,31 +109,29 @@ pub fn check_ort_version() -> Result<String, String> {
             // Library loaded successfully — grab the build info string.
             let info = ort::info().to_string();
 
-            // Try to extract and validate the version from the build info.
-            // The info string typically contains "git-branch=rel-1.24.4".
+            // Parse version from build info (e.g. "git-branch=rel-1.24.4")
+            // and verify it meets the minimum requirement.
             if let Some(ver_str) = info
-                .split("git-branch=rel-")
+                .split("rel-")
                 .nth(1)
                 .and_then(|s| s.split(|c: char| !c.is_ascii_digit() && c != '.').next())
             {
                 if let Some(found) = parse_version(ver_str) {
                     if !is_compatible(found) {
                         return Err(format!(
-                            "ONNX Runtime {ver_str} is too old \
-                             (minimum: {MIN_ORT_VERSION}, \
-                             recommended: {RECOMMENDED_ORT_VERSION}).\n\
+                            "ONNX Runtime {ver_str} is too old.\n\
+                             \n\
+                             Nellie requires ONNX Runtime >= {MIN_ORT_VERSION} \
+                             (recommended: {RECOMMENDED_ORT_VERSION}).\n\
                              \n\
                              To fix:\n  \
                              1. Run `nellie setup` to download the correct version, or\n  \
-                             2. Set ORT_DYLIB_PATH to a compatible libonnxruntime.{{so,dylib}}, or\n  \
+                             2. Set ORT_DYLIB_PATH to a compatible \
+                             libonnxruntime.{{so,dylib}}, or\n  \
                              3. Re-run `bash packaging/install-universal.sh`."
                         ));
                     }
-                } else {
-                    tracing::warn!("Could not parse ORT version from info string: {info}");
                 }
-            } else {
-                tracing::warn!("Could not extract ORT version from build info: {info}");
             }
 
             Ok(info)
