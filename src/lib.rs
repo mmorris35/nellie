@@ -43,6 +43,7 @@
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::cast_lossless)]
 
+pub mod bootstrap;
 pub mod claude_code;
 pub mod config;
 pub mod embeddings;

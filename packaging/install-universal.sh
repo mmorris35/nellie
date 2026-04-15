@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-REPO="mmorris35/nellie-rs"
+REPO="mmorris35/nellie"
 INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.nellie-rs}"
 BIN_DIR="${NELLIE_BIN_DIR:-$HOME/.local/bin}"
 
@@ -427,9 +427,24 @@ setup_macos_service() {
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/nellie</string>
-        <string>--config</string>
-        <string>$INSTALL_DIR/config.toml</string>
+        <string>serve</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8765</string>
+        <string>--data-dir</string>
+        <string>$HOME/.local/share/nellie</string>
+        <string>--enable-graph</string>
+        <string>--enable-structural</string>
+        <string>--enable-deep-hooks</string>
+        <string>--sync-interval</string>
+        <string>30</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ORT_DYLIB_PATH</key>
+        <string>$HOME/.local/share/nellie/lib/libonnxruntime.so</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -466,8 +481,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/nellie --config $INSTALL_DIR/config.toml
+ExecStart=$INSTALL_DIR/nellie serve --host 0.0.0.0 --port 8765 --data-dir $HOME/.local/share/nellie --enable-graph --enable-structural --enable-deep-hooks --sync-interval 30
 WorkingDirectory=$INSTALL_DIR
+Environment=ORT_DYLIB_PATH=$HOME/.local/share/nellie/lib/libonnxruntime.so
 Restart=on-failure
 RestartSec=5
 
@@ -522,7 +538,14 @@ main() {
     install_nellie_binary
     create_config
     setup_shell
-    
+
+    # Bootstrap default lessons BEFORE starting the service.
+    # The bootstrap command opens SQLite directly, so it must not run
+    # while the service is also writing to the DB.
+    echo ""
+    info "Bootstrapping default lessons..."
+    ORT_DYLIB_PATH="$NELLIE_LIB_DIR/libonnxruntime.so" "$BIN_DIR/nellie" bootstrap --data-dir "$NELLIE_DATA_DIR" 2>&1 || warn "Bootstrap failed (non-fatal)"
+
     # Setup service based on OS
     echo ""
     if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -530,7 +553,43 @@ main() {
     else
         setup_linux_service
     fi
-    
+
+    # Post-install verification
+    info "Verifying installation..."
+
+    # 1. Version check
+    if ! "$BIN_DIR/nellie" --version >/dev/null 2>&1; then
+        warn "nellie --version failed"
+    fi
+
+    # 2. Wait for server to be ready (up to 15 seconds)
+    local ready=false
+    for i in $(seq 1 15); do
+        if curl -fsS "http://127.0.0.1:8765/health" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$ready" = true ]; then
+        info "Server health check passed"
+    else
+        warn "Server not responding on port 8765 after 15s"
+    fi
+
+    # 3. Verify bootstrap lessons
+    local lesson_count
+    lesson_count=$(curl -fsS -X POST http://127.0.0.1:8765/mcp/invoke \
+        -H 'Content-Type: application/json' \
+        -d '{"name":"list_lessons","arguments":{}}' 2>/dev/null | \
+        grep -o '"lesson_' | wc -l | tr -d ' ')
+    if [ "${lesson_count:-0}" -ge 8 ]; then
+        info "Bootstrap lessons verified ($lesson_count lessons)"
+    else
+        warn "Expected >= 8 bootstrap lessons, found ${lesson_count:-0}"
+    fi
+
     echo ""
     echo "═══════════════════════════════════════════"
     echo ""
