@@ -159,12 +159,12 @@ When agents save lessons and checkpoints with structured metadata (tools used, p
 
 | Type | Examples |
 |------|----------|
-| **Agent** | `claude`, `mmn/nellie-rs` |
+| **Agent** | `claude`, `user/my-project` |
 | **Tool** | `cargo`, `reqwest`, `git` |
 | **Problem** | `OAuth timeout`, `WAL lock contention` |
 | **Solution** | `use async/await`, `enable WAL2 mode` |
 | **Concept** | `MCP`, `HTTP routing`, `embeddings` |
-| **Person** | `Mike` |
+| **Person** | `Alice` |
 | **Project** | `nellie-rs`, `whag` |
 | **Chunk** | Links to indexed code snippets |
 
@@ -201,7 +201,7 @@ When saving checkpoints and lessons, include graph fields to feed the knowledge 
 **Checkpoint graph fields:**
 ```json
 {
-  "agent": "mmn/nellie-rs",
+  "agent": "user/my-project",
   "working_on": "Fix OAuth timeout",
   "state": { "..." },
   "tools_used": ["reqwest", "cargo"],
@@ -449,12 +449,14 @@ systemctl --user start nellie
 sudo loginctl enable-linger $USER  # Start on boot without login
 ```
 
+> **Upgrade note:** Users with large watch directories may see a one-time initial filesystem scan on first boot after upgrading. This is expected and builds the index. To skip it, pass `--skip-initial-walk` to `nellie serve`.
+
 ## Multi-Machine Sync with Syncthing
 
 For teams or multi-machine setups, use [Syncthing](https://syncthing.net/) to keep code synchronized:
 
 ```
-BigDev (source) <-> mini-dev-server <-> workstation <-> laptop
+Server <-> workstation <-> laptop
                          |
                     Nellie indexes
                     local copy
@@ -619,7 +621,7 @@ You can also run injection manually for testing:
 nellie inject --query "how do I use Nellie?" --dry-run
 
 # Run against a remote Nellie instance
-nellie inject --query "authentication" --server http://100.87.147.89:8765
+nellie inject --query "authentication" --server http://localhost:8765
 
 # Control relevance threshold (0.0–1.0, default 0.6)
 nellie inject --query "test" --threshold 0.8

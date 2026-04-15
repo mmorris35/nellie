@@ -210,8 +210,20 @@ pub fn install_hooks(force: bool, server: Option<&str>) -> Result<HookInstallRep
     });
 
     if let Some(ups_val) = hooks.get_mut("UserPromptSubmit") {
-        // Append to existing array
+        // Dedup: remove any existing nellie inject entries before adding
         if let Some(arr) = ups_val.as_array_mut() {
+            arr.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map_or(true, |hooks_arr| {
+                        !hooks_arr.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c.contains("nellie "))
+                        })
+                    })
+            });
             arr.push(user_prompt_submit_hook);
             user_prompt_submit_installed = true;
         }

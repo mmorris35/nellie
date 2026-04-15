@@ -144,8 +144,8 @@ fn get_label_value(metric: &proto::Metric, name: &str) -> String {
     metric
         .get_label()
         .iter()
-        .find(|lp| lp.get_name() == name)
-        .map_or_else(String::new, |lp| lp.get_value().to_string())
+        .find(|lp| lp.name() == name)
+        .map_or_else(String::new, |lp| lp.value().to_string())
 }
 
 /// Estimate p95 latency from a prometheus histogram.
@@ -162,9 +162,9 @@ fn estimate_p95_from_histogram(h: &proto::Histogram) -> f64 {
     let buckets = h.get_bucket();
 
     for bucket in buckets {
-        if bucket.get_cumulative_count() >= target {
+        if bucket.cumulative_count() >= target {
             // Return bucket upper bound in milliseconds
-            return bucket.get_upper_bound() * 1000.0;
+            return bucket.upper_bound() * 1000.0;
         }
     }
 
@@ -208,7 +208,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
             let tool = get_label_value(metric, "tool");
             let agent = get_label_value(metric, "agent");
             let status = get_label_value(metric, "status");
-            let count = metric.get_counter().get_value() as u64;
+            let count = metric.get_counter().value() as u64;
 
             let tool_entry = tools.entry(tool).or_insert_with(|| ToolAccum {
                 invocations: 0,
@@ -260,7 +260,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
         for metric in family.get_metric() {
             let tool = get_label_value(metric, "tool");
             let agent = get_label_value(metric, "agent");
-            let value = metric.get_counter().get_value();
+            let value = metric.get_counter().value();
 
             if let Some(entry) = tools.get_mut(&tool) {
                 entry.tokens_saved += value;
@@ -276,7 +276,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
     for family in &bytes_families {
         for metric in family.get_metric() {
             let tool = get_label_value(metric, "tool");
-            let value = metric.get_counter().get_value() as u64;
+            let value = metric.get_counter().value() as u64;
 
             if let Some(entry) = tools.get_mut(&tool) {
                 entry.response_bytes += value;

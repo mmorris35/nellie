@@ -8,3 +8,5 @@ config.yaml
 *.db
 *.db-wal
 *.db-shm
+/reviews
+.claude/settings.local.json

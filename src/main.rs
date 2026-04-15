@@ -122,6 +122,7 @@ enum Commands {
 
         /// Nellie server URL. If set, routes through the running server via HTTP
         /// instead of opening the DB directly. Avoids dual-writer corruption.
+        /// Auto-falls back to local indexing if the server is unreachable.
         #[arg(long, default_value = "http://127.0.0.1:8765")]
         server: String,
 
@@ -214,7 +215,7 @@ enum Commands {
         /// When set, queries lessons and checkpoints from the remote
         /// server instead of the local database. Memory files are
         /// still written locally.
-        /// Example: --server http://100.87.147.89:8765
+        /// Example: --server http://localhost:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -256,7 +257,7 @@ enum Commands {
         ///
         /// When set, POSTs extracted lessons to the remote server
         /// instead of storing in the local database.
-        /// Example: --server http://100.87.147.89:8765
+        /// Example: --server http://localhost:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -1903,26 +1904,23 @@ fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
     // Run initial sync
     println!();
     println!("Running initial sync...");
-    let sync_cmd = server.map_or_else(
-        || "nellie sync --rules".to_string(),
-        |url| format!("nellie sync --rules --server {url}"),
-    );
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sync_cmd)
-        .status()
-    {
+    let mut sync_cmd = std::process::Command::new("nellie");
+    sync_cmd.arg("sync").arg("--rules");
+    if let Some(ref url) = server {
+        sync_cmd.arg("--server").arg(url);
+    }
+    match sync_cmd.status() {
         Ok(status) if status.success() => {
             println!("  ✓ Initial sync complete");
         }
         Ok(status) => {
             eprintln!(
-                "  ✗ Initial sync failed (exit {}). Run manually: {sync_cmd}",
+                "  ✗ Initial sync failed (exit {}). Run manually: nellie sync --rules",
                 status.code().unwrap_or(-1)
             );
         }
         Err(e) => {
-            eprintln!("  ✗ Could not run initial sync: {e}. Run manually: {sync_cmd}");
+            eprintln!("  ✗ Could not run initial sync: {e}. Run manually: nellie sync --rules");
         }
     }
 

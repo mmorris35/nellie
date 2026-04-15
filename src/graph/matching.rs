@@ -139,7 +139,7 @@ mod tests {
             ("n1", EntityType::Concept, "OAuth"),
             ("n2", EntityType::Concept, "oauth-token-refresh"),
             ("n3", EntityType::Tool, "reqwest"),
-            ("n4", EntityType::Person, "Mike"),
+            ("n4", EntityType::Person, "Alice"),
             ("n5", EntityType::Problem, "rate-limiting"),
         ] {
             graph.add_entity(Entity {
@@ -205,8 +205,8 @@ mod tests {
     #[test]
     fn test_type_hint_filters() {
         let graph = setup_graph();
-        // "mike" matches person, not concept
-        let result = find_best_match(&graph, "Mike", Some(EntityType::Person)).unwrap();
+        // "alice" matches person, not concept
+        let result = find_best_match(&graph, "Alice", Some(EntityType::Person)).unwrap();
         assert_eq!(result.entity_id, "n4");
     }
 
