@@ -214,7 +214,7 @@ enum Commands {
         /// When set, queries lessons and checkpoints from the remote
         /// server instead of the local database. Memory files are
         /// still written locally.
-        /// Example: --server http://100.87.147.89:8765
+        /// Example: --server http://localhost:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -256,7 +256,7 @@ enum Commands {
         ///
         /// When set, POSTs extracted lessons to the remote server
         /// instead of storing in the local database.
-        /// Example: --server http://100.87.147.89:8765
+        /// Example: --server http://localhost:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },

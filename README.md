@@ -437,7 +437,7 @@ sudo loginctl enable-linger $USER  # Start on boot without login
 For teams or multi-machine setups, use [Syncthing](https://syncthing.net/) to keep code synchronized:
 
 ```
-BigDev (source) <-> mini-dev-server <-> workstation <-> laptop
+BigDev (source) <-> server <-> workstation <-> laptop
                          |
                     Nellie indexes
                     local copy
@@ -602,7 +602,7 @@ You can also run injection manually for testing:
 nellie inject --query "how do I use Nellie?" --dry-run
 
 # Run against a remote Nellie instance
-nellie inject --query "authentication" --server http://100.87.147.89:8765
+nellie inject --query "authentication" --server http://localhost:8765
 
 # Control relevance threshold (0.0–1.0, default 0.6)
 nellie inject --query "test" --threshold 0.8

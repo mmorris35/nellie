@@ -221,6 +221,12 @@ pub async fn run_bootstrap(
                 }
             }
         } else {
+            eprintln!(
+                "WARNING: Embedding model not found. Lessons will be inserted \
+                 but won't appear in search_hybrid vector results.\n\
+                 Run `nellie setup` to download the model, then \
+                 `nellie bootstrap --force` to re-embed."
+            );
             tracing::warn!(
                 "Embedding model not found, lessons will not have embeddings. \
                  Run `nellie setup` to download the model."
@@ -290,7 +296,43 @@ pub async fn run_bootstrap(
         imported += 1;
     }
 
+    // Enrich the knowledge graph with bootstrap lesson metadata.
+    // Initialize a graph from the DB, enrich it, then persist changes.
+    if imported > 0 {
+        match enrich_bootstrap_graph(db, &parsed_lessons) {
+            Ok((nodes, edges)) => {
+                tracing::info!(
+                    nodes,
+                    edges,
+                    "Graph enriched with bootstrap lesson metadata"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Graph enrichment failed (non-fatal): {e}");
+            }
+        }
+    }
+
     Ok(BootstrapResult { imported, skipped })
+}
+
+/// Load the graph from DB, run [`enrich_graph_from_bootstrap`], and persist.
+fn enrich_bootstrap_graph(db: &Database, lessons: &[BootstrapLesson]) -> crate::Result<(u32, u32)> {
+    use crate::config::GraphConfig;
+    use crate::graph::persistence::{load_graph, save_graph};
+
+    let config = GraphConfig {
+        enabled: true,
+        ..Default::default()
+    };
+
+    let mut graph = db.with_conn(|conn| load_graph(conn, config))?;
+
+    let (nodes, edges) = enrich_graph_from_bootstrap(&mut graph, lessons);
+
+    db.with_conn(|conn| save_graph(conn, &graph))?;
+
+    Ok((nodes, edges))
 }
 
 /// Enrich the knowledge graph with bootstrap lesson metadata.
