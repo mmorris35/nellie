@@ -122,7 +122,6 @@ enum Commands {
 
         /// Nellie server URL. If set, routes through the running server via HTTP
         /// instead of opening the DB directly. Avoids dual-writer corruption.
-        /// Auto-falls back to local indexing if the server is unreachable.
         #[arg(long, default_value = "http://127.0.0.1:8765")]
         server: String,
 
@@ -215,7 +214,7 @@ enum Commands {
         /// When set, queries lessons and checkpoints from the remote
         /// server instead of the local database. Memory files are
         /// still written locally.
-        /// Example: --server http://localhost:8765
+        /// Example: --server http://100.87.147.89:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -257,7 +256,7 @@ enum Commands {
         ///
         /// When set, POSTs extracted lessons to the remote server
         /// instead of storing in the local database.
-        /// Example: --server http://localhost:8765
+        /// Example: --server http://100.87.147.89:8765
         #[arg(long, env = "NELLIE_SERVER")]
         server: Option<String>,
     },
@@ -348,6 +347,18 @@ enum Commands {
         /// Skip embedding model download
         #[arg(long)]
         skip_model: bool,
+    },
+
+    /// Import starter lessons into the database
+    ///
+    /// Reads embedded bootstrap lesson files and imports them into the
+    /// Nellie database. Lessons are imported idempotently -- if a lesson
+    /// with the same title already exists, it is skipped unless --force
+    /// is used.
+    Bootstrap {
+        /// Re-import all lessons even if they already exist (deletes + re-inserts)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -471,6 +482,7 @@ async fn main() -> Result<()> {
             skip_runtime,
             skip_model,
         }) => setup_command(&cli.data_dir, skip_runtime, skip_model).await,
+        Some(Commands::Bootstrap { force }) => bootstrap_command(&cli.data_dir, force).await,
         None => {
             // Default to serve command for backward compatibility
             tracing::info!("No command specified, starting server (use 'serve' explicitly)");
@@ -1904,23 +1916,26 @@ fn hooks_install_command(force: bool, server: Option<&str>) -> Result<()> {
     // Run initial sync
     println!();
     println!("Running initial sync...");
-    let mut sync_cmd = std::process::Command::new("nellie");
-    sync_cmd.arg("sync").arg("--rules");
-    if let Some(ref url) = server {
-        sync_cmd.arg("--server").arg(url);
-    }
-    match sync_cmd.status() {
+    let sync_cmd = server.map_or_else(
+        || "nellie sync --rules".to_string(),
+        |url| format!("nellie sync --rules --server {url}"),
+    );
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sync_cmd)
+        .status()
+    {
         Ok(status) if status.success() => {
             println!("  ✓ Initial sync complete");
         }
         Ok(status) => {
             eprintln!(
-                "  ✗ Initial sync failed (exit {}). Run manually: nellie sync --rules",
+                "  ✗ Initial sync failed (exit {}). Run manually: {sync_cmd}",
                 status.code().unwrap_or(-1)
             );
         }
         Err(e) => {
-            eprintln!("  ✗ Could not run initial sync: {e}. Run manually: nellie sync --rules");
+            eprintln!("  ✗ Could not run initial sync: {e}. Run manually: {sync_cmd}");
         }
     }
 
@@ -1973,6 +1988,40 @@ async fn setup_command(data_dir: &Path, skip_runtime: bool, skip_model: bool) ->
     nellie::setup::run_setup(data_dir, skip_runtime, skip_model)
         .await
         .map_err(|e| nellie::Error::internal(e.to_string()))?;
+    Ok(())
+}
+
+/// Run the bootstrap command: import starter lessons into the database.
+async fn bootstrap_command(data_dir: &Path, force: bool) -> Result<()> {
+    // Ensure data directory exists
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        nellie::Error::internal(format!(
+            "Failed to create data directory {}: {e}",
+            data_dir.display()
+        ))
+    })?;
+
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let db = Database::open(config.database_path())?;
+    init_storage(&db)?;
+
+    tracing::info!(
+        data_dir = %data_dir.display(),
+        force,
+        "Starting bootstrap"
+    );
+
+    let result = nellie::bootstrap::run_bootstrap(&db, data_dir, force).await?;
+
+    // Print summary to stdout (this is a CLI command, not library code)
+    println!(
+        "Bootstrapped {} lessons ({} skipped, already present)",
+        result.imported, result.skipped
+    );
+
     Ok(())
 }
 
@@ -2268,6 +2317,39 @@ mod tests {
             assert!(skip_model);
         } else {
             panic!("Expected Setup command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_bootstrap_defaults() {
+        let args = vec!["nellie", "bootstrap"];
+        let cli = Cli::try_parse_from(args);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Bootstrap { force }) = cli.command {
+            assert!(!force);
+        } else {
+            panic!("Expected Bootstrap command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_bootstrap_force() {
+        let args = vec![
+            "nellie",
+            "bootstrap",
+            "--data-dir",
+            "/tmp/nellie-data",
+            "--force",
+        ];
+        let cli = Cli::try_parse_from(args);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Bootstrap { force }) = cli.command {
+            assert_eq!(cli.data_dir, PathBuf::from("/tmp/nellie-data"));
+            assert!(force);
+        } else {
+            panic!("Expected Bootstrap command");
         }
     }
 

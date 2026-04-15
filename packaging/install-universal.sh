@@ -427,9 +427,24 @@ setup_macos_service() {
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/nellie</string>
-        <string>--config</string>
-        <string>$INSTALL_DIR/config.toml</string>
+        <string>serve</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8765</string>
+        <string>--data-dir</string>
+        <string>$HOME/.local/share/nellie</string>
+        <string>--enable-graph</string>
+        <string>--enable-structural</string>
+        <string>--enable-deep-hooks</string>
+        <string>--sync-interval</string>
+        <string>30</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ORT_DYLIB_PATH</key>
+        <string>$HOME/.local/share/nellie/lib/libonnxruntime.so</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -466,8 +481,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/nellie --config $INSTALL_DIR/config.toml
+ExecStart=$INSTALL_DIR/nellie serve --host 0.0.0.0 --port 8765 --data-dir $HOME/.local/share/nellie --enable-graph --enable-structural --enable-deep-hooks --sync-interval 30
 WorkingDirectory=$INSTALL_DIR
+Environment=ORT_DYLIB_PATH=$HOME/.local/share/nellie/lib/libonnxruntime.so
 Restart=on-failure
 RestartSec=5
 
@@ -531,6 +547,19 @@ main() {
         setup_linux_service
     fi
     
+    # Bootstrap default lessons
+    echo ""
+    info "Bootstrapping default lessons..."
+    ORT_DYLIB_PATH="$NELLIE_LIB_DIR/libonnxruntime.so" "$BIN_DIR/nellie" bootstrap --data-dir "$NELLIE_DATA_DIR" 2>&1 || warn "Bootstrap failed (non-fatal)"
+
+    # Post-install verification
+    info "Verifying installation..."
+    if "$BIN_DIR/nellie" --version >/dev/null 2>&1; then
+        info "nellie --version: $("$BIN_DIR/nellie" --version 2>&1)"
+    else
+        warn "nellie --version failed"
+    fi
+
     echo ""
     echo "═══════════════════════════════════════════"
     echo ""

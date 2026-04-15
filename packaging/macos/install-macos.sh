@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nellie-RS macOS Installation Script
-# macOS install script for Nellie-RS
+# For deployment to Mac Mini (mini-dev-server)
 
 set -e
 
