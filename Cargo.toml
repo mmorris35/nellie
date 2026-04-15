@@ -15,7 +15,7 @@ categories = ["development-tools", "database"]
 tokio = { version = "1.0", features = ["full"] }
 
 # Random
-rand = "0.8"
+rand = "0.9"
 
 # Async utilities
 futures = "0.3"
