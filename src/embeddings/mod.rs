@@ -7,6 +7,7 @@
 
 mod model;
 mod service;
+pub mod version;
 mod worker;
 
 pub use model::{

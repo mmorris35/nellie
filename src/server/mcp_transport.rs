@@ -56,7 +56,7 @@ pub struct AddLessonRequest {
     pub tags: Vec<String>,
     #[schemars(description = "Importance level (critical, warning, info)")]
     pub severity: Option<String>,
-    #[schemars(description = "Repository name (e.g., user/my-project)")]
+    #[schemars(description = "Repository name (e.g., mike-github/whag)")]
     pub repo: Option<String>,
 }
 

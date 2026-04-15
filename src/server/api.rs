@@ -160,7 +160,7 @@ pub struct ToolMetricsEntry {
 /// Per-agent metrics breakdown.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentMetricsEntry {
-    /// Agent identifier (e.g., `"test/my-project"`).
+    /// Agent identifier (e.g., `"mmn/nellie-rs"`).
     pub agent: String,
     /// Total invocations by this agent.
     pub invocations: u64,

@@ -37,6 +37,8 @@ pub struct HookInstallReport {
     pub session_start_installed: bool,
     /// Whether Stop hook was added or updated
     pub stop_installed: bool,
+    /// Whether UserPromptSubmit hook was added or updated
+    pub user_prompt_submit_installed: bool,
     /// Path to the settings.json file
     pub settings_path: PathBuf,
     /// Whether a backup was created
@@ -53,7 +55,7 @@ pub struct HookInstallReport {
 ///
 /// 1. Reads `~/.claude/settings.json` (creates if missing with default structure)
 /// 2. Navigates to the `hooks` object
-/// 3. Adds/updates SessionStart and Stop hooks with Nellie commands
+/// 3. Adds/updates SessionStart, Stop, and UserPromptSubmit hooks with Nellie commands
 /// 4. Preserves all existing hooks
 /// 5. Backs up the original to `settings.json.bak` before writing
 /// 6. Returns a report of what was installed
@@ -75,6 +77,15 @@ pub struct HookInstallReport {
 ///   "type": "command",
 ///   "command": "nellie ingest --project \"$PWD\" --since 1h 2>/dev/null || true",
 ///   "timeout": 30000
+/// }
+/// ```
+///
+/// **UserPromptSubmit** (matcher: ""):
+/// ```json
+/// {
+///   "type": "command",
+///   "command": "nellie inject --query \"$CC_USER_PROMPT\" --limit 3 2>/dev/null || true",
+///   "timeout": 1000
 /// }
 /// ```
 pub fn install_hooks(force: bool, server: Option<&str>) -> Result<HookInstallReport> {
@@ -185,6 +196,43 @@ pub fn install_hooks(force: bool, server: Option<&str>) -> Result<HookInstallRep
         stop_installed = true;
     }
 
+    // Add UserPromptSubmit hook with array of matcher groups format
+    let mut user_prompt_submit_installed = false;
+    let user_prompt_submit_command = json!({
+        "type": "command",
+        "command": format!("nellie inject --query \"$CC_USER_PROMPT\" --limit 3{server_flag} 2>/dev/null || true"),
+        "timeout": 1000
+    });
+
+    let user_prompt_submit_hook = json!({
+        "matcher": "",
+        "hooks": [user_prompt_submit_command]
+    });
+
+    if let Some(ups_val) = hooks.get_mut("UserPromptSubmit") {
+        // Dedup: remove any existing nellie inject entries before adding
+        if let Some(arr) = ups_val.as_array_mut() {
+            arr.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map_or(true, |hooks_arr| {
+                        !hooks_arr.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c.contains("nellie "))
+                        })
+                    })
+            });
+            arr.push(user_prompt_submit_hook);
+            user_prompt_submit_installed = true;
+        }
+    } else {
+        // Create new array with matcher group
+        hooks["UserPromptSubmit"] = json!([user_prompt_submit_hook]);
+        user_prompt_submit_installed = true;
+    }
+
     // Create backup if file exists
     let backup_created = if settings_path.exists() {
         let backup_path = settings_path.with_extension("json.bak");
@@ -202,6 +250,7 @@ pub fn install_hooks(force: bool, server: Option<&str>) -> Result<HookInstallRep
     Ok(HookInstallReport {
         session_start_installed,
         stop_installed,
+        user_prompt_submit_installed,
         settings_path,
         backup_created,
         old_shell_hook_replaced,
@@ -426,6 +475,8 @@ pub struct HookStatus {
     pub session_start_installed: bool,
     /// Whether Stop hook is installed
     pub stop_installed: bool,
+    /// Whether UserPromptSubmit hook is installed
+    pub user_prompt_submit_installed: bool,
     /// Path to the settings.json file (if it exists)
     pub settings_path: Option<PathBuf>,
     /// Whether the nellie binary is on PATH
@@ -436,6 +487,8 @@ pub struct HookStatus {
     pub last_sync_time: Option<i64>,
     /// Last ingest time in seconds since epoch (if available)
     pub last_ingest_time: Option<i64>,
+    /// Last inject time in seconds since epoch (if available)
+    pub last_inject_time: Option<i64>,
     /// Number of memory files found
     pub memory_file_count: usize,
     /// Number of rule files found
@@ -463,13 +516,15 @@ pub fn check_hook_status() -> Result<HookStatus> {
     let settings_path = crate::claude_code::paths::resolve_settings_path().ok();
 
     // Check for installed hooks
-    let (session_start_installed, stop_installed) = check_installed_hooks(settings_path.as_ref());
+    let (session_start_installed, stop_installed, user_prompt_submit_installed) =
+        check_installed_hooks(settings_path.as_ref());
 
     // Check for nellie binary on PATH
     let (nellie_binary_available, nellie_binary_path) = check_nellie_binary_on_path();
 
-    // Get last sync/ingest times from database
-    let (last_sync_time, last_ingest_time) = get_last_sync_ingest_times().unwrap_or((None, None));
+    // Get last sync/ingest/inject times from database
+    let (last_sync_time, last_ingest_time, last_inject_time) =
+        get_last_sync_ingest_inject_times().unwrap_or((None, None, None));
 
     // Count memory and rule files
     let (memory_file_count, memory_index_lines, memory_dir_exists) = count_memory_files();
@@ -482,11 +537,13 @@ pub fn check_hook_status() -> Result<HookStatus> {
     Ok(HookStatus {
         session_start_installed,
         stop_installed,
+        user_prompt_submit_installed,
         settings_path,
         nellie_binary_available,
         nellie_binary_path,
         last_sync_time,
         last_ingest_time,
+        last_inject_time,
         memory_file_count,
         rule_file_count,
         memory_dir_exists,
@@ -525,21 +582,21 @@ fn hook_event_has_nellie(event_val: &Value) -> bool {
 }
 
 /// Checks if hooks are installed in settings.json.
-fn check_installed_hooks(settings_path: Option<&PathBuf>) -> (bool, bool) {
+fn check_installed_hooks(settings_path: Option<&PathBuf>) -> (bool, bool, bool) {
     let Some(path) = settings_path else {
-        return (false, false);
+        return (false, false, false);
     };
 
     if !path.exists() {
-        return (false, false);
+        return (false, false, false);
     }
 
     let Ok(content) = fs::read_to_string(path) else {
-        return (false, false);
+        return (false, false, false);
     };
 
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&content) else {
-        return (false, false);
+        return (false, false, false);
     };
 
     let hooks = obj.get("hooks").and_then(|h| h.as_object());
@@ -551,7 +608,11 @@ fn check_installed_hooks(settings_path: Option<&PathBuf>) -> (bool, bool) {
         .and_then(|h| h.get("Stop"))
         .is_some_and(hook_event_has_nellie);
 
-    (session_start, stop)
+    let user_prompt_submit = hooks
+        .and_then(|h| h.get("UserPromptSubmit"))
+        .is_some_and(hook_event_has_nellie);
+
+    (session_start, stop, user_prompt_submit)
 }
 
 /// Checks if the nellie binary is available on PATH.
@@ -580,15 +641,16 @@ fn check_nellie_binary_on_path() -> (bool, Option<PathBuf>) {
     }
 }
 
-/// Retrieves last sync and ingest times from the database.
-fn get_last_sync_ingest_times() -> Result<(Option<i64>, Option<i64>)> {
+/// Retrieves last sync, ingest, and inject times from the database.
+fn get_last_sync_ingest_inject_times() -> Result<(Option<i64>, Option<i64>, Option<i64>)> {
     let cwd = std::env::current_dir()
         .map_err(|e| crate::Error::internal(format!("cannot get CWD: {e}")))?;
 
     let last_sync = crate::claude_code::paths::read_state_timestamp(&cwd, "last_sync_time");
     let last_ingest = crate::claude_code::paths::read_state_timestamp(&cwd, "last_ingest_time");
+    let last_inject = crate::claude_code::paths::read_state_timestamp(&cwd, "last_inject_time");
 
-    Ok((last_sync, last_ingest))
+    Ok((last_sync, last_ingest, last_inject))
 }
 
 /// Counts memory files in the Claude Code memory directory.
@@ -724,6 +786,12 @@ impl HookStatus {
             "✗ not installed"
         };
 
+        let ups_status = if self.user_prompt_submit_installed {
+            "✓ installed (nellie inject)"
+        } else {
+            "✗ not installed"
+        };
+
         let binary_line = self.nellie_binary_path.as_ref().map_or(
             "Nellie binary:         ✗ not on PATH\n".to_string(),
             |path| format!("Nellie binary:         ✓ {}\n", path.display()),
@@ -739,6 +807,12 @@ impl HookStatus {
             .last_ingest_time
             .map_or("Last ingest:           never\n".to_string(), |ts| {
                 format!("Last ingest:           {}\n", format_time_ago(ts))
+            });
+
+        let inject_line = self
+            .last_inject_time
+            .map_or("Last inject:           never\n".to_string(), |ts| {
+                format!("Last inject:           {}\n", format_time_ago(ts))
             });
 
         let memory_line = if self.memory_dir_exists {
@@ -780,6 +854,8 @@ impl HookStatus {
              ────────────────────────\n\n\
              SessionStart hook:     {}\n\
              Stop hook:             {}\n\
+             UserPromptSubmit hook: {}\n\
+             {}\
              {}\
              {}\
              {}\
@@ -787,9 +863,11 @@ impl HookStatus {
              Rule files:            {}{}\n",
             ss_status,
             stop_status,
+            ups_status,
             binary_line,
             sync_line,
             ingest_line,
+            inject_line,
             memory_line,
             self.rule_file_count,
             old_hook_line
@@ -808,11 +886,13 @@ impl HookStatus {
         let json = json!({
             "session_start_installed": self.session_start_installed,
             "stop_installed": self.stop_installed,
+            "user_prompt_submit_installed": self.user_prompt_submit_installed,
             "settings_path": self.settings_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             "nellie_binary_available": self.nellie_binary_available,
             "nellie_binary_path": self.nellie_binary_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             "last_sync_time": self.last_sync_time,
             "last_ingest_time": self.last_ingest_time,
+            "last_inject_time": self.last_inject_time,
             "memory_file_count": self.memory_file_count,
             "rule_file_count": self.rule_file_count,
             "memory_dir_exists": self.memory_dir_exists,
@@ -1130,11 +1210,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: true,
             stop_installed: false,
+            user_prompt_submit_installed: true,
             settings_path: Some(PathBuf::from("/home/user/.claude/settings.json")),
             nellie_binary_available: true,
             nellie_binary_path: Some(PathBuf::from("/usr/local/bin/nellie")),
             last_sync_time: Some(1234567890),
             last_ingest_time: None,
+            last_inject_time: Some(1234567900),
             memory_file_count: 5,
             rule_file_count: 3,
             memory_dir_exists: true,
@@ -1145,6 +1227,7 @@ mod tests {
 
         assert!(status.session_start_installed);
         assert!(!status.stop_installed);
+        assert!(status.user_prompt_submit_installed);
         assert_eq!(status.memory_file_count, 5);
         assert_eq!(status.rule_file_count, 3);
     }
@@ -1202,11 +1285,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: true,
             stop_installed: true,
+            user_prompt_submit_installed: true,
             settings_path: Some(PathBuf::from("/home/user/.claude/settings.json")),
             nellie_binary_available: true,
             nellie_binary_path: Some(PathBuf::from("/usr/local/bin/nellie")),
             last_sync_time: Some(1234567890),
             last_ingest_time: None,
+            last_inject_time: Some(1234567900),
             memory_file_count: 5,
             rule_file_count: 3,
             memory_dir_exists: true,
@@ -1218,6 +1303,7 @@ mod tests {
         let text = status.format_text();
         assert!(text.contains("Nellie Deep Hooks Status"));
         assert!(text.contains("✓ installed"));
+        assert!(text.contains("UserPromptSubmit"));
         assert!(text.contains("Memory files"));
         assert!(text.contains("Rule files"));
     }
@@ -1227,11 +1313,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: false,
             stop_installed: false,
+            user_prompt_submit_installed: false,
             settings_path: None,
             nellie_binary_available: false,
             nellie_binary_path: None,
             last_sync_time: None,
             last_ingest_time: None,
+            last_inject_time: None,
             memory_file_count: 0,
             rule_file_count: 0,
             memory_dir_exists: false,
@@ -1251,11 +1339,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: true,
             stop_installed: false,
+            user_prompt_submit_installed: false,
             settings_path: Some(PathBuf::from("/home/user/.claude/settings.json")),
             nellie_binary_available: true,
             nellie_binary_path: Some(PathBuf::from("/usr/local/bin/nellie")),
             last_sync_time: Some(1234567890),
             last_ingest_time: None,
+            last_inject_time: None,
             memory_file_count: 5,
             rule_file_count: 3,
             memory_dir_exists: true,
@@ -1266,6 +1356,7 @@ mod tests {
 
         let json_str = status.format_json();
         assert!(json_str.contains("session_start_installed"));
+        assert!(json_str.contains("user_prompt_submit_installed"));
         assert!(json_str.contains("true"));
         assert!(json_str.contains("memory_file_count"));
         let parsed: std::result::Result<Value, _> = serde_json::from_str(&json_str);
@@ -1277,11 +1368,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: true,
             stop_installed: true,
+            user_prompt_submit_installed: true,
             settings_path: Some(PathBuf::from("/home/user/.claude/settings.json")),
             nellie_binary_available: true,
             nellie_binary_path: Some(PathBuf::from("/usr/local/bin/nellie")),
             last_sync_time: None,
             last_ingest_time: None,
+            last_inject_time: None,
             memory_file_count: 10,
             rule_file_count: 5,
             memory_dir_exists: true,
@@ -1395,11 +1488,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: false,
             stop_installed: false,
+            user_prompt_submit_installed: false,
             settings_path: Some(PathBuf::from("/home/user/.claude/settings.json")),
             nellie_binary_available: true,
             nellie_binary_path: Some(PathBuf::from("/usr/local/bin/nellie")),
             last_sync_time: None,
             last_ingest_time: None,
+            last_inject_time: None,
             memory_file_count: 0,
             rule_file_count: 0,
             memory_dir_exists: false,
@@ -1422,11 +1517,13 @@ mod tests {
         let status = HookStatus {
             session_start_installed: true,
             stop_installed: true,
+            user_prompt_submit_installed: true,
             settings_path: Some(PathBuf::from("/home/user/.claude/settings.json")),
             nellie_binary_available: true,
             nellie_binary_path: Some(PathBuf::from("/usr/local/bin/nellie")),
             last_sync_time: None,
             last_ingest_time: None,
+            last_inject_time: None,
             memory_file_count: 2,
             rule_file_count: 1,
             memory_dir_exists: true,
@@ -1440,6 +1537,7 @@ mod tests {
 
         let json_str = status.format_json();
         assert!(json_str.contains("old_shell_hook_detected"));
+        assert!(json_str.contains("user_prompt_submit_installed"));
         assert!(json_str.contains("true"));
         assert!(json_str.contains("PreStart"));
         let parsed: std::result::Result<Value, _> = serde_json::from_str(&json_str);

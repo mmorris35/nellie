@@ -49,6 +49,7 @@ pub mod embeddings;
 pub mod error;
 pub mod graph;
 pub mod server;
+pub mod setup;
 pub mod storage;
 pub mod structural;
 pub mod watcher;

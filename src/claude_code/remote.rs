@@ -4,9 +4,9 @@
 //! the `--server` flag enables sync and ingest to work over HTTP instead
 //! of a local SQLite database.
 //!
-//! - `nellie sync --server http://your-server:8765` queries lessons/checkpoints
+//! - `nellie sync --server http://minidev:8765` queries lessons/checkpoints
 //!   via the REST API and writes memory files locally.
-//! - `nellie ingest --server http://your-server:8765` parses transcripts locally
+//! - `nellie ingest --server http://minidev:8765` parses transcripts locally
 //!   and POSTs extracted lessons to the remote server.
 
 use crate::storage::{CheckpointRecord, LessonRecord};

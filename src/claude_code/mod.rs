@@ -39,6 +39,7 @@ pub mod dedup;
 pub mod extractor;
 pub mod hooks;
 pub mod ingest;
+pub mod inject;
 pub mod mappers;
 pub mod memory_index;
 pub mod memory_writer;

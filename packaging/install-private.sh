@@ -2,12 +2,12 @@
 # Nellie-RS Private Repo Installer
 # Requires: gh CLI authenticated with repo access
 #
-# Usage:
-#   gh release download v0.1.0 --repo mmorris35/nellie -p "install-private.sh" -O - | bash
+# Usage: 
+#   gh release download v0.1.0 --repo mmorris35/nellie-rs -p "install-private.sh" -O - | bash
 
 set -euo pipefail
 
-REPO="mmorris35/nellie"
+REPO="mmorris35/nellie-rs"
 VERSION="${NELLIE_VERSION:-latest}"
 INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.nellie-rs}"
 BIN_DIR="${NELLIE_BIN_DIR:-$HOME/.local/bin}"
