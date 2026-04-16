@@ -2636,14 +2636,11 @@ async fn handle_diff_index(
         let mut files = Vec::new();
         for p in file_paths {
             if let Ok(metadata) = std::fs::metadata(&p) {
-                let mtime = metadata
-                    .modified()
-                    .map(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64
-                    })
-                    .unwrap_or(0);
+                let mtime = metadata.modified().map_or(0, |t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                });
                 let size = metadata.len() as i64;
                 files.push((p, mtime, size));
             }

@@ -230,14 +230,11 @@ impl Indexer {
     fn update_file_state(&self, path: &Path, hash: &str) -> Result<()> {
         let metadata = std::fs::metadata(path)?;
         #[allow(clippy::cast_possible_wrap)]
-        let mtime = metadata
-            .modified()
-            .map(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64
-            })
-            .unwrap_or(0);
+        let mtime = metadata.modified().map_or(0, |t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        });
         #[allow(clippy::cast_possible_wrap)]
         let size = metadata.len() as i64;
         let path_str = path.to_string_lossy().to_string();

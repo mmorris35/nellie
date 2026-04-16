@@ -304,7 +304,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
             }
         })
         .collect();
-    tool_entries.sort_by(|a, b| b.invocations.cmp(&a.invocations));
+    tool_entries.sort_by_key(|t| std::cmp::Reverse(t.invocations));
 
     let mut agent_entries: Vec<AgentMetricsEntry> = agents
         .into_iter()
@@ -314,7 +314,7 @@ pub fn collect_tool_metrics() -> ToolMetricsSummary {
             tokens_saved: acc.tokens_saved,
         })
         .collect();
-    agent_entries.sort_by(|a, b| b.invocations.cmp(&a.invocations));
+    agent_entries.sort_by_key(|a| std::cmp::Reverse(a.invocations));
 
     // Compute totals
     let total_invocations = tool_entries.iter().map(|t| t.invocations).sum();

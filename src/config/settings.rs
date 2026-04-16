@@ -40,9 +40,7 @@ impl Default for Config {
             port: 8080,
             log_level: "info".to_string(),
             watch_dirs: Vec::new(),
-            embedding_threads: std::thread::available_parallelism()
-                .map(|n| n.get().min(4))
-                .unwrap_or(4),
+            embedding_threads: std::thread::available_parallelism().map_or(4, |n| n.get().min(4)),
             api_key: std::env::var("NELLIE_API_KEY").ok(),
             enable_structural: false,
         }

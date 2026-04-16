@@ -1082,14 +1082,11 @@ fn reconcile_from_db(
         match std::fs::metadata(&path) {
             Ok(metadata) => {
                 #[allow(clippy::cast_possible_wrap)]
-                let mtime = metadata
-                    .modified()
-                    .map(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64
-                    })
-                    .unwrap_or(0);
+                let mtime = metadata.modified().map_or(0, |t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                });
                 #[allow(clippy::cast_possible_wrap)]
                 let size = metadata.len() as i64;
 

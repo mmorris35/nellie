@@ -14,8 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
 /// Generate a unique ID with a given prefix.
@@ -27,8 +26,7 @@ fn generate_id(prefix: &str) -> String {
     hasher.write_u128(
         std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_nanos()),
     );
     format!("{}_{:x}", prefix, hasher.finish())
 }

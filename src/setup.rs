@@ -358,10 +358,7 @@ async fn extract_ort_archive(
             .flatten()
         {
             let name = f.file_name().to_string_lossy().to_string();
-            if name.starts_with(base)
-                && name != base
-                && f.metadata().map(|m| m.len() > 0).unwrap_or(false)
-            {
+            if name.starts_with(base) && name != base && f.metadata().is_ok_and(|m| m.len() > 0) {
                 // Pick the longest filename (e.g. libonnxruntime.so.1.24.4
                 // over libonnxruntime.so.1) to ensure we symlink to the
                 // fully-versioned real file, not a shorter intermediate.
