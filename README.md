@@ -1,10 +1,37 @@
-# Nellie-RS
+# Nellie
 
-Your AI agent's **code memory** — semantic search, structural code analysis, lessons learned, checkpoint recovery, a self-improving knowledge graph, and automatic Claude Code integration via Deep Hooks.
+**Hook-based out-of-process context engineering middleware for Claude Code.**
+Persistent memory is how it implements the long-term-memory primitive — but memory is an ingredient, not the thing.
 
-[![CI](https://github.com/mmorris35/nellie-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mmorris35/nellie-rs/actions/workflows/ci.yml)
-[![Release](https://github.com/mmorris35/nellie-rs/actions/workflows/release.yml/badge.svg)](https://github.com/mmorris35/nellie-rs/releases)
+Nellie sits between the developer and the model: on every prompt, its hooks retrieve the relevant lessons, checkpoints, and structural code context and inject them into the session *before* the model sees the prompt. The model reasons; Nellie curates. Separation of duty by design.
+
+Semantic + structural + hybrid search, self-improving knowledge graph, automatic Claude Code integration via Deep Hooks, and a web dashboard — all in one local Rust server.
+
+[![CI](https://github.com/mmorris35/nellie/actions/workflows/ci.yml/badge.svg)](https://github.com/mmorris35/nellie/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+## Why "middleware," not "memory store"?
+
+Context engineering — the practice of designing what information a model sees on each prompt — is usually done *inside* the agent: subagent spawning, model-initiated tool calls, in-loop context-window management. Every framework reimplements its own version.
+
+Nellie does it **outside** the agent, at the harness layer, via Claude Code's hook API. The model doesn't know it's been augmented. The hook runs; the context gets curated; the augmented prompt reaches the model; the model responds.
+
+|   | In-process CE | Out-of-process CE (Nellie) |
+|---|---|---|
+| Where it runs | Inside the agent loop | In Claude Code hooks, before/after the model call |
+| Who triggers memory access | The model (tool call) | The harness (automatic) |
+| Scope | Per-agent, per-framework | Every Claude Code session, every model, every skill |
+| Separation of duty | Coupled | Clean — reasoning vs relevance |
+| Compliance auditability | Tied to model internals | Deterministic, loggable at the hook |
+| Authorable by non-programmers | Usually no | Yes — hooks are shell scripts |
+
+**Practical implication for compliance-adjacent workloads** (e.g. CUI-handling codebases, CMMC/ISO/FedRAMP contexts): the hook is the natural place to strip sensitive content from prompts before the model sees them, to redact outputs after, and to log every context-injection decision. That's a boundary-of-trust property the model layer cannot give you.
+
+### Academic validation
+
+Lee et al., *"Meta-Harness: End-to-End Optimization of Model Harnesses"* (Stanford, MIT, KRAFTON — March 2026, [arXiv:2603.28052](https://arxiv.org/abs/2603.28052)), formalize the **harness** — *"the code that determines what information to store, retrieve, and present to the model"* — as a first-class optimization target distinct from the model weights. They demonstrate harness-only wins of **+7.7 points on text classification (with 4× fewer context tokens)**, +4.7 points average on retrieval-augmented math reasoning across five held-out models, and discovered harnesses that surpass the best hand-engineered baselines on TerminalBench-2 — all on **fixed** base models. Claude Code is among the hand-engineered baselines evaluated.
+
+Nellie is a production hook-based harness that's been running this class of context engineering since before the abstraction was named.
 
 ## What is Nellie?
 
@@ -103,7 +130,7 @@ nellie list-lessons    # should show bootstrap lessons
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                              Nellie-RS                                     │
+│                               Nellie                                       │
 ├───────────────────────────────────────────────────────────────────────────┤
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐   │
 │  │  MCP API │ │ Embedding│ │   File   │ │Knowledge │ │  Tree-sitter │   │
@@ -148,7 +175,7 @@ When agents save lessons and checkpoints with structured metadata (tools used, p
 | **Solution** | `use async/await`, `enable WAL2 mode` |
 | **Concept** | `MCP`, `HTTP routing`, `embeddings` |
 | **Person** | `Alice` |
-| **Project** | `nellie-rs`, `whag` |
+| **Project** | `nellie`, `whag` |
 | **Chunk** | Links to indexed code snippets |
 
 ### Relationship Types
@@ -489,8 +516,8 @@ xcode-select --install  # skip if already installed
 
 ```bash
 # Clone
-git clone https://github.com/mmorris35/nellie-rs.git
-cd nellie-rs
+git clone https://github.com/mmorris35/nellie.git
+cd nellie
 
 # Build
 cargo build --release
