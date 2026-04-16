@@ -83,8 +83,7 @@ pub fn init_tracing(level: &str, json: bool) {
 pub fn config_from_env() -> TracingConfig {
     let level = std::env::var("NELLIE_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let json = std::env::var("NELLIE_LOG_JSON")
-        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false);
+        .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"));
 
     TracingConfig { level, json }
 }

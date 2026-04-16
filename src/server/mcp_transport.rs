@@ -597,7 +597,7 @@ impl ServerHandler for NellieMcpHandler {
                         .map(|c| {
                             // Content items are typically RawContent::Text
                             // Serialize to get a size estimate
-                            serde_json::to_string(c).map(|s| s.len()).unwrap_or(0)
+                            serde_json::to_string(c).map_or(0, |s| s.len())
                         })
                         .sum();
 
