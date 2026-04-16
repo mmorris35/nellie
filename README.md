@@ -29,7 +29,7 @@ Nellie does it **outside** the agent, at the harness layer, via Claude Code's ho
 
 ### Academic validation
 
-Lee et al., *"Meta-Harness: End-to-End Optimization of Model Harnesses"* (Stanford IRIS Lab + MIT, March 2026, [arXiv:2603.28052](https://arxiv.org/abs/2603.28052)), formalize the **harness** — *"the code that determines what to store, retrieve, and present to the model"* — as a first-class optimization target distinct from the model weights. They demonstrate harness-only wins of **+7.7 points on text classification (with 4× fewer context tokens)**, +4.7 points average on retrieval-augmented math reasoning across five held-out models, and +10 points on TerminalBench-2 over hand-engineered baselines — all on **fixed** base models. Their reference proposer agent is Claude Code.
+Lee et al., *"Meta-Harness: End-to-End Optimization of Model Harnesses"* (Stanford, MIT, KRAFTON — March 2026, [arXiv:2603.28052](https://arxiv.org/abs/2603.28052)), formalize the **harness** — *"the code that determines what information to store, retrieve, and present to the model"* — as a first-class optimization target distinct from the model weights. They demonstrate harness-only wins of **+7.7 points on text classification (with 4× fewer context tokens)**, +4.7 points average on retrieval-augmented math reasoning across five held-out models, and discovered harnesses that surpass the best hand-engineered baselines on TerminalBench-2 — all on **fixed** base models. Claude Code is among the hand-engineered baselines evaluated.
 
 Nellie is a production hook-based harness that's been running this class of context engineering since before the abstraction was named.
 
