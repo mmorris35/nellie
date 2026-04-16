@@ -1218,12 +1218,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_index_entry_filename() {
-        let cp = make_checkpoint(
-            "user/example",
-            "work",
-            serde_json::json!({}),
-            1_750_032_000,
-        );
+        let cp = make_checkpoint("user/example", "work", serde_json::json!({}), 1_750_032_000);
 
         let (_title, filename, _hook) = checkpoint_to_index_entry(&cp);
 
@@ -1530,7 +1525,7 @@ mod tests {
 
     #[test]
     fn test_distinct_agents_produce_distinct_filenames() {
-        let agents = ["user/example", "mmn/other-project", "other-user/example"];
+        let agents = ["user/example", "user/other-project", "other-user/example"];
 
         let filenames: Vec<String> = agents
             .iter()

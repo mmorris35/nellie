@@ -713,7 +713,7 @@ mod tests {
         );
 
         let cp2 = CheckpointRecord::new(
-            "mmn/other-project",
+            "user/other-project",
             "Debugging CI pipeline",
             serde_json::json!({
                 "flags": ["blocked_on_ci"],
@@ -805,7 +805,7 @@ mod tests {
 
         // Should be sorted by agent name
         assert_eq!(checkpoints[0].agent, "user/example");
-        assert_eq!(checkpoints[1].agent, "mmn/other-project");
+        assert_eq!(checkpoints[1].agent, "user/other-project");
     }
 
     #[test]
