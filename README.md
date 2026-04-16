@@ -8,7 +8,6 @@ Nellie sits between the developer and the model: on every prompt, its hooks retr
 Semantic + structural + hybrid search, self-improving knowledge graph, automatic Claude Code integration via Deep Hooks, and a web dashboard — all in one local Rust server.
 
 [![CI](https://github.com/mmorris35/nellie/actions/workflows/ci.yml/badge.svg)](https://github.com/mmorris35/nellie/actions/workflows/ci.yml)
-[![Release](https://github.com/mmorris35/nellie-rs/actions/workflows/release.yml/badge.svg)](https://github.com/mmorris35/nellie-rs/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Why "middleware," not "memory store"?
