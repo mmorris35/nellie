@@ -444,7 +444,7 @@ mod tests {
                 rusqlite::params![
                     "cp-1",
                     "test-agent",
-                    "nellie-rs",
+                    "example",
                     "Implementing feature X",
                     r#"{"key": "value"}"#,
                     1234567890i64

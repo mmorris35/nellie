@@ -1,5 +1,5 @@
 #!/bin/bash
-# Nellie-RS Local Installer
+# Nellie Local Installer
 # Put this script in the same folder as the nellie binary, then run it.
 #
 # Usage: ./install-local.sh
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.nellie-rs}"
+INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.local/share/nellie}"
 BIN_DIR="${NELLIE_BIN_DIR:-$HOME/.local/bin}"
 
 GREEN='\033[0;32m'
@@ -57,7 +57,7 @@ find_binary() {
 main() {
     echo ""
     echo "╔═══════════════════════════════════════╗"
-    echo "║  Nellie-RS Local Installer            ║"
+    echo "║  Nellie Local Installer            ║"
     echo "╚═══════════════════════════════════════╝"
     echo ""
     
@@ -91,7 +91,7 @@ main() {
     if [[ ! -f "$config" ]]; then
         info "Creating config..."
         cat > "$config" << 'EOF'
-# Nellie-RS Configuration
+# Nellie Configuration
 
 [server]
 host = "127.0.0.1"
@@ -114,20 +114,20 @@ EOF
     esac
     
     if [[ -n "$shell_rc" ]] && ! grep -q "$BIN_DIR" "$shell_rc" 2>/dev/null; then
-        echo -e "\n# Nellie-RS\nexport PATH=\"$BIN_DIR:\$PATH\"" >> "$shell_rc"
+        echo -e "\n# Nellie\nexport PATH=\"$BIN_DIR:\$PATH\"" >> "$shell_rc"
         info "Added to PATH in $shell_rc"
     fi
     
     # Create launchd plist (macOS)
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        local plist="$HOME/Library/LaunchAgents/com.nellie-rs.plist"
+        local plist="$HOME/Library/LaunchAgents/com.nellie.plist"
         mkdir -p "$(dirname "$plist")"
         cat > "$plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>com.nellie-rs</string>
+    <key>Label</key><string>com.nellie</string>
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/nellie</string>
@@ -155,7 +155,7 @@ EOF
         mkdir -p "$(dirname "$service")"
         cat > "$service" << EOF
 [Unit]
-Description=Nellie-RS Code Memory
+Description=Nellie Code Memory
 After=network.target
 
 [Service]
@@ -193,8 +193,8 @@ EOF
         echo ""
         echo "  2. Restart after config changes:"
         if [[ "$(uname -s)" == "Darwin" ]]; then
-            echo "     ${YELLOW}launchctl unload ~/Library/LaunchAgents/com.nellie-rs.plist${NC}"
-            echo "     ${YELLOW}launchctl load ~/Library/LaunchAgents/com.nellie-rs.plist${NC}"
+            echo "     ${YELLOW}launchctl unload ~/Library/LaunchAgents/com.nellie.plist${NC}"
+            echo "     ${YELLOW}launchctl load ~/Library/LaunchAgents/com.nellie.plist${NC}"
         else
             echo "     ${YELLOW}systemctl --user restart nellie${NC}"
         fi
@@ -204,7 +204,7 @@ EOF
         echo ""
         echo "To start manually:"
         if [[ "$(uname -s)" == "Darwin" ]]; then
-            echo "     ${YELLOW}launchctl load ~/Library/LaunchAgents/com.nellie-rs.plist${NC}"
+            echo "     ${YELLOW}launchctl load ~/Library/LaunchAgents/com.nellie.plist${NC}"
         else
             echo "     ${YELLOW}systemctl --user start nellie${NC}"
         fi

@@ -1,14 +1,14 @@
 #!/bin/bash
-# Nellie-RS Universal Installer
-# Usage: curl -sSL https://github.com/mmorris35/nellie-rs/releases/latest/download/install-universal.sh | bash
+# Nellie Universal Installer
+# Usage: curl -sSL https://github.com/mmorris35/nellie/releases/latest/download/install-universal.sh | bash
 #
 # Or with specific version:
-# curl -sSL https://github.com/mmorris35/nellie-rs/releases/download/v0.1.0/install-universal.sh | bash
+# curl -sSL https://github.com/mmorris35/nellie/releases/download/v0.1.0/install-universal.sh | bash
 
 set -euo pipefail
 
 REPO="mmorris35/nellie"
-INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.nellie-rs}"
+INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.local/share/nellie}"
 BIN_DIR="${NELLIE_BIN_DIR:-$HOME/.local/bin}"
 
 # ONNX Runtime version — must match src/embeddings/version.rs MIN_ORT_VERSION
@@ -307,7 +307,7 @@ install_nellie_binary() {
     error "Could not install nellie binary.
 
 To build manually:
-  git clone https://github.com/$REPO.git && cd nellie-rs
+  git clone https://github.com/$REPO.git && cd nellie
   cargo build --release
   cp target/release/nellie $INSTALL_DIR/nellie
 
@@ -353,7 +353,7 @@ create_config() {
     
     info "Creating default configuration..."
     cat > "$config_file" << 'EOF'
-# Nellie-RS Configuration
+# Nellie Configuration
 # Edit this file to customize your Nellie instance
 
 [server]
@@ -361,11 +361,11 @@ host = "127.0.0.1"
 port = 8765
 
 [storage]
-# Database location (default: ~/.nellie-rs/nellie.db)
+# Database location (default: ~/.local/share/nellie/nellie.db)
 # db_path = "/path/to/nellie.db"
 
 [embeddings]
-# Model path (default: ~/.nellie-rs/models/all-MiniLM-L6-v2.onnx)
+# Model path (default: ~/.local/share/nellie/models/all-MiniLM-L6-v2.onnx)
 # model_path = "/path/to/model.onnx"
 
 [watcher]
@@ -403,7 +403,7 @@ setup_shell() {
     # Add to PATH if needed
     if [[ -n "$shell_rc" ]] && ! grep -q "$BIN_DIR" "$shell_rc" 2>/dev/null; then
         echo "" >> "$shell_rc"
-        echo "# Nellie-RS" >> "$shell_rc"
+        echo "# Nellie" >> "$shell_rc"
         echo "$path_line" >> "$shell_rc"
         info "Added $BIN_DIR to PATH in $shell_rc"
         warn "Run 'source $shell_rc' or restart your terminal"
@@ -413,7 +413,7 @@ setup_shell() {
 # Create launchd plist for macOS
 setup_macos_service() {
     local plist_dir="$HOME/Library/LaunchAgents"
-    local plist_file="$plist_dir/com.nellie-rs.plist"
+    local plist_file="$plist_dir/com.nellie.plist"
     
     mkdir -p "$plist_dir"
     
@@ -423,7 +423,7 @@ setup_macos_service() {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nellie-rs</string>
+    <string>com.nellie</string>
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/nellie</string>
@@ -476,7 +476,7 @@ setup_linux_service() {
     
     cat > "$service_file" << EOF
 [Unit]
-Description=Nellie-RS Code Memory Server
+Description=Nellie Code Memory Server
 After=network.target
 
 [Service]
@@ -512,7 +512,7 @@ EOF
 main() {
     echo ""
     echo "╔═══════════════════════════════════════════╗"
-    echo "║     Nellie-RS Installer                   ║"
+    echo "║     Nellie Installer                   ║"
     echo "║     Your AI-Powered Code Memory           ║"
     echo "╚═══════════════════════════════════════════╝"
     echo ""

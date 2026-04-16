@@ -704,7 +704,7 @@ mod tests {
     /// Helper: insert test checkpoints into the database.
     fn insert_test_checkpoints(db: &Database) {
         let cp1 = CheckpointRecord::new(
-            "mmn/nellie-rs",
+            "user/example",
             "Implementing deep hooks phase 1",
             serde_json::json!({
                 "decisions": ["Use atomic writes", "Tag with [nellie]"],
@@ -713,7 +713,7 @@ mod tests {
         );
 
         let cp2 = CheckpointRecord::new(
-            "mmn/other-project",
+            "user/other-project",
             "Debugging CI pipeline",
             serde_json::json!({
                 "flags": ["blocked_on_ci"],
@@ -804,8 +804,8 @@ mod tests {
         assert_eq!(checkpoints.len(), 2);
 
         // Should be sorted by agent name
-        assert_eq!(checkpoints[0].agent, "mmn/nellie-rs");
-        assert_eq!(checkpoints[1].agent, "mmn/other-project");
+        assert_eq!(checkpoints[0].agent, "user/example");
+        assert_eq!(checkpoints[1].agent, "user/other-project");
     }
 
     #[test]

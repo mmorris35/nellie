@@ -1,15 +1,15 @@
 #!/bin/bash
-# Nellie-RS Private Repo Installer
+# Nellie Private Repo Installer
 # Requires: gh CLI authenticated with repo access
 #
 # Usage: 
-#   gh release download v0.1.0 --repo mmorris35/nellie-rs -p "install-private.sh" -O - | bash
+#   gh release download v0.1.0 --repo mmorris35/nellie -p "install-private.sh" -O - | bash
 
 set -euo pipefail
 
-REPO="mmorris35/nellie-rs"
+REPO="mmorris35/nellie"
 VERSION="${NELLIE_VERSION:-latest}"
-INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.nellie-rs}"
+INSTALL_DIR="${NELLIE_INSTALL_DIR:-$HOME/.local/share/nellie}"
 BIN_DIR="${NELLIE_BIN_DIR:-$HOME/.local/bin}"
 
 # Colors
@@ -101,7 +101,7 @@ create_config() {
     
     info "Creating config..."
     cat > "$config_file" << 'EOF'
-# Nellie-RS Configuration
+# Nellie Configuration
 
 [server]
 host = "127.0.0.1"
@@ -128,7 +128,7 @@ setup_path() {
     esac
     
     if [[ -n "$shell_rc" ]] && ! grep -q "$BIN_DIR" "$shell_rc" 2>/dev/null; then
-        echo -e "\n# Nellie-RS\nexport PATH=\"$BIN_DIR:\$PATH\"" >> "$shell_rc"
+        echo -e "\n# Nellie\nexport PATH=\"$BIN_DIR:\$PATH\"" >> "$shell_rc"
         warn "Added to PATH. Run: source $shell_rc"
     fi
 }
@@ -138,14 +138,14 @@ setup_service() {
     mkdir -p "$INSTALL_DIR/logs"
     
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        local plist="$HOME/Library/LaunchAgents/com.nellie-rs.plist"
+        local plist="$HOME/Library/LaunchAgents/com.nellie.plist"
         mkdir -p "$(dirname "$plist")"
         cat > "$plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>com.nellie-rs</string>
+    <key>Label</key><string>com.nellie</string>
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/nellie</string>
@@ -168,7 +168,7 @@ EOF
         mkdir -p "$(dirname "$service")"
         cat > "$service" << EOF
 [Unit]
-Description=Nellie-RS
+Description=Nellie
 After=network.target
 [Service]
 ExecStart=$INSTALL_DIR/nellie --config $INSTALL_DIR/config.toml
@@ -186,7 +186,7 @@ EOF
 main() {
     echo ""
     echo "╔═══════════════════════════════════════╗"
-    echo "║  Nellie-RS Private Installer          ║"
+    echo "║  Nellie Private Installer          ║"
     echo "╚═══════════════════════════════════════╝"
     echo ""
     

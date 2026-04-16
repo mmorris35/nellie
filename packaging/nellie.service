@@ -1,6 +1,6 @@
 [Unit]
 Description=Nellie Production - Semantic Code Memory System
-Documentation=https://github.com/sequeldata/nellie-rs
+Documentation=https://github.com/mmorris35/nellie
 After=network.target
 Wants=network-online.target
 

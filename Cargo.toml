@@ -6,7 +6,7 @@ rust-version = "1.75"
 authors = ["Sequel Data <dev@sequeldata.com>"]
 description = "Production-grade semantic code memory system"
 license = "MIT"
-repository = "https://github.com/sequeldata/nellie-rs"
+repository = "https://github.com/mmorris35/nellie"
 keywords = ["semantic-search", "code-search", "mcp", "embeddings"]
 categories = ["development-tools", "database"]
 

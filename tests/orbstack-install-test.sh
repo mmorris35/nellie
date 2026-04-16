@@ -14,8 +14,8 @@
 set -uo pipefail
 
 VM="nellie-test"
-REPO_HOST="/Users/mmn/github/nellie-rs"
-REPO_VM="/Users/mmn/github/nellie-rs"
+REPO_HOST="/Users/mmn/github/nellie"
+REPO_VM="/Users/mmn/github/nellie"
 NELLIE_PORT=8765
 RESULTS=()
 FAIL=0
@@ -108,7 +108,7 @@ fi
 echo "=== Verification ==="
 
 # 1. Binary exists
-check "nellie binary exists" run 'which nellie 2>/dev/null || test -f ~/.local/bin/nellie || test -f ~/github/nellie-rs/target/release/nellie'
+check "nellie binary exists" run 'which nellie 2>/dev/null || test -f ~/.local/bin/nellie || test -f ~/github/nellie/target/release/nellie'
 
 # 2. Version check
 echo -n "  Version: "

@@ -1,16 +1,16 @@
 #!/bin/bash
-# Nellie-RS macOS Installation Script
+# Nellie macOS Installation Script
 # macOS install script for Nellie
 
 set -e
 
 NELLIE_BIN="/usr/local/bin/nellie"
-NELLIE_DATA="/var/lib/nellie-rs"
+NELLIE_DATA="/var/lib/nellie"
 NELLIE_CONFIG="/usr/local/etc/nellie"
-LAUNCHD_PLIST="/Library/LaunchDaemons/com.nellie-rs.server.plist"
+LAUNCHD_PLIST="/Library/LaunchDaemons/com.nellie.server.plist"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "=== Nellie-RS macOS Installation ==="
+echo "=== Nellie macOS Installation ==="
 echo ""
 
 # Check if running as root for system-wide installation
@@ -59,7 +59,7 @@ if [[ -f "$LAUNCHD_PLIST" ]]; then
     echo "  Unloading existing service..."
     sudo launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
 fi
-sudo cp "$SCRIPT_DIR/com.nellie-rs.server.plist" "$LAUNCHD_PLIST"
+sudo cp "$SCRIPT_DIR/com.nellie.server.plist" "$LAUNCHD_PLIST"
 sudo chown root:wheel "$LAUNCHD_PLIST"
 sudo chmod 644 "$LAUNCHD_PLIST"
 echo "  Done."

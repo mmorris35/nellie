@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_parse_header_line() {
-        let line = "# Nellie-RS Memory Index";
+        let line = "# Nellie Memory Index";
         assert!(parse_nellie_entry(line).is_none());
     }
 
@@ -688,9 +688,9 @@ mod tests {
     #[test]
     fn test_parse_mixed_content() {
         let content = "\
-# Nellie-RS Memory Index
+# Nellie Memory Index
 
-- [project_deployment.md](project_deployment.md) -- Nellie-RS only runs on MiniDev, hostname guard enforces this
+- [project_deployment.md](project_deployment.md) -- Nellie only runs on MiniDev, hostname guard enforces this
 - [SQLite Tips](sqlite_tips.md) -- WAL mode best practices [nellie]
 - [Git Rules](git_rules.md) -- Interleaving workflow [nellie]
 ";
@@ -833,7 +833,7 @@ mod tests {
         let mut index = MemoryIndex::new();
         index
             .entries
-            .push(MemoryEntry::Other("# Nellie-RS Memory Index".to_string()));
+            .push(MemoryEntry::Other("# Nellie Memory Index".to_string()));
         index.entries.push(MemoryEntry::Other(String::new()));
         index.add_entry("SQLite Tips", "sqlite_tips.md", "WAL mode best practices");
         index.add_entry("Git Rules", "git_rules.md", "Interleaving workflow");
@@ -845,7 +845,7 @@ mod tests {
 
         assert_eq!(loaded.line_count(), index.line_count());
         assert_eq!(loaded.nellie_entry_count(), index.nellie_entry_count());
-        assert!(loaded.entries[0] == MemoryEntry::Other("# Nellie-RS Memory Index".to_string()));
+        assert!(loaded.entries[0] == MemoryEntry::Other("# Nellie Memory Index".to_string()));
         assert!(loaded.entries[1] == MemoryEntry::Other(String::new()));
     }
 
@@ -961,9 +961,9 @@ mod tests {
 
         // Start with an existing MEMORY.md that has manual content
         let initial = "\
-# Nellie-RS Memory Index
+# Nellie Memory Index
 
-- [project_deployment.md](project_deployment.md) -- Nellie-RS only runs on MiniDev
+- [project_deployment.md](project_deployment.md) -- Nellie only runs on MiniDev
 ";
         fs::write(&path, initial).unwrap();
 
@@ -995,7 +995,7 @@ mod tests {
         // Original content preserved
         assert_eq!(
             reloaded.entries[0],
-            MemoryEntry::Other("# Nellie-RS Memory Index".to_string())
+            MemoryEntry::Other("# Nellie Memory Index".to_string())
         );
     }
 

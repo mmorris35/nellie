@@ -1,6 +1,6 @@
 #!/bin/bash
-# Migration script: Python Nellie -> Nellie-RS
-# Copies lessons and checkpoints from Python Nellie's ChromaDB to Nellie-RS SQLite
+# Migration script: Python Nellie -> Nellie
+# Copies lessons and checkpoints from Python Nellie's ChromaDB to Nellie SQLite
 
 set -e
 
@@ -30,11 +30,11 @@ fi
 echo "  Python Nellie: OK"
 
 if ! curl -s "$RUST_URL/health" > /dev/null 2>&1; then
-    echo "Error: Nellie-RS not responding at $RUST_URL/health"
-    echo "Make sure Nellie-RS is running on port $RUST_NELLIE_PORT"
+    echo "Error: Nellie not responding at $RUST_URL/health"
+    echo "Make sure Nellie is running on port $RUST_NELLIE_PORT"
     exit 1
 fi
-echo "  Nellie-RS: OK"
+echo "  Nellie: OK"
 echo ""
 
 # Create temp directory for migration data
@@ -58,7 +58,7 @@ if [[ "$LESSON_COUNT" == "0" || "$LESSON_COUNT" == "null" ]]; then
     echo "  Skipping lessons migration."
 else
     echo ""
-    echo "=== Step 2: Import Lessons to Nellie-RS ==="
+    echo "=== Step 2: Import Lessons to Nellie ==="
 
     # Extract lessons and import each one
     IMPORTED=0
@@ -119,7 +119,7 @@ if [[ "$CHECKPOINT_COUNT" == "0" || "$CHECKPOINT_COUNT" == "null" ]]; then
     echo "  Skipping checkpoints migration."
 else
     echo ""
-    echo "=== Step 4: Import Checkpoints to Nellie-RS ==="
+    echo "=== Step 4: Import Checkpoints to Nellie ==="
 
     IMPORTED=0
     FAILED=0
@@ -163,7 +163,7 @@ RUST_STATUS=$(curl -s "$RUST_URL/api/v1/status")
 RUST_LESSONS=$(echo "$RUST_STATUS" | jq '.lessons // 0')
 RUST_CHECKPOINTS=$(echo "$RUST_STATUS" | jq '.checkpoints // 0')
 
-echo "  Nellie-RS now has:"
+echo "  Nellie now has:"
 echo "    Lessons: $RUST_LESSONS"
 echo "    Checkpoints: $RUST_CHECKPOINTS"
 
@@ -171,7 +171,7 @@ echo ""
 echo "=== Migration Complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Verify data in Nellie-RS:"
+echo "  1. Verify data in Nellie:"
 echo "     curl '$RUST_URL/mcp/invoke' -d '{\"name\":\"search_lessons\",\"arguments\":{\"query\":\"test\",\"limit\":5}}'"
 echo ""
 echo "  2. Update clients to use port $RUST_NELLIE_PORT"
@@ -180,5 +180,5 @@ echo "  3. After verification, shut down Python Nellie:"
 echo "     screen -S nellie-daemon -X quit"
 echo "     screen -S nellie-watchdog -X quit"
 echo ""
-echo "  4. Reconfigure Nellie-RS to port 8765 (edit launchd plist)"
+echo "  4. Reconfigure Nellie to port 8765 (edit launchd plist)"
 echo ""

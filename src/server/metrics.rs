@@ -107,7 +107,7 @@ pub const TOKENS_PER_CHAR: f64 = 0.25;
 /// # Arguments
 ///
 /// * `tool_name` - MCP tool name (e.g., `"search_code"`)
-/// * `agent` - Agent identifier (e.g., `"mmn/nellie-rs"`) or `"unknown"`
+/// * `agent` - Agent identifier (e.g., `"user/example"`) or `"unknown"`
 /// * `status` - `"success"` or `"error"`
 /// * `latency` - Time elapsed for the tool call
 /// * `response_bytes` - Size of the response payload in bytes (0 for errors)
@@ -370,7 +370,7 @@ mod tests {
         // Record a successful tool call
         record_tool_call(
             "search_code",
-            "mmn/test",
+            "user/test",
             "success",
             std::time::Duration::from_millis(42),
             1024,
@@ -378,7 +378,7 @@ mod tests {
 
         // Verify counter incremented
         let count = TOOL_INVOCATIONS
-            .with_label_values(&["search_code", "mmn/test", "success"])
+            .with_label_values(&["search_code", "user/test", "success"])
             .get();
         assert!(
             count >= 1,
@@ -387,13 +387,13 @@ mod tests {
 
         // Verify latency recorded
         let latency = TOOL_LATENCY
-            .with_label_values(&["search_code", "mmn/test"])
+            .with_label_values(&["search_code", "user/test"])
             .get_sample_count();
         assert!(latency >= 1, "latency histogram should have >= 1 sample");
 
         // Verify response bytes recorded
         let bytes = TOOL_RESPONSE_BYTES
-            .with_label_values(&["search_code", "mmn/test"])
+            .with_label_values(&["search_code", "user/test"])
             .get();
         assert!(
             bytes >= 1024,
@@ -402,7 +402,7 @@ mod tests {
 
         // Verify token savings estimated
         let tokens = TOKEN_SAVINGS
-            .with_label_values(&["search_code", "mmn/test"])
+            .with_label_values(&["search_code", "user/test"])
             .get();
         assert!(
             tokens >= 256.0,
@@ -435,14 +435,14 @@ mod tests {
         // Record some tool calls so there is data to collect
         record_tool_call(
             "collect_test_tool",
-            "mmn/collect-test",
+            "user/collect-test",
             "success",
             std::time::Duration::from_millis(100),
             512,
         );
         record_tool_call(
             "collect_test_tool",
-            "mmn/collect-test",
+            "user/collect-test",
             "error",
             std::time::Duration::from_millis(5),
             0,
@@ -475,8 +475,11 @@ mod tests {
         let agent = summary
             .agents
             .iter()
-            .find(|a| a.agent == "mmn/collect-test");
-        assert!(agent.is_some(), "mmn/collect-test should be in agents list");
+            .find(|a| a.agent == "user/collect-test");
+        assert!(
+            agent.is_some(),
+            "user/collect-test should be in agents list"
+        );
         let agent = agent.unwrap();
         assert!(agent.invocations >= 2);
     }

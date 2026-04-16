@@ -243,8 +243,8 @@ enum Commands {
         ///
         /// Supports Unix timestamps or human-readable formats like "1h", "2d", "30m", "1w".
         /// Use with --project for incremental ingest. Examples:
-        /// nellie ingest --project ~/github/nellie-rs --since 1630000000
-        /// nellie ingest --project ~/github/nellie-rs --since 1h
+        /// nellie ingest --project ~/github/example --since 1630000000
+        /// nellie ingest --project ~/github/example --since 1h
         #[arg(long)]
         since: Option<String>,
 
