@@ -39,7 +39,7 @@ RestrictSUIDSGID=true
 MemoryDenyWriteExecute=true
 LockPersonality=true
 
-# Resource limits
+# Resource limits — lower MemoryMax to 2G on machines with <8GB RAM
 LimitNOFILE=65536
 MemoryMax=4G
 
