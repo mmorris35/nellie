@@ -41,7 +41,7 @@ LockPersonality=true
 
 # Resource limits
 LimitNOFILE=65536
-MemoryMax=4G
+MemoryMax=2G
 
 # Environment
 Environment="RUST_LOG=info"
