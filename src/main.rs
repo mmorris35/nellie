@@ -113,7 +113,7 @@ enum Commands {
 
         /// Force a full filesystem walk even when an existing index is detected.
         /// By default, subsequent startups use fast DB-first reconciliation.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "skip_initial_walk")]
         force_initial_walk: bool,
     },
 
