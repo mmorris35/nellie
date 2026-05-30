@@ -55,6 +55,39 @@ pub fn format_version(v: (u32, u32, u32)) -> String {
     format!("{}.{}.{}", v.0, v.1, v.2)
 }
 
+/// Resolve the ORT dylib path by checking, in order:
+///
+/// 1. The `ORT_DYLIB_PATH` environment variable (explicit override).
+/// 2. The Nellie-managed data directory (`$DATA_DIR/lib/libonnxruntime.*`),
+///    using `NELLIE_DATA_DIR` or the platform default from `dirs::data_local_dir`.
+///
+/// Returns `Some(path)` when a candidate file exists on disk, `None` otherwise.
+fn discover_ort_dylib() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
+        if !p.is_empty() && std::path::Path::new(&p).exists() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+
+    let data_dir = std::env::var("NELLIE_DATA_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("nellie")))?;
+
+    let lib_name = if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+
+    let candidate = data_dir.join("lib").join(lib_name);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Eagerly load the ONNX Runtime dynamic library and validate its version.
 ///
 /// On success the runtime build-info string is returned (e.g.
@@ -65,23 +98,21 @@ pub fn format_version(v: (u32, u32, u32)) -> String {
 /// - the recommended (pinned) version,
 /// - concrete remediation steps.
 ///
-/// This function calls `ort::init_from` when `ORT_DYLIB_PATH` is set, or
-/// falls back to `ort::init().commit()` (which triggers lazy loading via
-/// platform default search paths).  Either way, the ONNX Runtime library is
-/// loaded and its version is validated by the `ort` crate itself before this
-/// function returns.
+/// This function first tries to auto-discover the dylib that `nellie setup`
+/// installed (in `$DATA_DIR/lib/`), eliminating the need for users to set
+/// `ORT_DYLIB_PATH` manually.  Falls back to `ort::init().commit()` (platform
+/// default search paths) only when no managed copy is found.
 pub fn check_ort_version() -> Result<String, String> {
     // Attempt to load the dynamic library eagerly so we can surface version
     // mismatches *before* any Session is constructed.
-    let load_result = match std::env::var("ORT_DYLIB_PATH") {
-        Ok(ref p) if !p.is_empty() => {
-            // init_from both loads the library and returns Result
+    let load_result = match discover_ort_dylib() {
+        Some(ref p) => {
             ort::init_from(p).map(|builder| {
                 builder.commit();
             })
         }
-        _ => {
-            // No explicit path — trigger the default search.
+        None => {
+            // No managed copy found — trigger the default search.
             // init() cannot fail, but the actual library load happens lazily
             // when api() is first called.  Force it now.
             ort::init().commit();
