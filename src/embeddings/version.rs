@@ -105,32 +105,29 @@ fn discover_ort_dylib() -> Option<std::path::PathBuf> {
 pub fn check_ort_version() -> Result<String, String> {
     // Attempt to load the dynamic library eagerly so we can surface version
     // mismatches *before* any Session is constructed.
-    let load_result = if let Some(ref p) = discover_ort_dylib() {
-        ort::init_from(p).map(|builder| {
-            builder.commit();
-        })
-    } else {
-        // No managed copy found — trigger the default search.
-        // init() cannot fail, but the actual library load happens lazily
-        // when api() is first called.  Force it now.
-        ort::init().commit();
-        // Trigger the lazy API initialisation which loads the dylib.
-        // ort::api() panics on failure; catch that with catch_unwind.
-        std::panic::catch_unwind(ort::api)
-            .map(|_| ())
-            .map_err(|panic_payload| {
-                let msg = panic_payload
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| {
-                        panic_payload
-                            .downcast_ref::<&str>()
-                            .map(ToString::to_string)
-                    })
-                    .unwrap_or_else(|| "unknown panic while loading ONNX Runtime".to_string());
-                ort::Error::new(msg)
-            })
-    };
+    let load_result = discover_ort_dylib().map_or_else(
+        || {
+            // No managed copy found — trigger the default search.
+            ort::init().commit();
+            std::panic::catch_unwind(ort::api)
+                .map(|_| ())
+                .map_err(|panic_payload| {
+                    let msg = panic_payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            panic_payload
+                                .downcast_ref::<&str>()
+                                .map(ToString::to_string)
+                        })
+                        .unwrap_or_else(|| {
+                            "unknown panic while loading ONNX Runtime".to_string()
+                        });
+                    ort::Error::new(msg)
+                })
+        },
+        |ref p| ort::init_from(p).map(|builder| builder.commit()),
+    );
 
     match load_result {
         Ok(()) => {
