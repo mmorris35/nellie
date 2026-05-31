@@ -120,13 +120,15 @@ pub fn check_ort_version() -> Result<String, String> {
                                 .downcast_ref::<&str>()
                                 .map(ToString::to_string)
                         })
-                        .unwrap_or_else(|| {
-                            "unknown panic while loading ONNX Runtime".to_string()
-                        });
+                        .unwrap_or_else(|| "unknown panic while loading ONNX Runtime".to_string());
                     ort::Error::new(msg)
                 })
         },
-        |ref p| ort::init_from(p).map(|builder| builder.commit()),
+        |ref p| {
+            ort::init_from(p).map(|builder| {
+                let _ = builder.commit();
+            })
+        },
     );
 
     match load_result {
