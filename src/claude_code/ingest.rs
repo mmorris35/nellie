@@ -44,6 +44,11 @@ use super::extractor::{extract_lessons, ExtractedLesson};
 use super::paths::resolve_transcript_dir;
 use super::transcript::parse_transcript;
 
+/// Maximum lesson content size in bytes. Lessons exceeding this are
+/// truncated with a marker. Prevents unbounded storage from skill
+/// prompts and other large injected content.
+const MAX_LESSON_BYTES: usize = 8192;
+
 /// Configuration for transcript ingestion.
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
@@ -311,7 +316,7 @@ async fn process_single_transcript_remote(
         });
     }
 
-    let extracted = extract_lessons(&entries);
+    let extracted = cap_lesson_size(extract_lessons(&entries));
     let extracted_count = extracted.len();
 
     let mut new_lessons = Vec::new();
@@ -447,6 +452,45 @@ fn find_transcripts_in_project(project_path: &Path, since: Option<i64>) -> Resul
     Ok(transcripts)
 }
 
+/// Cap lesson content to `MAX_LESSON_BYTES`. Returns the filtered list
+/// with oversized lessons either truncated (with a marker) or skipped.
+fn cap_lesson_size(lessons: Vec<ExtractedLesson>) -> Vec<ExtractedLesson> {
+    lessons
+        .into_iter()
+        .filter_map(|mut lesson| {
+            let size = lesson.content.len();
+            if size <= MAX_LESSON_BYTES {
+                return Some(lesson);
+            }
+            // Skip lessons that are overwhelmingly a single injected blob
+            // (>32KB is almost certainly a skill prompt dump, not real content)
+            if size > MAX_LESSON_BYTES * 4 {
+                tracing::warn!(
+                    title = %lesson.title,
+                    size_bytes = size,
+                    "Skipping oversized lesson (likely injected content)"
+                );
+                return None;
+            }
+            // Truncate with marker
+            let mut end = MAX_LESSON_BYTES;
+            while !lesson.content.is_char_boundary(end) {
+                end -= 1;
+            }
+            lesson.content.truncate(end);
+            lesson
+                .content
+                .push_str("\n\n[... truncated — original exceeded 8 KB]");
+            tracing::info!(
+                title = %lesson.title,
+                original_bytes = size,
+                "Truncated oversized lesson"
+            );
+            Some(lesson)
+        })
+        .collect()
+}
+
 /// Process a single transcript file and extract lessons.
 ///
 /// 1. Parse the transcript into structured entries
@@ -482,8 +526,8 @@ fn process_single_transcript(
         "Parsed transcript"
     );
 
-    // Extract lessons from patterns
-    let extracted = extract_lessons(&entries);
+    // Extract lessons from patterns (with size cap)
+    let extracted = cap_lesson_size(extract_lessons(&entries));
     let extracted_count = extracted.len();
 
     tracing::debug!(
