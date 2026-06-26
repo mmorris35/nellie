@@ -12,7 +12,9 @@
 #![allow(clippy::cast_precision_loss)]
 
 use clap::{Parser, Subcommand};
-use nellie::server::{init_metrics, init_tracing, App, ServerConfig};
+use nellie::server::{
+    init_metrics, init_tracing, start_mcp_server, App, McpTransportConfig, ServerConfig,
+};
 use nellie::storage::{init_storage, Database};
 use nellie::watcher::{FileFilter, FileWatcher, IndexRequest, Indexer, WatcherConfig};
 use nellie::{Config, Result};
@@ -806,6 +808,26 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
     let indexer_db = db.clone();
 
     let app = App::new(server_config.clone(), db).await?;
+
+    let mcp_port = args
+        .port
+        .checked_add(1)
+        .ok_or_else(|| nellie::Error::config("MCP port overflow"))?;
+    let _mcp_handle = start_mcp_server(
+        McpTransportConfig {
+            host: server_config.host.clone(),
+            port: mcp_port,
+        },
+        indexer_db.clone(),
+        app.embeddings(),
+        app.graph(),
+    )
+    .await?;
+    tracing::info!(
+        "Streamable MCP transport available at http://{}:{}/mcp",
+        server_config.host,
+        mcp_port
+    );
 
     // Wire up transcript watcher for Deep Hooks if enabled
     if args.enable_deep_hooks {

@@ -232,6 +232,11 @@ impl App {
         self.state.embeddings.clone()
     }
 
+    /// Get a clone of the graph memory lock if graph memory is enabled.
+    pub fn graph(&self) -> Option<Arc<parking_lot::RwLock<crate::graph::GraphMemory>>> {
+        self.state.graph.clone()
+    }
+
     /// server can start immediately. Returns handles to spawned tasks.
     ///
     /// # Errors

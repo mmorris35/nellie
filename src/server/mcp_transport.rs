@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::embeddings::EmbeddingService;
+use crate::graph::{EntityType, GraphMemory, RelationshipKind};
 use crate::storage::Database;
 
 // ==================== Request Types ====================
@@ -58,6 +59,14 @@ pub struct AddLessonRequest {
     pub severity: Option<String>,
     #[schemars(description = "Repository name (e.g., my-org/my-repo)")]
     pub repo: Option<String>,
+    #[schemars(description = "Problem this lesson solved; creates a problem node and solved edge")]
+    pub solved_problem: Option<String>,
+    #[schemars(description = "Tools used by this lesson; creates tool nodes and used edges")]
+    pub used_tools: Option<Vec<String>>,
+    #[schemars(description = "Related concepts; creates concept nodes and related_to edges")]
+    pub related_concepts: Option<Vec<String>>,
+    #[schemars(description = "Source concept or prior lesson this was learned from")]
+    pub learned_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -74,6 +83,16 @@ pub struct AddCheckpointRequest {
     pub working_on: String,
     #[schemars(description = "State object to persist")]
     pub state: Value,
+    #[schemars(description = "Tools used in this session; creates tool nodes and used edges")]
+    pub tools_used: Option<Vec<String>>,
+    #[schemars(description = "Problems encountered in this session")]
+    pub problems_encountered: Option<Vec<String>>,
+    #[schemars(description = "Solutions found in this session")]
+    pub solutions_found: Option<Vec<String>>,
+    #[schemars(description = "Graph suggestion edge IDs used during this session")]
+    pub graph_suggestions_used: Option<Vec<String>>,
+    #[schemars(description = "Outcome for graph suggestions: success, failure, or partial")]
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -115,17 +134,255 @@ pub struct TriggerReindexRequest {
 pub struct NellieMcpHandler {
     db: Database,
     embeddings: Option<EmbeddingService>,
+    graph: Option<Arc<parking_lot::RwLock<GraphMemory>>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl NellieMcpHandler {
     /// Create a new MCP handler.
-    pub fn new(db: Database, embeddings: Option<EmbeddingService>) -> Self {
+    pub fn new(
+        db: Database,
+        embeddings: Option<EmbeddingService>,
+        graph: Option<Arc<parking_lot::RwLock<GraphMemory>>>,
+    ) -> Self {
         Self {
             db,
             embeddings,
+            graph,
             tool_router: Self::tool_router(),
         }
+    }
+
+    fn enrich_lesson_graph(&self, req: &AddLessonRequest) -> Option<Value> {
+        let graph_lock = self.graph.as_ref()?;
+        if req.solved_problem.is_none()
+            && req.used_tools.as_ref().is_none_or(Vec::is_empty)
+            && req.related_concepts.as_ref().is_none_or(Vec::is_empty)
+            && req.learned_from.is_none()
+        {
+            return None;
+        }
+
+        let mut graph = graph_lock.write();
+        let mut entity_ids = Vec::new();
+        let mut edge_ids = Vec::new();
+
+        let solution_id =
+            crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Solution, &req.title);
+        entity_ids.push(solution_id.clone());
+
+        if let Some(problem) = req
+            .solved_problem
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let problem_id =
+                crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Problem, problem);
+            entity_ids.push(problem_id.clone());
+            if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                &mut graph,
+                &solution_id,
+                &problem_id,
+                RelationshipKind::Solved,
+                Some("Lesson solved_problem".to_string()),
+            ) {
+                edge_ids.push(edge_id);
+            }
+        }
+
+        if let Some(tools) = req.used_tools.as_ref() {
+            for tool in tools.iter().filter(|tool| !tool.trim().is_empty()) {
+                let tool_id =
+                    crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Tool, tool);
+                entity_ids.push(tool_id.clone());
+                if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                    &mut graph,
+                    &solution_id,
+                    &tool_id,
+                    RelationshipKind::Used,
+                    Some("Lesson used_tools".to_string()),
+                ) {
+                    edge_ids.push(edge_id);
+                }
+            }
+        }
+
+        if let Some(concepts) = req.related_concepts.as_ref() {
+            for concept in concepts.iter().filter(|concept| !concept.trim().is_empty()) {
+                let concept_id = crate::graph::enrichment::ensure_entity(
+                    &mut graph,
+                    EntityType::Concept,
+                    concept,
+                );
+                entity_ids.push(concept_id.clone());
+                if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                    &mut graph,
+                    &solution_id,
+                    &concept_id,
+                    RelationshipKind::RelatedTo,
+                    Some("Lesson related_concepts".to_string()),
+                ) {
+                    edge_ids.push(edge_id);
+                }
+            }
+        }
+
+        if let Some(source) = req.learned_from.as_deref().filter(|s| !s.trim().is_empty()) {
+            let source_id =
+                crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Concept, source);
+            entity_ids.push(source_id.clone());
+            if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                &mut graph,
+                &solution_id,
+                &source_id,
+                RelationshipKind::DerivedFrom,
+                Some("Lesson learned_from".to_string()),
+            ) {
+                edge_ids.push(edge_id);
+            }
+        }
+
+        crate::graph::enrichment::persist_changes(&self.db, &graph, &entity_ids, &edge_ids);
+
+        Some(serde_json::json!({
+            "nodes_touched": entity_ids.len(),
+            "edges_touched": edge_ids.len()
+        }))
+    }
+
+    fn enrich_checkpoint_graph(
+        &self,
+        req: &AddCheckpointRequest,
+        checkpoint_id: &str,
+    ) -> Option<Value> {
+        let graph_lock = self.graph.as_ref()?;
+        if req.tools_used.as_ref().is_none_or(Vec::is_empty)
+            && req.problems_encountered.as_ref().is_none_or(Vec::is_empty)
+            && req.solutions_found.as_ref().is_none_or(Vec::is_empty)
+            && req
+                .graph_suggestions_used
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return None;
+        }
+
+        let mut graph = graph_lock.write();
+        let mut entity_ids = Vec::new();
+        let mut edge_ids = Vec::new();
+
+        let agent_id =
+            crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Agent, &req.agent);
+        entity_ids.push(agent_id.clone());
+
+        let checkpoint_node_id =
+            crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Chunk, checkpoint_id);
+        entity_ids.push(checkpoint_node_id.clone());
+
+        if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+            &mut graph,
+            &agent_id,
+            &checkpoint_node_id,
+            RelationshipKind::RelatedTo,
+            Some("Checkpoint recorded".to_string()),
+        ) {
+            edge_ids.push(edge_id);
+        }
+
+        if let Some(tools) = req.tools_used.as_ref() {
+            for tool in tools.iter().filter(|tool| !tool.trim().is_empty()) {
+                let tool_id =
+                    crate::graph::enrichment::ensure_entity(&mut graph, EntityType::Tool, tool);
+                entity_ids.push(tool_id.clone());
+                if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                    &mut graph,
+                    &agent_id,
+                    &tool_id,
+                    RelationshipKind::Used,
+                    Some("Checkpoint tools_used".to_string()),
+                ) {
+                    edge_ids.push(edge_id);
+                }
+            }
+        }
+
+        let mut problem_ids = Vec::new();
+        if let Some(problems) = req.problems_encountered.as_ref() {
+            for problem in problems.iter().filter(|problem| !problem.trim().is_empty()) {
+                let problem_id = crate::graph::enrichment::ensure_entity(
+                    &mut graph,
+                    EntityType::Problem,
+                    problem,
+                );
+                entity_ids.push(problem_id.clone());
+                problem_ids.push(problem_id.clone());
+                if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                    &mut graph,
+                    &checkpoint_node_id,
+                    &problem_id,
+                    RelationshipKind::Encountered,
+                    Some("Checkpoint problems_encountered".to_string()),
+                ) {
+                    edge_ids.push(edge_id);
+                }
+            }
+        }
+
+        let mut solution_ids = Vec::new();
+        if let Some(solutions) = req.solutions_found.as_ref() {
+            for solution in solutions
+                .iter()
+                .filter(|solution| !solution.trim().is_empty())
+            {
+                let solution_id = crate::graph::enrichment::ensure_entity(
+                    &mut graph,
+                    EntityType::Solution,
+                    solution,
+                );
+                entity_ids.push(solution_id.clone());
+                solution_ids.push(solution_id.clone());
+                if let Some(edge_id) = crate::graph::enrichment::ensure_edge(
+                    &mut graph,
+                    &checkpoint_node_id,
+                    &solution_id,
+                    RelationshipKind::SolvedBy,
+                    Some("Checkpoint solutions_found".to_string()),
+                ) {
+                    edge_ids.push(edge_id);
+                }
+            }
+        }
+
+        let mut outcome_applied = false;
+        if let (Some(suggestions), Some(outcome_str)) =
+            (req.graph_suggestions_used.as_ref(), req.outcome.as_deref())
+        {
+            if let Some(outcome) = crate::graph::entities::Outcome::parse(outcome_str) {
+                crate::graph::integrity::process_outcome(&mut graph, suggestions, outcome);
+                outcome_applied = true;
+
+                if matches!(outcome, crate::graph::entities::Outcome::Failure) {
+                    for solution_id in &solution_ids {
+                        for problem_id in &problem_ids {
+                            crate::graph::integrity::create_contradiction_edge(
+                                &mut graph,
+                                solution_id,
+                                problem_id,
+                                Some("Reported as failure in checkpoint".to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        crate::graph::enrichment::persist_changes(&self.db, &graph, &entity_ids, &edge_ids);
+
+        Some(serde_json::json!({
+            "nodes_touched": entity_ids.len(),
+            "edges_touched": edge_ids.len(),
+            "outcome_applied": outcome_applied
+        }))
     }
 }
 
@@ -303,11 +560,16 @@ impl NellieMcpHandler {
             }
         }
 
-        serde_json::json!({
+        let graph_info = self.enrich_lesson_graph(&req);
+
+        let mut response = serde_json::json!({
             "id": id,
             "message": "Lesson recorded successfully"
-        })
-        .to_string()
+        });
+        if let Some(graph_info) = graph_info {
+            response["graph"] = graph_info;
+        }
+        response.to_string()
     }
 
     #[tool(description = "Delete a lesson by ID")]
@@ -328,7 +590,7 @@ impl NellieMcpHandler {
     #[tool(description = "Store an agent checkpoint for context recovery")]
     fn add_checkpoint(&self, Parameters(req): Parameters<AddCheckpointRequest>) -> String {
         let checkpoint =
-            crate::storage::CheckpointRecord::new(&req.agent, &req.working_on, req.state);
+            crate::storage::CheckpointRecord::new(&req.agent, &req.working_on, req.state.clone());
         let id = checkpoint.id.clone();
 
         if let Err(e) = self
@@ -363,11 +625,16 @@ impl NellieMcpHandler {
             }
         }
 
-        serde_json::json!({
+        let graph_info = self.enrich_checkpoint_graph(&req, &id);
+
+        let mut response = serde_json::json!({
             "id": id,
             "message": "Checkpoint saved successfully"
-        })
-        .to_string()
+        });
+        if let Some(graph_info) = graph_info {
+            response["graph"] = graph_info;
+        }
+        response.to_string()
     }
 
     #[tool(
@@ -657,6 +924,7 @@ pub async fn start_mcp_server(
     config: McpTransportConfig,
     db: Database,
     embeddings: Option<EmbeddingService>,
+    graph: Option<Arc<parking_lot::RwLock<GraphMemory>>>,
 ) -> crate::Result<tokio::task::JoinHandle<()>> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -675,6 +943,7 @@ pub async fn start_mcp_server(
     // Create the StreamableHttpService with a factory function
     let db_clone = db.clone();
     let embeddings_clone = embeddings.clone();
+    let graph_clone = graph.clone();
 
     let mcp_config = StreamableHttpServerConfig {
         stateful_mode: true,
@@ -688,6 +957,7 @@ pub async fn start_mcp_server(
                 Ok(NellieMcpHandler::new(
                     db_clone.clone(),
                     embeddings_clone.clone(),
+                    graph_clone.clone(),
                 ))
             },
             Arc::new(LocalSessionManager::default()),
