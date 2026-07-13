@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{sse::Event, IntoResponse, Sse},
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -86,6 +86,48 @@ pub struct LessonListQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+/// Lesson search query parameters.
+#[derive(Debug, Deserialize)]
+pub struct LessonSearchQuery {
+    pub q: String,
+    #[serde(default = "default_lesson_search_limit")]
+    pub limit: i64,
+}
+
+fn default_lesson_search_limit() -> i64 {
+    10
+}
+
+/// Lesson search response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonSearchResponse {
+    pub lessons: Vec<LessonSearchEntry>,
+    pub query: String,
+    pub total: usize,
+    pub search_type: String,
+}
+
+/// Lesson search result entry (includes score for semantic results).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LessonSearchEntry {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub severity: String,
+    pub tags: Vec<String>,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+}
+
+/// Embedding backfill response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BackfillResponse {
+    pub processed: usize,
+    pub skipped: usize,
+    pub failed: usize,
 }
 
 /// Lesson list response.
@@ -323,6 +365,8 @@ pub fn create_api_router(state: Arc<McpState>) -> Router {
         .route("/api/v1/files", get(list_files))
         .route("/api/v1/search", get(search))
         .route("/api/v1/lessons", get(list_lessons).post(create_lesson))
+        .route("/api/v1/lessons/search", get(search_lessons))
+        .route("/api/v1/lessons/backfill-embeddings", post(backfill_lesson_embeddings))
         .route("/api/v1/lessons/{id}", delete(delete_lesson))
         .route("/api/v1/metrics", get(tool_metrics))
         .route("/api/v1/search/hybrid", get(hybrid_search))
@@ -608,6 +652,173 @@ async fn delete_lesson(
 
     tracing::info!(id = %id, "Lesson deleted via UI");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/v1/lessons/search - Semantic search over lessons.
+///
+/// Uses embedding similarity when the embedding service is available,
+/// falls back to text search (LIKE) otherwise.
+async fn search_lessons(
+    State(state): State<Arc<McpState>>,
+    Query(params): Query<LessonSearchQuery>,
+) -> Result<Json<LessonSearchResponse>, StatusCode> {
+    if params.q.trim().is_empty() {
+        return Ok(Json(LessonSearchResponse {
+            lessons: Vec::new(),
+            query: params.q,
+            total: 0,
+            search_type: "none".to_string(),
+        }));
+    }
+
+    let limit = params.limit.clamp(1, 100) as usize;
+
+    // Try semantic search if embeddings available
+    if let Some(ref embedding_service) = state.embeddings {
+        match embedding_service.embed_one(params.q.clone()).await {
+            Ok(query_embedding) => {
+                let results = state
+                    .db()
+                    .with_conn(|conn| {
+                        storage::search_lessons_by_embedding(conn, &query_embedding, limit)
+                    })
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "Lesson semantic search failed");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                let lessons: Vec<LessonSearchEntry> = results
+                    .into_iter()
+                    .map(|r| LessonSearchEntry {
+                        id: r.record.id,
+                        title: r.record.title,
+                        content: r.record.content,
+                        severity: r.record.severity,
+                        tags: r.record.tags,
+                        created_at: r.record.created_at,
+                        score: Some(r.score),
+                    })
+                    .collect();
+
+                let total = lessons.len();
+                return Ok(Json(LessonSearchResponse {
+                    lessons,
+                    query: params.q,
+                    total,
+                    search_type: "semantic".to_string(),
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Lesson embedding failed, falling back to text search"
+                );
+            }
+        }
+    }
+
+    // Fallback to text search
+    let results = state
+        .db()
+        .with_conn(|conn| storage::search_lessons_by_text(conn, &params.q, limit))
+        .map_err(|e| {
+            tracing::error!(error = %e, "Lesson text search failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let lessons: Vec<LessonSearchEntry> = results
+        .into_iter()
+        .map(|l| LessonSearchEntry {
+            id: l.id,
+            title: l.title,
+            content: l.content,
+            severity: l.severity,
+            tags: l.tags,
+            created_at: l.created_at,
+            score: None,
+        })
+        .collect();
+
+    let total = lessons.len();
+    Ok(Json(LessonSearchResponse {
+        lessons,
+        query: params.q,
+        total,
+        search_type: "text".to_string(),
+    }))
+}
+
+/// POST /api/v1/lessons/backfill-embeddings - Generate embeddings for lessons that lack them.
+async fn backfill_lesson_embeddings(
+    State(state): State<Arc<McpState>>,
+) -> Result<Json<BackfillResponse>, StatusCode> {
+    let embedding_service = state.embeddings.as_ref().ok_or_else(|| {
+        tracing::error!("Backfill requested but embedding service not available");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let all_lessons = state
+        .db()
+        .with_conn(storage::list_lessons)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list lessons for backfill");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for lesson in &all_lessons {
+        // Check if embedding already exists by attempting a search with a dummy
+        let has_embedding = state
+            .db()
+            .with_conn(|conn| {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM lesson_embeddings WHERE id = ?",
+                        [&lesson.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok::<bool, crate::Error>(count > 0)
+            })
+            .unwrap_or(false);
+
+        if has_embedding {
+            skipped += 1;
+            continue;
+        }
+
+        let embed_text = format!("{} {}", lesson.title, lesson.content);
+        match embedding_service.embed_one(embed_text).await {
+            Ok(embedding) => {
+                let lesson_id = lesson.id.clone();
+                match state
+                    .db()
+                    .with_conn(move |conn| storage::store_lesson_embedding(conn, &lesson_id, &embedding))
+                {
+                    Ok(()) => processed += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, lesson_id = %lesson.id, "Failed to store backfill embedding");
+                        failed += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, lesson_id = %lesson.id, "Failed to generate backfill embedding");
+                failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(processed, skipped, failed, total = all_lessons.len(), "Lesson embedding backfill complete");
+
+    Ok(Json(BackfillResponse {
+        processed,
+        skipped,
+        failed,
+    }))
 }
 
 /// GET /api/v1/metrics - Tool-level metrics as structured JSON.
@@ -1237,6 +1448,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_search_lessons_empty_query() {
+        let state = create_test_state();
+        let app = create_api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lessons/search?q=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: LessonSearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.total, 0);
+        assert_eq!(result.search_type, "none");
+    }
+
+    #[tokio::test]
+    async fn test_search_lessons_text_fallback() {
+        let state = create_test_state();
+
+        // Insert a lesson
+        state
+            .db()
+            .with_conn(|conn| {
+                let lesson = storage::LessonRecord::new(
+                    "Rust Error Handling",
+                    "Use Result type for error handling in Rust",
+                    vec!["rust".to_string()],
+                );
+                storage::insert_lesson(conn, &lesson)
+            })
+            .unwrap();
+
+        let app = create_api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lessons/search?q=Rust")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: LessonSearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.search_type, "text");
+        assert!(result.lessons[0].title.contains("Rust"));
+        assert!(result.lessons[0].score.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_backfill_no_embeddings() {
+        let state = create_test_state();
+        let app = create_api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/lessons/backfill-embeddings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No embedding service = 503
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
