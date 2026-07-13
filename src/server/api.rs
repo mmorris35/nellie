@@ -281,6 +281,53 @@ pub struct CheckpointListResponse {
     pub total: usize,
 }
 
+/// Create checkpoint request body.
+#[derive(Debug, Deserialize)]
+pub struct CreateCheckpointRequest {
+    pub agent: String,
+    pub working_on: String,
+    #[serde(default = "default_checkpoint_state")]
+    pub state: serde_json::Value,
+}
+
+fn default_checkpoint_state() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Checkpoint search query parameters.
+#[derive(Debug, Deserialize)]
+pub struct CheckpointSearchQuery {
+    pub q: String,
+    pub agent: Option<String>,
+    #[serde(default = "default_checkpoint_search_limit")]
+    pub limit: i64,
+}
+
+fn default_checkpoint_search_limit() -> i64 {
+    5
+}
+
+/// Checkpoint search response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointSearchResponse {
+    pub checkpoints: Vec<CheckpointSearchEntry>,
+    pub query: String,
+    pub total: usize,
+    pub search_type: String,
+}
+
+/// Checkpoint search result entry (includes score for semantic results).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointSearchEntry {
+    pub id: String,
+    pub agent: String,
+    pub working_on: String,
+    pub state: serde_json::Value,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+}
+
 /// Agent list response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentListResponse {
@@ -370,7 +417,9 @@ pub fn create_api_router(state: Arc<McpState>) -> Router {
         .route("/api/v1/lessons/{id}", delete(delete_lesson))
         .route("/api/v1/metrics", get(tool_metrics))
         .route("/api/v1/search/hybrid", get(hybrid_search))
-        .route("/api/v1/checkpoints", get(list_checkpoints))
+        .route("/api/v1/checkpoints", get(list_checkpoints).post(create_checkpoint))
+        .route("/api/v1/checkpoints/search", get(search_checkpoints))
+        .route("/api/v1/checkpoints/backfill-embeddings", post(backfill_checkpoint_embeddings))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/graph", get(graph_query))
         .route("/api/v1/activity", get(activity_stream))
@@ -1037,6 +1086,245 @@ async fn list_checkpoints(
         checkpoints: page,
         total,
     })
+}
+
+/// POST /api/v1/checkpoints - Create a new checkpoint with optional embedding.
+async fn create_checkpoint(
+    State(state): State<Arc<McpState>>,
+    Json(body): Json<CreateCheckpointRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let checkpoint = storage::CheckpointRecord::new(&body.agent, &body.working_on, body.state);
+    let id = checkpoint.id.clone();
+
+    state
+        .db()
+        .with_conn(|conn| storage::insert_checkpoint(conn, &checkpoint))
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to create checkpoint");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if let Some(ref embedding_service) = state.embeddings {
+        if embedding_service.is_initialized() {
+            let text_to_embed = checkpoint.working_on.clone();
+            match embedding_service.embed_one(text_to_embed).await {
+                Ok(embedding) => {
+                    let _ = state.db().with_conn(|conn| {
+                        storage::store_checkpoint_embedding(conn, &id, &embedding)
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to generate checkpoint embedding");
+                }
+            }
+        }
+    }
+
+    tracing::info!(id = %id, agent = %checkpoint.agent, "Checkpoint created via REST");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "status": "created" })),
+    ))
+}
+
+/// GET /api/v1/checkpoints/search - Semantic search over checkpoints.
+///
+/// Uses embedding similarity when available, falls back to text search.
+/// Supports optional `agent` filter.
+async fn search_checkpoints(
+    State(state): State<Arc<McpState>>,
+    Query(params): Query<CheckpointSearchQuery>,
+) -> Result<Json<CheckpointSearchResponse>, StatusCode> {
+    if params.q.trim().is_empty() {
+        return Ok(Json(CheckpointSearchResponse {
+            checkpoints: Vec::new(),
+            query: params.q,
+            total: 0,
+            search_type: "none".to_string(),
+        }));
+    }
+
+    let limit = params.limit.clamp(1, 100) as usize;
+
+    if let Some(ref embedding_service) = state.embeddings {
+        if embedding_service.is_initialized() {
+            match embedding_service.embed_one(params.q.clone()).await {
+                Ok(query_embedding) => {
+                    let results = state
+                        .db()
+                        .with_conn(|conn| {
+                            storage::search_checkpoints_by_embedding(
+                                conn,
+                                &query_embedding,
+                                limit,
+                            )
+                        })
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "Checkpoint semantic search failed");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
+
+                    let checkpoints: Vec<CheckpointSearchEntry> = if let Some(ref agent) =
+                        params.agent
+                    {
+                        results
+                            .into_iter()
+                            .filter(|r| r.record.agent == *agent)
+                            .map(|r| CheckpointSearchEntry {
+                                id: r.record.id,
+                                agent: r.record.agent,
+                                working_on: r.record.working_on,
+                                state: r.record.state,
+                                created_at: r.record.created_at,
+                                score: Some(r.score),
+                            })
+                            .collect()
+                    } else {
+                        results
+                            .into_iter()
+                            .map(|r| CheckpointSearchEntry {
+                                id: r.record.id,
+                                agent: r.record.agent,
+                                working_on: r.record.working_on,
+                                state: r.record.state,
+                                created_at: r.record.created_at,
+                                score: Some(r.score),
+                            })
+                            .collect()
+                    };
+
+                    let total = checkpoints.len();
+                    return Ok(Json(CheckpointSearchResponse {
+                        checkpoints,
+                        query: params.q,
+                        total,
+                        search_type: "semantic".to_string(),
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Checkpoint embedding failed, falling back to text search"
+                    );
+                }
+            }
+        }
+    }
+
+    let results = state
+        .db()
+        .with_conn(|conn| storage::search_checkpoints_by_text(conn, &params.q, limit))
+        .map_err(|e| {
+            tracing::error!(error = %e, "Checkpoint text search failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let checkpoints: Vec<CheckpointSearchEntry> = if let Some(ref agent) = params.agent {
+        results
+            .into_iter()
+            .filter(|cp| cp.agent == *agent)
+            .map(|cp| CheckpointSearchEntry {
+                id: cp.id,
+                agent: cp.agent,
+                working_on: cp.working_on,
+                state: cp.state,
+                created_at: cp.created_at,
+                score: None,
+            })
+            .collect()
+    } else {
+        results
+            .into_iter()
+            .map(|cp| CheckpointSearchEntry {
+                id: cp.id,
+                agent: cp.agent,
+                working_on: cp.working_on,
+                state: cp.state,
+                created_at: cp.created_at,
+                score: None,
+            })
+            .collect()
+    };
+
+    let total = checkpoints.len();
+    Ok(Json(CheckpointSearchResponse {
+        checkpoints,
+        query: params.q,
+        total,
+        search_type: "text".to_string(),
+    }))
+}
+
+/// POST /api/v1/checkpoints/backfill-embeddings - Generate embeddings for checkpoints that lack them.
+async fn backfill_checkpoint_embeddings(
+    State(state): State<Arc<McpState>>,
+) -> Result<Json<BackfillResponse>, StatusCode> {
+    let embedding_service = state.embeddings.as_ref().ok_or_else(|| {
+        tracing::error!("Checkpoint backfill requested but embedding service not available");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let all_checkpoints = state
+        .db()
+        .with_conn(|conn| storage::get_recent_checkpoints_all(conn, 10_000))
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list checkpoints for backfill");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for cp in &all_checkpoints {
+        let has_embedding = state
+            .db()
+            .with_conn(|conn| {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM checkpoint_embeddings WHERE id = ?",
+                        [&cp.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok::<bool, crate::Error>(count > 0)
+            })
+            .unwrap_or(false);
+
+        if has_embedding {
+            skipped += 1;
+            continue;
+        }
+
+        match embedding_service.embed_one(cp.working_on.clone()).await {
+            Ok(embedding) => {
+                let cp_id = cp.id.clone();
+                match state
+                    .db()
+                    .with_conn(move |conn| storage::store_checkpoint_embedding(conn, &cp_id, &embedding))
+                {
+                    Ok(()) => processed += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, checkpoint_id = %cp.id, "Failed to store checkpoint backfill embedding");
+                        failed += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, checkpoint_id = %cp.id, "Failed to generate checkpoint backfill embedding");
+                failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(processed, skipped, failed, total = all_checkpoints.len(), "Checkpoint embedding backfill complete");
+
+    Ok(Json(BackfillResponse {
+        processed,
+        skipped,
+        failed,
+    }))
 }
 
 /// GET /api/v1/agents - List distinct agents with checkpoint counts.
