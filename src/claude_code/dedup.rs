@@ -62,12 +62,25 @@ use crate::storage::LessonRecord;
 /// enough to catch genuine near-duplicates.
 const SIMILARITY_THRESHOLD: f64 = 0.85;
 
-/// Maximum length of content to consider for similarity matching.
+/// Maximum byte length of content to consider for similarity matching.
 ///
-/// Using only the first 200 characters speeds up comparison and
+/// Using only the first ~200 bytes speeds up comparison and
 /// avoids matching files that happen to share a long common section
 /// but differ significantly overall.
 const CONTENT_PREVIEW_LENGTH: usize = 200;
+
+/// Truncate a string to at most `max_bytes` bytes without splitting a
+/// multi-byte UTF-8 character. Returns the longest prefix that fits.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Weight for recency in relevance scoring (0.0..1.0).
 ///
@@ -238,8 +251,8 @@ fn are_duplicates(a: &MemoryFile, b: &MemoryFile) -> bool {
         return true;
     }
 
-    let content_a = &a.content[..a.content.len().min(CONTENT_PREVIEW_LENGTH)];
-    let content_b = &b.content[..b.content.len().min(CONTENT_PREVIEW_LENGTH)];
+    let content_a = truncate_to_char_boundary(&a.content, CONTENT_PREVIEW_LENGTH);
+    let content_b = truncate_to_char_boundary(&b.content, CONTENT_PREVIEW_LENGTH);
     let content_similarity = jaro_winkler(content_a, content_b);
 
     content_similarity >= SIMILARITY_THRESHOLD
@@ -1122,5 +1135,28 @@ mod tests {
         let result = select_memories_within_budget(vec![large, small.clone()], 20);
         assert!(result.len() >= 1);
         assert_eq!(result[0].memory.name, "Small");
+    }
+
+    #[test]
+    fn test_are_duplicates_multibyte_boundary_no_panic() {
+        // 199 ASCII bytes + a 3-byte UTF-8 char (→) straddling byte 200
+        let content = "x".repeat(199) + "→ rest of the note";
+        let a = test_memory("Multibyte Test A", &content, MemoryType::Project);
+        let b = test_memory("Multibyte Test B", &content, MemoryType::Project);
+        // Must not panic — and should detect them as duplicates
+        assert!(are_duplicates(&a, &b));
+    }
+
+    #[test]
+    fn test_truncate_to_char_boundary() {
+        let s = "x".repeat(199) + "→tail";
+        // 200 lands inside the 3-byte → (bytes 199..202)
+        let truncated = truncate_to_char_boundary(&s, 200);
+        assert_eq!(truncated.len(), 199);
+        assert!(truncated.is_char_boundary(truncated.len()));
+
+        // Already within bounds
+        let short = "hello";
+        assert_eq!(truncate_to_char_boundary(short, 200), "hello");
     }
 }
