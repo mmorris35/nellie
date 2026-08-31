@@ -62,9 +62,9 @@ use crate::storage::LessonRecord;
 /// enough to catch genuine near-duplicates.
 const SIMILARITY_THRESHOLD: f64 = 0.85;
 
-/// Maximum length of content to consider for similarity matching.
+/// Maximum byte length of content to consider for similarity matching.
 ///
-/// Using only the first 200 characters speeds up comparison and
+/// Using only the first ~200 bytes speeds up comparison and
 /// avoids matching files that happen to share a long common section
 /// but differ significantly overall.
 const CONTENT_PREVIEW_LENGTH: usize = 200;
@@ -238,8 +238,8 @@ fn are_duplicates(a: &MemoryFile, b: &MemoryFile) -> bool {
         return true;
     }
 
-    let content_a = &a.content[..a.content.len().min(CONTENT_PREVIEW_LENGTH)];
-    let content_b = &b.content[..b.content.len().min(CONTENT_PREVIEW_LENGTH)];
+    let content_a = super::util::truncate_to_char_boundary(&a.content, CONTENT_PREVIEW_LENGTH);
+    let content_b = super::util::truncate_to_char_boundary(&b.content, CONTENT_PREVIEW_LENGTH);
     let content_similarity = jaro_winkler(content_a, content_b);
 
     content_similarity >= SIMILARITY_THRESHOLD
