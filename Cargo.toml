@@ -70,7 +70,7 @@ crossbeam-channel = "0.5"
 blake3 = "1.5"
 tokio-util = "0.7.18"
 # Graph memory (Nellie-V)
-petgraph = "0.6"
+petgraph = "0.8"
 strsim = "0.11"
 # Tree-sitter structural parsing
 tree-sitter = "=0.25.10"
