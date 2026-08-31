@@ -257,20 +257,25 @@ impl Indexer {
         })
     }
 
-    /// Generate embeddings for chunks.
+    /// Generate embeddings for chunks, processing in sub-batches to bound memory.
     async fn generate_embeddings(
         &self,
         chunks: &[super::chunker::CodeChunk],
     ) -> Result<Vec<Vec<f32>>> {
+        const MAX_BATCH: usize = 32;
+
         if let Some(ref service) = self.embeddings {
             if service.is_initialized() {
-                let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-                return service.embed_batch(texts).await;
+                let mut all_embeddings = Vec::with_capacity(chunks.len());
+                for batch in chunks.chunks(MAX_BATCH) {
+                    let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+                    let mut batch_embeddings = service.embed_batch(texts).await?;
+                    all_embeddings.append(&mut batch_embeddings);
+                }
+                return Ok(all_embeddings);
             }
         }
 
-        // Return empty embeddings when no service available
-        // (will not be stored, so no vector table needed)
         Ok(vec![vec![]; chunks.len()])
     }
 

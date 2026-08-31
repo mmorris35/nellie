@@ -106,9 +106,15 @@ enum Commands {
         sync_interval: u64,
 
         /// Skip the initial filesystem walk on startup (use DB-first reconciliation only).
-        /// Useful for resume-after-crash scenarios where a walk would be wasteful.
+        /// This is now the default when the index already has entries; kept for
+        /// backwards compatibility.
         #[arg(long, default_value_t = false)]
         skip_initial_walk: bool,
+
+        /// Force a full filesystem walk even when an existing index is detected.
+        /// By default, subsequent startups use fast DB-first reconciliation.
+        #[arg(long, default_value_t = false, conflicts_with = "skip_initial_walk")]
+        force_initial_walk: bool,
     },
 
     /// Manually index a directory
@@ -397,6 +403,7 @@ async fn main() -> Result<()> {
             enable_deep_hooks,
             sync_interval,
             skip_initial_walk,
+            force_initial_walk,
         }) => {
             serve_command(ServeCommandArgs {
                 data_dir: cli.data_dir,
@@ -412,6 +419,7 @@ async fn main() -> Result<()> {
                 enable_deep_hooks,
                 sync_interval,
                 skip_initial_walk,
+                force_initial_walk,
             })
             .await
         }
@@ -500,6 +508,7 @@ async fn main() -> Result<()> {
                 enable_deep_hooks: false,
                 sync_interval: 30,
                 skip_initial_walk: false,
+                force_initial_walk: false,
             })
             .await
         }
@@ -522,6 +531,7 @@ struct ServeCommandArgs {
     enable_deep_hooks: bool,
     sync_interval: u64,
     skip_initial_walk: bool,
+    force_initial_walk: bool,
 }
 
 /// Background task for transcript watcher.
@@ -827,7 +837,7 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
         let scan_db = indexer_db.clone();
         let indexer =
             std::sync::Arc::new(Indexer::new(indexer_db, embeddings, args.enable_structural));
-        let (index_tx, index_rx) = tokio::sync::mpsc::channel::<IndexRequest>(1000);
+        let (index_tx, index_rx) = tokio::sync::mpsc::channel::<IndexRequest>(200);
         let (delete_tx, delete_rx) = tokio::sync::mpsc::channel(100);
 
         // Start the indexer loop
@@ -835,16 +845,44 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
         tokio::spawn(async move {
             indexer_clone.run(index_rx, delete_rx).await;
         });
-        // Startup reconciliation: walk filesystem on startup or use DB-first mode.
-        // For each known file, stat() it — if gone, delete from index; if changed, re-index.
-        // New files are discovered by the watcher (FSEvents).
+        // Startup reconciliation: choose between full walk and fast DB-first mode.
+        //
+        // Default behaviour (no flags):
+        //   - First startup (empty file_state): full filesystem walk
+        //   - Subsequent startups: DB-first reconciliation (fast stat-only check)
+        //
+        // Flags:
+        //   --force-initial-walk   always do a full walk
+        //   --skip-initial-walk    always use DB-first (kept for backwards compat)
         let index_tx_scan = index_tx;
         let delete_tx_scan = delete_tx.clone();
         let skip_walk = args.skip_initial_walk;
+        let force_walk = args.force_initial_walk;
         let watch_dirs = args.watch.clone();
         std::thread::spawn(move || {
-            if skip_walk {
-                tracing::info!("--skip-initial-walk set, using DB-first reconciliation only");
+            let tracked_count = scan_db
+                .with_conn(nellie::storage::count_tracked_files)
+                .unwrap_or(0);
+
+            let use_db_first = if force_walk {
+                tracing::info!("--force-initial-walk set, performing full filesystem walk");
+                false
+            } else if skip_walk {
+                tracing::info!("--skip-initial-walk set, using DB-first reconciliation");
+                true
+            } else if tracked_count > 0 {
+                tracing::info!(
+                    tracked_files = tracked_count,
+                    "Existing index detected, using DB-first reconciliation \
+                     (use --force-initial-walk to override)"
+                );
+                true
+            } else {
+                tracing::info!("Empty index, performing initial filesystem walk");
+                false
+            };
+
+            if use_db_first {
                 reconcile_from_db(&scan_db, &index_tx_scan, &delete_tx_scan);
             } else if let Err(e) =
                 reconcile_with_walk(&scan_db, &watch_dirs, &index_tx_scan, &delete_tx_scan)
@@ -1005,6 +1043,10 @@ fn reconcile_with_walk(
                 if index_tx.blocking_send(request).is_err() {
                     tracing::warn!("Index channel closed during walk reconciliation");
                     return Ok(stats);
+                }
+                // Let the indexer drain periodically to avoid sustained memory pressure
+                if stats.queued % 50 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         }
@@ -2044,6 +2086,7 @@ mod tests {
             enable_deep_hooks,
             sync_interval,
             skip_initial_walk,
+            force_initial_walk,
         }) = cli.command
         {
             assert_eq!(host, "0.0.0.0");
@@ -2056,6 +2099,7 @@ mod tests {
             assert!(!enable_deep_hooks);
             assert_eq!(sync_interval, 30);
             assert!(!skip_initial_walk);
+            assert!(!force_initial_walk);
         } else {
             panic!("Expected Serve command");
         }
