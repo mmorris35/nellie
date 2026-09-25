@@ -9,6 +9,7 @@
 mod chunker;
 mod events;
 pub mod filter;
+pub mod git;
 mod handler;
 mod indexer;
 mod scanner;

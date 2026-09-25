@@ -1,5 +1,13 @@
 # Nellie Configuration Example
-# Copy to config.yaml and customize for your environment
+# Copy to config.yaml and customize for your environment.
+#
+# Loading: `nellie serve` reads this file automatically from
+#   1. the path given to --config / $NELLIE_CONFIG, else
+#   2. <data_dir>/config.yaml, else
+#   3. ./nellie.yaml
+# Precedence for any single value: CLI flag > environment variable >
+# this config file > built-in default. The file only fills in values you
+# did not set on the command line or via the environment.
 
 # Server configuration
 server:
@@ -16,8 +24,13 @@ data:
 
 # File watching and indexing
 watch:
-  # Directories to index for semantic code search
-  # Paths are scanned recursively with gitignore patterns respected
+  # Directories to index for semantic code search.
+  # Paths are scanned recursively with gitignore patterns respected.
+  # Setting paths here enables the live file watcher WITHOUT any CLI flags —
+  # editing a file under one of these directories reindexes just that file.
+  # For directories that are git work trees, the watcher also reacts to
+  # `.git/HEAD` / ref changes (branch switch, pull, commit, merge, rebase) and
+  # runs a single incremental reconcile against the new working tree.
   # Examples:
   #   - "/home/user/projects/my-app"
   #   - "/home/user/github/nellie"
@@ -45,6 +58,17 @@ deep_hooks:
   enabled: true
   # How often to check for new transcripts (minutes)
   sync_interval: 30
+
+# Portable graph snapshots (CLI + MCP, no config needed)
+# ------------------------------------------------------
+# Export a compressed, project-scoped, index-only snapshot of the database so
+# teammates / CI / fresh clones start from a warm index and only reindex what
+# changed since the snapshot:
+#   nellie snapshot export --project /path/to/repo   # -> <repo>/.nellie/graph.db.zst
+#   nellie snapshot import --project /path/to/repo   # verifies + merges, then diff-indexes
+# Also available as the `snapshot_export` / `snapshot_import` MCP tools.
+# Convention: commit `.nellie/graph.db.zst`, or add `.nellie/` to .gitignore if
+# your team prefers not to check the snapshot in.
 
 # Optional: Restrict which hostname can run this instance
 # Prevents accidental startup on the wrong machine
