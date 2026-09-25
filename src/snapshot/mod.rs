@@ -85,10 +85,19 @@ pub fn default_snapshot_path(project_root: &Path) -> PathBuf {
 }
 
 /// SQL `LIKE` pattern matching all files under a project root.
+///
+/// The root is escaped so a literal `_` or `%` in the path is not treated as a
+/// `LIKE` wildcard (underscores in path components are common, e.g. `my_app`);
+/// callers must pair this with `ESCAPE '\'`. Only the trailing `/%` is a
+/// wildcard.
 fn project_prefix_pattern(project_root: &Path) -> String {
     let root = project_root.to_string_lossy();
     let root = root.trim_end_matches('/');
-    format!("{root}/%")
+    let escaped = root
+        .replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_");
+    format!("{escaped}/%")
 }
 
 /// Map a rusqlite error into a storage error.
@@ -287,18 +296,18 @@ fn build_snapshot_db(
 
     let files = conn
         .execute(
-            "INSERT INTO snap.file_state
-             SELECT path, mtime, size, hash, last_indexed FROM file_state WHERE path LIKE ?1",
+            r"INSERT INTO snap.file_state
+             SELECT path, mtime, size, hash, last_indexed FROM file_state WHERE path LIKE ?1 ESCAPE '\'",
             [pattern],
         )
         .map_err(|e| db_err("failed to copy file_state", &e))? as u64;
 
     let chunks = conn
         .execute(
-            "INSERT INTO snap.chunks
+            r"INSERT INTO snap.chunks
              SELECT id, file_path, chunk_index, start_line, end_line, content, language,
                     file_hash, indexed_at
-             FROM chunks WHERE file_path LIKE ?1",
+             FROM chunks WHERE file_path LIKE ?1 ESCAPE '\'",
             [pattern],
         )
         .map_err(|e| db_err("failed to copy chunks", &e))? as u64;
@@ -306,11 +315,11 @@ fn build_snapshot_db(
     // Embeddings travel with the snapshot when the vec0 table exists.
     let embeddings = if table_exists(conn, "chunk_embeddings") {
         conn.execute(
-            "INSERT INTO snap.chunk_embeddings (id, embedding)
+            r"INSERT INTO snap.chunk_embeddings (id, embedding)
              SELECT ce.id, ce.embedding
              FROM chunk_embeddings ce
              JOIN chunks c ON c.id = ce.id
-             WHERE c.file_path LIKE ?1",
+             WHERE c.file_path LIKE ?1 ESCAPE '\'",
             [pattern],
         )
         .map_err(|e| db_err("failed to copy chunk embeddings", &e))? as u64
@@ -320,22 +329,22 @@ fn build_snapshot_db(
 
     let symbols = conn
         .execute(
-            "INSERT INTO snap.symbols
+            r"INSERT INTO snap.symbols
              SELECT id, file_path, symbol_name, symbol_kind, language, start_line, end_line,
                     scope, signature, file_hash, indexed_at
-             FROM symbols WHERE file_path LIKE ?1",
+             FROM symbols WHERE file_path LIKE ?1 ESCAPE '\'",
             [pattern],
         )
         .map_err(|e| db_err("failed to copy symbols", &e))? as u64;
 
     let structural_edges =
         conn.execute(
-            "INSERT INTO snap.structural_edges
+            r"INSERT INTO snap.structural_edges
              SELECT se.id, se.source_symbol_id, se.target_symbol_name, se.target_file_path,
                     se.edge_kind, se.indexed_at
              FROM structural_edges se
              JOIN symbols s ON s.id = se.source_symbol_id
-             WHERE s.file_path LIKE ?1",
+             WHERE s.file_path LIKE ?1 ESCAPE '\'",
             [pattern],
         )
         .map_err(|e| db_err("failed to copy structural_edges", &e))? as u64;
@@ -1019,5 +1028,40 @@ mod tests {
             default_snapshot_path(Path::new("/repo")),
             PathBuf::from("/repo/.nellie/graph.db.zst")
         );
+    }
+
+    #[test]
+    fn test_underscore_in_root_is_not_a_wildcard() {
+        // A project root with an underscore must not pull in a sibling whose
+        // name matches only because `_` is a LIKE wildcard.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("my_app");
+        let sibling = tmp.path().join("myXapp");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let in_project = project.join("main.rs").to_string_lossy().to_string();
+        let in_sibling = sibling.join("main.rs").to_string_lossy().to_string();
+
+        let db = setup_db(&tmp, "source.db");
+        insert_test_file(&db, &in_project, "hash-in", false);
+        insert_test_file(&db, &in_sibling, "hash-sib", false);
+
+        let out = tmp.path().join("graph.db.zst");
+        let report = export_snapshot(&db, &project, &out).unwrap();
+        assert_eq!(report.files, 1, "only the project's own file should travel");
+
+        let db2 = setup_db(&tmp, "dest.db");
+        import_snapshot(&db2, &out).unwrap();
+        let sibling_rows: i64 = db2
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE file_path = ?1",
+                    [&in_sibling],
+                    |row| row.get(0),
+                )
+                .map_err(|e| crate::error::StorageError::Database(e.to_string()).into())
+            })
+            .unwrap();
+        assert_eq!(sibling_rows, 0, "sibling matched an unescaped `_` wildcard");
     }
 }

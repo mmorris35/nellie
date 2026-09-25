@@ -15,7 +15,6 @@ use axum::{
     Router,
 };
 use tokio::signal;
-use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -27,9 +26,6 @@ use super::sse::create_sse_router;
 use super::ui::create_ui_router;
 use crate::embeddings::{EmbeddingConfig, EmbeddingService};
 use crate::storage::Database;
-use crate::watcher::{
-    EventHandler, FileWatcher, HandlerConfig, Indexer, WatcherConfig, WatcherStats,
-};
 use crate::Result;
 
 /// Server configuration.
@@ -230,161 +226,6 @@ impl App {
     /// Get a clone of the embedding service if available.
     pub fn embeddings(&self) -> Option<EmbeddingService> {
         self.state.embeddings.clone()
-    }
-
-    /// server can start immediately. Returns handles to spawned tasks.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only for critical failures (none currently - all errors logged).
-    #[allow(clippy::unused_async)]
-    pub async fn start_watcher(
-        &self,
-        watch_dirs: Vec<std::path::PathBuf>,
-    ) -> Result<Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>> {
-        if watch_dirs.is_empty() {
-            tracing::info!("No watch directories specified, file indexing disabled");
-            return Ok(None);
-        }
-
-        tracing::info!(?watch_dirs, "Starting file watcher (background)");
-
-        // Create channels
-        let (index_tx, index_rx) = mpsc::channel(1000);
-        let (delete_tx, delete_rx) = mpsc::channel(100);
-
-        // Create indexer
-        let indexer = Arc::new(Indexer::new(
-            self.state.db().clone(),
-            self.state.embedding_service(),
-            false,
-        ));
-
-        // Spawn indexer task (runs immediately)
-        let indexer_clone = Arc::clone(&indexer);
-        let indexer_handle = tokio::spawn(async move {
-            indexer_clone.run(index_rx, delete_rx).await;
-        });
-
-        // Clone data for background task
-        let watch_dirs_for_task = watch_dirs;
-        let index_tx_for_task = index_tx;
-
-        // Spawn watcher setup and initial scan in background
-        // This allows server to start immediately while indexing happens
-        let watcher_handle = tokio::spawn(async move {
-            // Create watcher config
-            let watcher_config = WatcherConfig {
-                watch_dirs: watch_dirs_for_task.clone(),
-                ..Default::default()
-            };
-
-            // FileWatcher::new() uses blocking walkdir, so run in spawn_blocking
-            let watcher_result =
-                tokio::task::spawn_blocking(move || FileWatcher::new(&watcher_config)).await;
-
-            let mut watcher = match watcher_result {
-                Ok(Ok(w)) => w,
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to create file watcher: {}", e);
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!("Watcher creation task panicked: {}", e);
-                    return;
-                }
-            };
-
-            tracing::info!("File watcher initialized successfully");
-
-            // Create event handlers
-            let stats = WatcherStats::new();
-            let mut handlers = Vec::new();
-            for dir in &watch_dirs_for_task {
-                let handler_config = HandlerConfig {
-                    base_path: dir.clone(),
-                    ignore_patterns: vec![],
-                };
-                match EventHandler::new(
-                    &handler_config,
-                    Arc::clone(&stats),
-                    index_tx_for_task.clone(),
-                    delete_tx.clone(),
-                ) {
-                    Ok(handler) => handlers.push((dir.clone(), handler)),
-                    Err(e) => tracing::error!("Failed to create handler for {:?}: {}", dir, e),
-                }
-            }
-
-            // Do initial scan
-            tracing::info!("Starting initial scan of watch directories");
-            for dir in &watch_dirs_for_task {
-                if let Err(e) = Self::do_initial_scan(dir, &index_tx_for_task).await {
-                    tracing::error!("Initial scan failed for {:?}: {}", dir, e);
-                }
-            }
-            tracing::info!("Initial scan complete");
-
-            // Run watcher event loop
-            while let Some(batch) = watcher.recv().await {
-                for (base_path, handler) in &handlers {
-                    let filtered_batch = crate::watcher::EventBatch {
-                        modified: batch
-                            .modified
-                            .iter()
-                            .filter(|p| p.starts_with(base_path))
-                            .cloned()
-                            .collect(),
-                        deleted: batch
-                            .deleted
-                            .iter()
-                            .filter(|p| p.starts_with(base_path))
-                            .cloned()
-                            .collect(),
-                    };
-                    if !filtered_batch.is_empty() {
-                        handler.process_batch(filtered_batch).await;
-                    }
-                }
-            }
-            tracing::info!("Watcher loop ended");
-        });
-
-        Ok(Some((indexer_handle, watcher_handle)))
-    }
-
-    /// Perform initial scan of a directory (static helper for background task).
-    async fn do_initial_scan(
-        dir: &std::path::Path,
-        index_tx: &mpsc::Sender<crate::watcher::IndexRequest>,
-    ) -> Result<()> {
-        use crate::watcher::{FileFilter, IndexRequest};
-
-        let filter = FileFilter::new(dir);
-        let mut count = 0;
-
-        for entry in walkdir::WalkDir::new(dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-        {
-            let path = entry.path();
-            if path.is_file() && filter.should_index(path) {
-                let language = FileFilter::detect_language(path).map(String::from);
-                let request = IndexRequest {
-                    path: path.to_path_buf(),
-                    language,
-                };
-                if index_tx.send(request).await.is_err() {
-                    tracing::warn!("Index channel closed during initial scan");
-                    break;
-                }
-                count += 1;
-            }
-        }
-
-        tracing::info!(dir = %dir.display(), files = count, "Directory scan complete");
-        Ok(())
     }
 
     /// Build the router with all endpoints.

@@ -641,7 +641,7 @@ fn resolve_serve_args(cli: ServeCliValues) -> Result<ServeCommandArgs> {
     // host: CLI/env > file > default
     let host = cli
         .host
-        .or(file_cfg.server.host.clone())
+        .or_else(|| file_cfg.server.host.clone())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
     // port: CLI/env > file > default
@@ -2318,14 +2318,12 @@ async fn snapshot_command(data_dir: PathBuf, action: SnapshotAction) -> Result<(
             // Prefer routing the post-import diff_index through a running server
             // to avoid dual-writer corruption. The import itself writes to the DB
             // directly, so it requires the server be stopped unless --local.
-            if !local {
-                if let Ok(true) = server_reachable(&server).await {
-                    return Err(nellie::Error::internal(format!(
-                        "A Nellie server appears to be running at {server}. Importing writes to \
-                         the database directly and must not run concurrently with the server. \
-                         Stop the server and re-run, or pass --local to override."
-                    )));
-                }
+            if !local && matches!(server_reachable(&server).await, Ok(true)) {
+                return Err(nellie::Error::internal(format!(
+                    "A Nellie server appears to be running at {server}. Importing writes to \
+                     the database directly and must not run concurrently with the server. \
+                     Stop the server and re-run, or pass --local to override."
+                )));
             }
 
             let config = Config {
