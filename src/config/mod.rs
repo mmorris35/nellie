@@ -7,4 +7,7 @@
 
 mod settings;
 
-pub use settings::{Config, GraphConfig};
+pub use settings::{
+    expand_tilde, Config, FileConfig, FileDataSection, FileDeepHooksSection, FileServerSection,
+    FileToggleSection, FileWatchSection, GraphConfig,
+};

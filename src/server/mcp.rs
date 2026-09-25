@@ -733,6 +733,52 @@ pub fn get_tools() -> Vec<ToolInfo> {
                 "required": ["symbol", "query_type"]
             }),
         },
+        ToolInfo {
+            name: "snapshot_export".to_string(),
+            description: Some(
+                "Export a project-scoped, zstd-compressed snapshot of the index (chunks, \
+                 embeddings, symbols, graph, file state) to a committable file (default: \
+                 <project>/.nellie/graph.db.zst). Teammates import it for a warm start."
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project root to scope the snapshot to (absolute path)"
+                    },
+                    "out": {
+                        "type": "string",
+                        "description": "Output path (default: <project>/.nellie/graph.db.zst)"
+                    }
+                },
+                "required": ["project"]
+            }),
+        },
+        ToolInfo {
+            name: "snapshot_import".to_string(),
+            description: Some(
+                "Import a portable graph snapshot into the local index, verifying schema and \
+                 embedding-dimension compatibility (refuses on mismatch) and merging by upsert. \
+                 Run diff_index afterwards to reindex files changed since the snapshot."
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project root the snapshot belongs to (absolute path)"
+                    },
+                    "in": {
+                        "type": "string",
+                        "description": "Snapshot file to import (default: <project>/.nellie/graph.db.zst)"
+                    }
+                },
+                "required": ["project"]
+            }),
+        },
     ]
 }
 
@@ -823,6 +869,8 @@ async fn invoke_tool(
         "get_blast_radius" => handle_get_blast_radius(&state, &request.arguments),
         "get_review_context" => handle_get_review_context(&state, &request.arguments),
         "query_structure" => handle_query_structure(&state, &request.arguments),
+        "snapshot_export" => handle_snapshot_export(&state, &request.arguments),
+        "snapshot_import" => handle_snapshot_import(&state, &request.arguments).await,
         _ => Err(format!("Unknown tool: {}", request.name)),
     };
 
@@ -893,6 +941,8 @@ pub async fn invoke_tool_direct(state: &McpState, request: ToolRequest) -> ToolR
         "bootstrap_graph" => handle_bootstrap_graph(state, &request.arguments),
         "get_blast_radius" => handle_get_blast_radius(state, &request.arguments),
         "query_structure" => handle_query_structure(state, &request.arguments),
+        "snapshot_export" => handle_snapshot_export(state, &request.arguments),
+        "snapshot_import" => handle_snapshot_import(state, &request.arguments).await,
         _ => Err(format!("Unknown tool: {}", request.name)),
     };
 
@@ -2950,6 +3000,95 @@ async fn handle_full_reindex(
     }))
 }
 
+/// Typed input for `snapshot_export`.
+#[derive(Debug, Deserialize)]
+struct SnapshotExportInput {
+    /// Project root to scope the snapshot to.
+    project: String,
+    /// Optional output path (default: `<project>/.nellie/graph.db.zst`).
+    #[serde(default)]
+    out: Option<String>,
+}
+
+/// Typed input for `snapshot_import`.
+#[derive(Debug, Deserialize)]
+struct SnapshotImportInput {
+    /// Project root the snapshot belongs to.
+    project: String,
+    /// Optional snapshot path (default: `<project>/.nellie/graph.db.zst`).
+    #[serde(rename = "in", default)]
+    input: Option<String>,
+}
+
+/// Export a portable graph snapshot for a project.
+fn handle_snapshot_export(
+    state: &McpState,
+    args: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let input: SnapshotExportInput =
+        serde_json::from_value(args.clone()).map_err(|e| format!("invalid arguments: {e}"))?;
+
+    let project = std::path::PathBuf::from(&input.project);
+    if !project.is_dir() {
+        return Err(format!("project is not a directory: {}", input.project));
+    }
+    let out_path = input.out.map_or_else(
+        || crate::snapshot::default_snapshot_path(&project),
+        std::path::PathBuf::from,
+    );
+
+    let report = crate::snapshot::export_snapshot(&state.db, &project, &out_path)
+        .map_err(|e| format!("snapshot export failed: {e}"))?;
+
+    serde_json::to_value(&report).map_err(|e| format!("failed to serialize report: {e}"))
+}
+
+/// Import a portable graph snapshot, then diff-index the project so files
+/// changed since the snapshot are reindexed.
+async fn handle_snapshot_import(
+    state: &McpState,
+    args: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let input: SnapshotImportInput =
+        serde_json::from_value(args.clone()).map_err(|e| format!("invalid arguments: {e}"))?;
+
+    let project = std::path::PathBuf::from(&input.project);
+    let in_path = input.input.map_or_else(
+        || crate::snapshot::default_snapshot_path(&project),
+        std::path::PathBuf::from,
+    );
+    if !in_path.exists() {
+        return Err(format!("snapshot not found: {}", in_path.display()));
+    }
+
+    let report = crate::snapshot::import_snapshot(&state.db, &in_path)
+        .map_err(|e| format!("snapshot import failed: {e}"))?;
+
+    let mut result =
+        serde_json::to_value(&report).map_err(|e| format!("failed to serialize report: {e}"))?;
+
+    // Reindex anything that changed since the snapshot was taken, reusing the
+    // existing diff_index path (no new diff logic). Best-effort: an import is
+    // still a success even if the follow-up diff can't run.
+    if project.is_dir() {
+        match handle_diff_index(state, &serde_json::json!({ "path": input.project })).await {
+            Ok(diff) => {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("diff_index".to_string(), diff);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Post-import diff_index failed");
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("diff_index_error".to_string(), serde_json::Value::String(e));
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2978,6 +3117,9 @@ mod tests {
         assert!(names.contains(&"full_reindex"));
         // Graph bootstrap tool
         assert!(names.contains(&"bootstrap_graph"));
+        // Snapshot tools
+        assert!(names.contains(&"snapshot_export"));
+        assert!(names.contains(&"snapshot_import"));
     }
 
     #[tokio::test]

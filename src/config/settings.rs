@@ -1,7 +1,8 @@
 //! Configuration settings and validation.
 
 use crate::{Error, Result};
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 /// Main configuration for Nellie server.
 #[derive(Debug, Clone)]
@@ -306,5 +307,242 @@ mod tests_graph {
         assert_eq!(gc.gc_orphan_days, 7);
         assert!((gc.provisional_threshold - 0.3).abs() < f32::EPSILON);
         assert_eq!(gc.confirmation_count, 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-based configuration (config.yaml)
+// ---------------------------------------------------------------------------
+
+/// Configuration loaded from a YAML file (`config.yaml` / `nellie.yaml`).
+///
+/// Mirrors the shape of `config.example.yaml`. All sections and fields are
+/// optional so a partial file (e.g. only `watch.paths`) is valid.
+///
+/// Precedence, resolved in `main.rs`: **CLI flag > environment variable >
+/// config file > built-in default.** The file only fills in values that were
+/// not supplied on the command line or via the environment.
+///
+/// Note: `data.dir` is parsed but NOT applied — the config file itself is
+/// located relative to the data directory, so the data dir must come from
+/// CLI/env/default to avoid a circular lookup.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FileConfig {
+    /// `server:` section (host, port).
+    pub server: FileServerSection,
+    /// `data:` section (dir) — parsed but not applied (see struct docs).
+    pub data: FileDataSection,
+    /// `watch:` section (paths).
+    pub watch: FileWatchSection,
+    /// `graph:` section (enabled).
+    pub graph: FileToggleSection,
+    /// `structural:` section (enabled).
+    pub structural: FileToggleSection,
+    /// `deep_hooks:` section (enabled, sync_interval).
+    pub deep_hooks: FileDeepHooksSection,
+}
+
+/// `server:` section of the config file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FileServerSection {
+    /// Bind address for the HTTP server.
+    pub host: Option<String>,
+    /// Port for the HTTP server.
+    pub port: Option<u16>,
+}
+
+/// `data:` section of the config file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FileDataSection {
+    /// Data directory (parsed for forward-compat; not applied — see [`FileConfig`]).
+    pub dir: Option<String>,
+}
+
+/// `watch:` section of the config file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FileWatchSection {
+    /// Directories to watch for code changes.
+    pub paths: Vec<String>,
+}
+
+/// Generic `enabled:` toggle section (`graph:`, `structural:`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FileToggleSection {
+    /// Whether the feature is enabled.
+    pub enabled: Option<bool>,
+}
+
+/// `deep_hooks:` section of the config file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FileDeepHooksSection {
+    /// Whether the Deep Hooks daemon is enabled.
+    pub enabled: Option<bool>,
+    /// Periodic sync interval in minutes.
+    pub sync_interval: Option<u64>,
+}
+
+impl FileConfig {
+    /// Load and parse a YAML config file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the file cannot be read or parsed.
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            Error::config(format!("cannot read config file {}: {e}", path.display()))
+        })?;
+        serde_yaml::from_str(&raw)
+            .map_err(|e| Error::config(format!("cannot parse config file {}: {e}", path.display())))
+    }
+
+    /// Find the default config file location.
+    ///
+    /// Looks for `<data_dir>/config.yaml`, then `./nellie.yaml`.
+    /// Returns `None` if neither exists.
+    #[must_use]
+    pub fn find_default(data_dir: &Path) -> Option<PathBuf> {
+        let candidates = [data_dir.join("config.yaml"), PathBuf::from("nellie.yaml")];
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    /// Watch paths from the file with `~` expanded to the home directory.
+    #[must_use]
+    pub fn watch_paths(&self) -> Vec<PathBuf> {
+        self.watch.paths.iter().map(|p| expand_tilde(p)).collect()
+    }
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+///
+/// Returns the path unchanged if it does not start with `~` or if the home
+/// directory cannot be determined.
+#[must_use]
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests_file_config {
+    use super::*;
+
+    #[test]
+    fn test_parse_full_example_shape() {
+        let yaml = r#"
+server:
+  host: "0.0.0.0"
+  port: 9999
+data:
+  dir: "~/.local/share/nellie"
+watch:
+  paths:
+    - "/home/user/projects/my-app"
+graph:
+  enabled: true
+structural:
+  enabled: false
+deep_hooks:
+  enabled: true
+  sync_interval: 15
+"#;
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.server.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(cfg.server.port, Some(9999));
+        assert_eq!(cfg.watch.paths, vec!["/home/user/projects/my-app"]);
+        assert_eq!(cfg.graph.enabled, Some(true));
+        assert_eq!(cfg.structural.enabled, Some(false));
+        assert_eq!(cfg.deep_hooks.enabled, Some(true));
+        assert_eq!(cfg.deep_hooks.sync_interval, Some(15));
+    }
+
+    #[test]
+    fn test_parse_watch_only() {
+        let yaml = "watch:\n  paths:\n    - \"/tmp/repo\"\n";
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.watch_paths(), vec![PathBuf::from("/tmp/repo")]);
+        assert!(cfg.server.host.is_none());
+        assert!(cfg.server.port.is_none());
+        assert!(cfg.graph.enabled.is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_file() {
+        let cfg: FileConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.watch.paths.is_empty());
+        assert!(cfg.server.host.is_none());
+    }
+
+    #[test]
+    fn test_parse_unknown_keys_ignored() {
+        // config.example.yaml ships commented-out/extra sections;
+        // unknown keys must not be a hard error.
+        let yaml = "watch:\n  paths: []\nallowed_hostname: \"box\"\n";
+        let cfg: FileConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.watch.paths.is_empty());
+    }
+
+    #[test]
+    fn test_load_missing_file_errors() {
+        let err = FileConfig::load(Path::new("/nonexistent/config.yaml")).unwrap_err();
+        assert!(err.to_string().contains("cannot read config file"));
+    }
+
+    #[test]
+    fn test_load_invalid_yaml_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "watch: [not: {a map").unwrap();
+        let err = FileConfig::load(&path).unwrap_err();
+        assert!(err.to_string().contains("cannot parse config file"));
+    }
+
+    #[test]
+    fn test_load_valid_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "watch:\n  paths:\n    - \"/srv/code\"\n").unwrap();
+        let cfg = FileConfig::load(&path).unwrap();
+        assert_eq!(cfg.watch_paths(), vec![PathBuf::from("/srv/code")]);
+    }
+
+    #[test]
+    fn test_find_default_prefers_data_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.yaml");
+        std::fs::write(&cfg_path, "watch:\n  paths: []\n").unwrap();
+        assert_eq!(FileConfig::find_default(tmp.path()), Some(cfg_path));
+    }
+
+    #[test]
+    fn test_find_default_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No config.yaml in data dir; ./nellie.yaml existence depends on CWD,
+        // so only assert the data-dir candidate is skipped when absent.
+        let found = FileConfig::find_default(tmp.path());
+        if let Some(p) = found {
+            assert_eq!(p, PathBuf::from("nellie.yaml"));
+        }
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde("~/code"), home.join("code"));
+            assert_eq!(expand_tilde("~"), home);
+        }
     }
 }

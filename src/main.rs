@@ -69,13 +69,18 @@ enum Commands {
     /// lessons management, and agent checkpoints. Optionally watches
     /// specified directories for automatic indexing.
     Serve {
-        /// Host address to bind to
-        #[arg(long, env = "NELLIE_HOST", default_value = "127.0.0.1")]
-        host: String,
+        /// Path to a YAML config file (default lookup: <data_dir>/config.yaml,
+        /// then ./nellie.yaml). Precedence: CLI flag > env > config file > default.
+        #[arg(long, env = "NELLIE_CONFIG")]
+        config: Option<PathBuf>,
 
-        /// Port to listen on
-        #[arg(short, long, env = "NELLIE_PORT", default_value = "8765")]
-        port: u16,
+        /// Host address to bind to (default: 127.0.0.1)
+        #[arg(long, env = "NELLIE_HOST")]
+        host: Option<String>,
+
+        /// Port to listen on (default: 8765)
+        #[arg(short, long, env = "NELLIE_PORT")]
+        port: Option<u16>,
 
         /// Directories to watch for code changes (comma-separated)
         #[arg(short, long, env = "NELLIE_WATCH_DIRS", value_delimiter = ',')]
@@ -102,8 +107,8 @@ enum Commands {
         enable_deep_hooks: bool,
 
         /// Periodic sync interval in minutes (default: 30)
-        #[arg(long, env = "NELLIE_SYNC_INTERVAL", default_value = "30")]
-        sync_interval: u64,
+        #[arg(long, env = "NELLIE_SYNC_INTERVAL")]
+        sync_interval: Option<u64>,
 
         /// Skip the initial filesystem walk on startup (use DB-first reconciliation only).
         /// Useful for resume-after-crash scenarios where a walk would be wasteful.
@@ -360,6 +365,54 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Export or import a portable graph snapshot
+    ///
+    /// A snapshot is a project-scoped, zstd-compressed subset of the index
+    /// (chunks, embeddings, symbols, graph, file state) that teams can commit
+    /// to their repository (default: .nellie/graph.db.zst). Importing a
+    /// snapshot warm-starts the index so only files changed since the
+    /// snapshot need reindexing.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+}
+
+/// Snapshot subcommand actions.
+#[derive(Subcommand, Debug)]
+enum SnapshotAction {
+    /// Export a snapshot of the index for a project
+    Export {
+        /// Project root to scope the snapshot to (default: current directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+
+        /// Output path (default: <project>/.nellie/graph.db.zst)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Import a snapshot into the local index
+    Import {
+        /// Project root the snapshot belongs to (default: current directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+
+        /// Snapshot file to import (default: <project>/.nellie/graph.db.zst)
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+
+        /// Nellie server URL. If reachable, routes through the running server
+        /// (avoids dual-writer corruption) and triggers diff_index afterwards.
+        #[arg(long, default_value = "http://127.0.0.1:8765")]
+        server: String,
+
+        /// Force local import even if a server is reachable.
+        /// WARNING: only use when the server is stopped.
+        #[arg(long, default_value_t = false)]
+        local: bool,
+    },
 }
 
 #[tokio::main]
@@ -387,6 +440,7 @@ async fn main() -> Result<()> {
     // Route to appropriate command handler
     match cli.command {
         Some(Commands::Serve {
+            config,
             host,
             port,
             watch,
@@ -398,22 +452,23 @@ async fn main() -> Result<()> {
             sync_interval,
             skip_initial_walk,
         }) => {
-            serve_command(ServeCommandArgs {
+            let args = resolve_serve_args(ServeCliValues {
                 data_dir: cli.data_dir,
+                log_level: cli.log_level,
+                api_key: cli.api_key,
+                config,
                 host,
                 port,
                 watch,
                 embedding_threads,
-                log_level: cli.log_level,
-                api_key: cli.api_key,
                 disable_embeddings,
                 enable_graph,
                 enable_structural,
                 enable_deep_hooks,
                 sync_interval,
                 skip_initial_walk,
-            })
-            .await
+            })?;
+            serve_command(args).await
         }
         Some(Commands::Index {
             paths,
@@ -483,25 +538,29 @@ async fn main() -> Result<()> {
             skip_model,
         }) => setup_command(&cli.data_dir, skip_runtime, skip_model).await,
         Some(Commands::Bootstrap { force }) => bootstrap_command(&cli.data_dir, force).await,
+        Some(Commands::Snapshot { action }) => snapshot_command(cli.data_dir, action).await,
         None => {
-            // Default to serve command for backward compatibility
+            // Default to serve command for backward compatibility.
+            // Still layer in a config file (default lookup) so `nellie` with no
+            // args honors config.yaml / nellie.yaml.
             tracing::info!("No command specified, starting server (use 'serve' explicitly)");
-            serve_command(ServeCommandArgs {
+            let args = resolve_serve_args(ServeCliValues {
                 data_dir: cli.data_dir,
-                host: "127.0.0.1".to_string(),
-                port: 8765,
-                watch: vec![],
-                embedding_threads: 4,
                 log_level: cli.log_level,
                 api_key: cli.api_key,
+                config: None,
+                host: None,
+                port: None,
+                watch: vec![],
+                embedding_threads: 4,
                 disable_embeddings: false,
                 enable_graph: false,
                 enable_structural: false,
                 enable_deep_hooks: false,
-                sync_interval: 30,
+                sync_interval: None,
                 skip_initial_walk: false,
-            })
-            .await
+            })?;
+            serve_command(args).await
         }
     }
 }
@@ -522,6 +581,106 @@ struct ServeCommandArgs {
     enable_deep_hooks: bool,
     sync_interval: u64,
     skip_initial_walk: bool,
+}
+
+/// Raw serve values from the CLI/env layer, before the config file is layered in.
+///
+/// `Option` fields distinguish "user supplied a value (via flag or env)" from
+/// "not supplied — fall back to the config file, then the built-in default."
+#[allow(clippy::struct_excessive_bools)]
+struct ServeCliValues {
+    data_dir: PathBuf,
+    log_level: String,
+    api_key: Option<String>,
+    config: Option<PathBuf>,
+    host: Option<String>,
+    port: Option<u16>,
+    watch: Vec<PathBuf>,
+    embedding_threads: usize,
+    disable_embeddings: bool,
+    enable_graph: bool,
+    enable_structural: bool,
+    enable_deep_hooks: bool,
+    sync_interval: Option<u64>,
+    skip_initial_walk: bool,
+}
+
+/// Resolve the effective serve arguments by layering the config file UNDER the
+/// CLI/env values.
+///
+/// Precedence (highest first): **CLI flag / env var > config file > default.**
+/// `clap`'s `env` attribute already folds env vars into the CLI values, so a
+/// value present here always wins over the file. The file only fills gaps.
+///
+/// `watch` is treated specially: since `--watch` has no way to express "unset"
+/// separately from "empty", an empty CLI/env watch list falls back to the
+/// config file's `watch.paths`. This is what makes the watcher reachable from
+/// config alone (Phase 1, Gap 1).
+///
+/// # Errors
+///
+/// Returns an error if an explicitly-specified `--config` file cannot be read
+/// or parsed. A missing default-lookup file is not an error.
+fn resolve_serve_args(cli: ServeCliValues) -> Result<ServeCommandArgs> {
+    use nellie::config::FileConfig;
+
+    // Load the config file: explicit --config is required-to-exist; the default
+    // lookup is best-effort.
+    let file_cfg = if let Some(path) = &cli.config {
+        tracing::info!(path = %path.display(), "Loading config file");
+        Some(FileConfig::load(path)?)
+    } else if let Some(path) = FileConfig::find_default(&cli.data_dir) {
+        tracing::info!(path = %path.display(), "Loading config file (default lookup)");
+        FileConfig::load(&path).ok()
+    } else {
+        None
+    };
+
+    let file_cfg = file_cfg.unwrap_or_default();
+
+    // host: CLI/env > file > default
+    let host = cli
+        .host
+        .or(file_cfg.server.host.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // port: CLI/env > file > default
+    let port = cli.port.or(file_cfg.server.port).unwrap_or(8765);
+
+    // watch: CLI/env (if non-empty) > file paths
+    let watch = if cli.watch.is_empty() {
+        file_cfg.watch_paths()
+    } else {
+        cli.watch
+    };
+
+    // Boolean feature flags: a CLI/env flag can only turn a feature ON, so we
+    // OR it with the file's setting (file can enable when the flag is absent).
+    let enable_graph = cli.enable_graph || file_cfg.graph.enabled.unwrap_or(false);
+    let enable_structural = cli.enable_structural || file_cfg.structural.enabled.unwrap_or(false);
+    let enable_deep_hooks = cli.enable_deep_hooks || file_cfg.deep_hooks.enabled.unwrap_or(false);
+
+    // sync_interval: CLI/env > file > default(30)
+    let sync_interval = cli
+        .sync_interval
+        .or(file_cfg.deep_hooks.sync_interval)
+        .unwrap_or(30);
+
+    Ok(ServeCommandArgs {
+        data_dir: cli.data_dir,
+        host,
+        port,
+        watch,
+        embedding_threads: cli.embedding_threads,
+        log_level: cli.log_level,
+        api_key: cli.api_key,
+        disable_embeddings: cli.disable_embeddings,
+        enable_graph,
+        enable_structural,
+        enable_deep_hooks,
+        sync_interval,
+        skip_initial_walk: cli.skip_initial_walk,
+    })
 }
 
 /// Background task for transcript watcher.
@@ -830,6 +989,11 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
         let (index_tx, index_rx) = tokio::sync::mpsc::channel::<IndexRequest>(1000);
         let (delete_tx, delete_rx) = tokio::sync::mpsc::channel(100);
 
+        // Clones for the git-HEAD reconcile task (Phase 1, Gap 2).
+        let index_tx_git = index_tx.clone();
+        let delete_tx_git = delete_tx.clone();
+        let git_db = scan_db.clone();
+
         // Start the indexer loop
         let indexer_clone = std::sync::Arc::clone(&indexer);
         tokio::spawn(async move {
@@ -858,15 +1022,76 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
         let watcher_watch_dirs = args.watch.clone();
         let watcher_indexer = std::sync::Arc::clone(&indexer);
         let watcher_delete_tx = delete_tx;
+        let git_watch_dirs = args.watch.clone();
         tokio::spawn(async move {
             let watcher_config = WatcherConfig {
                 watch_dirs: watcher_watch_dirs,
                 ..Default::default()
             };
+
+            // Git-HEAD awareness (Phase 1, Gap 2): discover repos among the
+            // watched roots and remember each repo's current HEAD commit. When
+            // a `.git/HEAD` / ref change is observed and the commit actually
+            // moved (checkout / pull / commit / merge / rebase), trigger the
+            // existing reconcile path instead of reacting to per-file churn.
+            let repos = nellie::watcher::git::discover_repos(&git_watch_dirs);
+            let mut head_commits: std::collections::HashMap<std::path::PathBuf, Option<String>> =
+                repos
+                    .iter()
+                    .map(|r| (r.git_dir.clone(), r.head_commit()))
+                    .collect();
+
             match FileWatcher::new(&watcher_config) {
                 Ok(mut watcher) => {
                     tracing::info!("File watcher started");
                     while let Some(batch) = watcher.recv().await {
+                        // Detect git metadata changes first — a HEAD move should
+                        // reconcile the whole tree, not index individual refs.
+                        let git_meta_touched = !repos.is_empty()
+                            && batch
+                                .modified
+                                .iter()
+                                .chain(batch.deleted.iter())
+                                .any(|p| repos.iter().any(|r| r.is_meta_path(p)));
+
+                        if git_meta_touched {
+                            for repo in &repos {
+                                let new_head = repo.head_commit();
+                                let entry =
+                                    head_commits.entry(repo.git_dir.clone()).or_insert(None);
+                                if *entry != new_head {
+                                    tracing::info!(
+                                        root = %repo.work_root.display(),
+                                        old = ?entry,
+                                        new = ?new_head,
+                                        "Git HEAD moved — reconciling index with working tree"
+                                    );
+                                    *entry = new_head;
+
+                                    // Reuse the existing metadata-diff walk; it
+                                    // indexes changed/new files and prunes deletions.
+                                    let recon_db = git_db.clone();
+                                    let recon_dirs = vec![repo.work_root.clone()];
+                                    let recon_index_tx = index_tx_git.clone();
+                                    let recon_delete_tx = delete_tx_git.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if let Err(e) = reconcile_with_walk(
+                                            &recon_db,
+                                            &recon_dirs,
+                                            &recon_index_tx,
+                                            &recon_delete_tx,
+                                        ) {
+                                            tracing::error!(
+                                                error = ?e,
+                                                "Git HEAD reconcile failed"
+                                            );
+                                        }
+                                    })
+                                    .await;
+                                }
+                            }
+                        }
+
                         let total = batch.modified.len() + batch.deleted.len();
                         tracing::info!(events = total, "Processing file change batch");
 
@@ -2023,6 +2248,128 @@ async fn bootstrap_command(data_dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a project directory argument to an absolute path (default: CWD).
+fn resolve_project_dir(project: Option<PathBuf>) -> Result<PathBuf> {
+    match project {
+        Some(p) if p.is_absolute() => Ok(p),
+        Some(p) => Ok(std::env::current_dir()
+            .map_err(|e| nellie::Error::internal(format!("cannot get CWD: {e}")))?
+            .join(p)),
+        None => std::env::current_dir()
+            .map_err(|e| nellie::Error::internal(format!("cannot get CWD: {e}"))),
+    }
+}
+
+/// Snapshot command: export or import a portable graph snapshot.
+async fn snapshot_command(data_dir: PathBuf, action: SnapshotAction) -> Result<()> {
+    match action {
+        SnapshotAction::Export { project, out } => {
+            let project_dir = resolve_project_dir(project)?;
+            let out_path =
+                out.unwrap_or_else(|| nellie::snapshot::default_snapshot_path(&project_dir));
+
+            let config = Config {
+                data_dir,
+                ..Config::default()
+            };
+            let db = Database::open(config.database_path())?;
+            init_storage(&db)?;
+
+            let report = nellie::snapshot::export_snapshot(&db, &project_dir, &out_path)?;
+            println!(
+                "Snapshot exported to {}\n  {} files, {} chunks, {} embeddings, {} symbols, \
+                 {} structural edges, {} graph nodes, {} graph edges\n  {} bytes raw -> {} bytes \
+                 compressed ({:.1}% of raw)",
+                report.out_path,
+                report.files,
+                report.chunks,
+                report.embeddings,
+                report.symbols,
+                report.structural_edges,
+                report.graph_nodes,
+                report.graph_edges,
+                report.raw_bytes,
+                report.compressed_bytes,
+                if report.raw_bytes == 0 {
+                    0.0
+                } else {
+                    100.0 * report.compressed_bytes as f64 / report.raw_bytes as f64
+                },
+            );
+            Ok(())
+        }
+        SnapshotAction::Import {
+            project,
+            input,
+            server,
+            local,
+        } => {
+            let project_dir = resolve_project_dir(project)?;
+            let in_path =
+                input.unwrap_or_else(|| nellie::snapshot::default_snapshot_path(&project_dir));
+
+            if !in_path.exists() {
+                return Err(nellie::Error::internal(format!(
+                    "Snapshot not found: {}",
+                    in_path.display()
+                )));
+            }
+
+            // Prefer routing the post-import diff_index through a running server
+            // to avoid dual-writer corruption. The import itself writes to the DB
+            // directly, so it requires the server be stopped unless --local.
+            if !local {
+                if let Ok(true) = server_reachable(&server).await {
+                    return Err(nellie::Error::internal(format!(
+                        "A Nellie server appears to be running at {server}. Importing writes to \
+                         the database directly and must not run concurrently with the server. \
+                         Stop the server and re-run, or pass --local to override."
+                    )));
+                }
+            }
+
+            let config = Config {
+                data_dir,
+                ..Config::default()
+            };
+            let db = Database::open(config.database_path())?;
+            init_storage(&db)?;
+
+            let report = nellie::snapshot::import_snapshot(&db, &in_path)?;
+            println!(
+                "Snapshot imported from {}\n  {} files merged, {} skipped (already current), \
+                 {} chunks, {} embeddings, {} symbols, {} structural edges, {} graph nodes, \
+                 {} graph edges",
+                report.in_path,
+                report.files_merged,
+                report.files_skipped,
+                report.chunks_inserted,
+                report.embeddings_inserted,
+                report.symbols_inserted,
+                report.structural_edges_inserted,
+                report.graph_nodes_merged,
+                report.graph_edges_merged,
+            );
+            println!(
+                "Run `nellie index {}` (or the diff_index MCP tool) to reindex any files \
+                 changed since the snapshot.",
+                project_dir.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Best-effort check whether a Nellie server is reachable at `server`.
+async fn server_reachable(server: &str) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .map_err(|e| nellie::Error::internal(format!("failed to build HTTP client: {e}")))?;
+    let url = format!("{}/health", server.trim_end_matches('/'));
+    Ok(client.get(&url).send().await.is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2034,6 +2381,7 @@ mod tests {
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         if let Some(Commands::Serve {
+            config,
             host,
             port,
             watch,
@@ -2046,15 +2394,17 @@ mod tests {
             skip_initial_walk,
         }) = cli.command
         {
-            assert_eq!(host, "0.0.0.0");
-            assert_eq!(port, 9000);
+            assert!(config.is_none());
+            assert_eq!(host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(port, Some(9000));
             assert!(watch.is_empty());
             assert_eq!(embedding_threads, 4);
             assert!(!disable_embeddings);
             assert!(!enable_graph);
             assert!(!enable_structural);
             assert!(!enable_deep_hooks);
-            assert_eq!(sync_interval, 30);
+            // sync_interval is unset on the CLI here (resolved later to 30).
+            assert!(sync_interval.is_none());
             assert!(!skip_initial_walk);
         } else {
             panic!("Expected Serve command");
