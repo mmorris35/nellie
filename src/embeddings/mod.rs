@@ -7,6 +7,7 @@
 
 mod model;
 mod service;
+mod spec;
 pub mod version;
 mod worker;
 
@@ -14,7 +15,11 @@ pub use model::{
     is_runtime_available, EmbeddingModel, DEFAULT_MODEL_NAME, EMBEDDING_DIM, MAX_SEQ_LENGTH,
 };
 pub use service::{placeholder_embedding, EmbeddingConfig, EmbeddingService};
-pub use worker::{load_tokenizer, EmbeddingWorker};
+pub use spec::{
+    checkpoint_embedding_text, chunk_embedding_text, lesson_embedding_text, EmbeddingSpec,
+    MODEL_ID, NORMALISATION_L2, SPECIAL_TOKENS_INTACT, SPECIAL_TOKENS_TRUNCATED,
+};
+pub use worker::{configure_tokenizer, load_tokenizer, EmbeddingWorker};
 
 /// Initialize embeddings module.
 pub fn init() {

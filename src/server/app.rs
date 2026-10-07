@@ -238,6 +238,7 @@ impl App {
     ///
     /// Returns an error only for critical failures (none currently - all errors logged).
     #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     pub async fn start_watcher(
         &self,
         watch_dirs: Vec<std::path::PathBuf>,

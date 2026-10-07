@@ -2,29 +2,23 @@
 
 use rusqlite::Connection;
 
+use super::embedding_meta::{active_tables, ensure_vector_tables};
 use super::models::{CheckpointRecord, SearchResult};
 use crate::error::StorageError;
 use crate::Result;
 
-const CHECKPOINT_VEC_TABLE: &str = "checkpoint_embeddings";
+/// Name of the active checkpoint vector table (see `embedding_meta`).
+fn checkpoint_vec_table(conn: &Connection) -> Result<&'static str> {
+    Ok(active_tables(conn)?.checkpoints)
+}
 
-/// Initialize checkpoint vector table.
+/// Initialize the active vector tables (chunks, lessons, checkpoints).
 ///
 /// # Errors
 ///
-/// Returns an error if the table cannot be created.
+/// Returns an error if the tables cannot be created.
 pub fn init_checkpoint_vectors(conn: &Connection) -> Result<()> {
-    let sql = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {CHECKPOINT_VEC_TABLE} USING vec0(
-            id TEXT PRIMARY KEY,
-            embedding FLOAT[384]
-        )"
-    );
-
-    conn.execute(&sql, [])
-        .map_err(|e| StorageError::Vector(format!("failed to create checkpoint vec table: {e}")))?;
-
-    Ok(())
+    ensure_vector_tables(conn)
 }
 
 /// Store checkpoint embedding.
@@ -37,9 +31,11 @@ pub fn store_checkpoint_embedding(
     checkpoint_id: &str,
     embedding: &[f32],
 ) -> Result<()> {
+    let table = checkpoint_vec_table(conn)?;
+
     // Delete old embedding if exists
     conn.execute(
-        &format!("DELETE FROM {CHECKPOINT_VEC_TABLE} WHERE id = ?"),
+        &format!("DELETE FROM {table} WHERE id = ?"),
         [checkpoint_id],
     )
     .ok();
@@ -47,7 +43,7 @@ pub fn store_checkpoint_embedding(
     // Insert new embedding
     let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
     conn.execute(
-        &format!("INSERT INTO {CHECKPOINT_VEC_TABLE} (id, embedding) VALUES (?, ?)"),
+        &format!("INSERT INTO {table} (id, embedding) VALUES (?, ?)"),
         rusqlite::params![checkpoint_id, blob],
     )
     .map_err(|e| StorageError::Vector(format!("failed to store checkpoint embedding: {e}")))?;
@@ -70,8 +66,9 @@ pub fn search_checkpoints_by_embedding(
         .flat_map(|f| f.to_le_bytes())
         .collect();
 
+    let table = checkpoint_vec_table(conn)?;
     let sql = format!(
-        "SELECT id, distance FROM {CHECKPOINT_VEC_TABLE} WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
+        "SELECT id, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
     );
 
     let mut stmt = conn

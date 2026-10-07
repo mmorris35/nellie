@@ -4,31 +4,33 @@
 
 use rusqlite::{params, Connection};
 
+use super::embedding_meta::{active_tables, ensure_vector_tables};
 use super::models::ChunkRecord;
-use super::vector::{delete_vector, insert_vector, EMBEDDING_DIM};
+use super::vector::{delete_vector, insert_vector};
 use crate::error::StorageError;
 use crate::Result;
 
-/// Vector table name for chunk embeddings.
-const CHUNK_VEC_TABLE: &str = "chunk_embeddings";
+/// Name of the active chunk vector table (see `embedding_meta`).
+fn chunk_vec_table(conn: &Connection) -> Result<&'static str> {
+    Ok(active_tables(conn)?.chunks)
+}
 
-/// Initialize chunk vector table.
+/// Active chunk vector table for deletes. Deletes never fail on vector
+/// cleanup (as before), so a missing index just means nothing to remove.
+fn chunk_vec_table_for_delete(conn: &Connection) -> Option<&'static str> {
+    super::embedding_meta::active_meta(conn)
+        .ok()
+        .flatten()
+        .map(|m| m.tables.chunks)
+}
+
+/// Initialize the active vector tables (chunks, lessons, checkpoints).
 ///
 /// # Errors
 ///
-/// Returns an error if the table cannot be created.
+/// Returns an error if the tables cannot be created.
 pub fn init_chunk_vectors(conn: &Connection) -> Result<()> {
-    // Create vec0 table for chunk embeddings
-    let sql = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {CHUNK_VEC_TABLE} USING vec0(
-            id INTEGER PRIMARY KEY,
-            embedding FLOAT[{EMBEDDING_DIM}]
-        )"
-    );
-
-    conn.execute(&sql, [])
-        .map_err(|e| StorageError::Vector(format!("failed to create chunk vec table: {e}")))?;
-
+    ensure_vector_tables(conn)?;
     tracing::debug!("Chunk vector table initialized");
     Ok(())
 }
@@ -65,7 +67,7 @@ pub fn insert_chunk(conn: &Connection, chunk: &ChunkRecord) -> Result<i64> {
 
     // Insert embedding if available
     if let Some(ref embedding) = chunk.embedding {
-        insert_vector(conn, CHUNK_VEC_TABLE, id, embedding)?;
+        insert_vector(conn, chunk_vec_table(conn)?, id, embedding)?;
     }
 
     tracing::trace!(id, path = %chunk.file_path, "Inserted chunk");
@@ -177,7 +179,9 @@ pub fn get_chunks_by_file(conn: &Connection, file_path: &str) -> Result<Vec<Chun
 /// Returns an error if the deletion fails.
 pub fn delete_chunk(conn: &Connection, id: i64) -> Result<()> {
     // Delete from vector table first
-    let _ = delete_vector(conn, CHUNK_VEC_TABLE, id);
+    if let Some(table) = chunk_vec_table_for_delete(conn) {
+        let _ = delete_vector(conn, table, id);
+    }
 
     // Delete from chunks table
     conn.execute("DELETE FROM chunks WHERE id = ?", [id])
@@ -209,8 +213,10 @@ pub fn delete_chunks_by_file(conn: &Connection, file_path: &str) -> Result<usize
     };
 
     // Delete from vector table
-    for id in &ids {
-        let _ = delete_vector(conn, CHUNK_VEC_TABLE, *id);
+    if let Some(table) = chunk_vec_table_for_delete(conn) {
+        for id in &ids {
+            let _ = delete_vector(conn, table, *id);
+        }
     }
 
     // Delete from chunks table
@@ -228,11 +234,13 @@ pub fn delete_chunks_by_file(conn: &Connection, file_path: &str) -> Result<usize
 ///
 /// Returns an error if the update fails.
 pub fn update_chunk_embedding(conn: &Connection, id: i64, embedding: &[f32]) -> Result<()> {
+    let table = chunk_vec_table(conn)?;
+
     // Delete old embedding if exists
-    let _ = delete_vector(conn, CHUNK_VEC_TABLE, id);
+    let _ = delete_vector(conn, table, id);
 
     // Insert new embedding
-    insert_vector(conn, CHUNK_VEC_TABLE, id, embedding)?;
+    insert_vector(conn, table, id, embedding)?;
 
     tracing::trace!(id, "Updated chunk embedding");
     Ok(())
@@ -292,8 +300,10 @@ pub fn delete_chunks_by_path_prefix(conn: &Connection, path_prefix: &str) -> Res
     };
 
     // Delete from vector table
-    for id in &ids {
-        let _ = delete_vector(conn, CHUNK_VEC_TABLE, *id);
+    if let Some(table) = chunk_vec_table_for_delete(conn) {
+        for id in &ids {
+            let _ = delete_vector(conn, table, *id);
+        }
     }
 
     // Delete from chunks table

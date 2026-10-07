@@ -1861,8 +1861,9 @@ async fn handle_add_lesson(
     // Generate and store embedding for semantic search
     if let Some(ref embeddings) = state.embeddings {
         if embeddings.is_initialized() {
-            // Combine title and content for better semantic understanding
-            let text_to_embed = format!("{}\n{}", lesson.title, lesson.content);
+            // Same text format as every other lesson insert path and reembed
+            let text_to_embed =
+                crate::embeddings::lesson_embedding_text(&lesson.title, &lesson.content);
 
             if let Ok(embedding) = embeddings.embed_one(text_to_embed).await {
                 // Store embedding in vector table (ignore errors, embedding is optional for backward compat)
@@ -1934,7 +1935,8 @@ async fn handle_add_checkpoint(
     if let Some(ref embeddings) = state.embeddings {
         if embeddings.is_initialized() {
             // Embed the working_on description for checkpoint semantic search
-            let text_to_embed = checkpoint.working_on.clone();
+            let text_to_embed =
+                crate::embeddings::checkpoint_embedding_text(&checkpoint.working_on);
 
             if let Ok(embedding) = embeddings.embed_one(text_to_embed).await {
                 // Store embedding in vector table (ignore errors, embedding is optional for backward compat)

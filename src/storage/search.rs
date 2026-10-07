@@ -4,13 +4,11 @@
 
 use rusqlite::Connection;
 
+use super::embedding_meta::active_tables;
 use super::models::{ChunkRecord, SearchResult};
 use super::vector::search_similar;
 use crate::error::StorageError;
 use crate::Result;
-
-/// Vector table name for chunk embeddings.
-const CHUNK_VEC_TABLE: &str = "chunk_embeddings";
 
 /// Search options for semantic search.
 #[derive(Debug, Clone)]
@@ -94,7 +92,12 @@ pub fn search_chunks(
     // Get candidate IDs from vector search
     // Request more than limit to account for filtering
     let candidate_limit = options.limit * 3;
-    let candidates = search_similar(conn, CHUNK_VEC_TABLE, query_embedding, candidate_limit)?;
+    let candidates = search_similar(
+        conn,
+        active_tables(conn)?.chunks,
+        query_embedding,
+        candidate_limit,
+    )?;
 
     if candidates.is_empty() {
         return Ok(Vec::new());

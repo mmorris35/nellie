@@ -264,7 +264,10 @@ impl Indexer {
     ) -> Result<Vec<Vec<f32>>> {
         if let Some(ref service) = self.embeddings {
             if service.is_initialized() {
-                let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+                let texts: Vec<String> = chunks
+                    .iter()
+                    .map(|c| crate::embeddings::chunk_embedding_text(&c.content))
+                    .collect();
                 return service.embed_batch(texts).await;
             }
         }

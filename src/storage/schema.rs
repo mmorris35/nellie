@@ -8,7 +8,7 @@ use crate::error::StorageError;
 use crate::Result;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Run all pending migrations.
 ///
@@ -43,6 +43,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     if current_version < 3 {
         migrate_v3(conn)?;
+    }
+
+    if current_version < 4 {
+        migrate_v4(conn)?;
     }
 
     Ok(())
@@ -275,6 +279,45 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration v4: embedding index metadata.
+///
+/// Records which embedding spec (model, token limit, prompts, normalisation)
+/// built the active vector tables, and their names. Rows are only added, so
+/// earlier specs stay on record; exactly one row is active.
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    tracing::info!("Applying migration v4: Embedding index metadata");
+
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS embedding_meta (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            max_len INTEGER NOT NULL,
+            special_tokens TEXT NOT NULL,
+            query_prompt TEXT NOT NULL,
+            doc_prompt TEXT NOT NULL,
+            normalisation TEXT NOT NULL,
+            chunk_table TEXT NOT NULL,
+            lesson_table TEXT NOT NULL,
+            checkpoint_table TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL,
+            recorded_at INTEGER NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_meta_active
+            ON embedding_meta(active) WHERE active = 1;
+        ",
+    )
+    .map_err(|e| StorageError::Migration(format!("v4 migration failed: {e}")))?;
+
+    record_migration(conn, 4)?;
+    tracing::info!("Migration v4 complete");
+
+    Ok(())
+}
+
 /// Verify all expected tables exist.
 ///
 /// # Errors
@@ -292,6 +335,7 @@ pub fn verify_schema(conn: &Connection) -> Result<()> {
         "graph_edges",
         "symbols",
         "structural_edges",
+        "embedding_meta",
     ];
 
     for table in tables {
@@ -615,7 +659,7 @@ mod tests {
 
             let version = get_current_version(conn)?;
             assert_eq!(version, SCHEMA_VERSION);
-            assert_eq!(version, 3);
+            assert_eq!(version, 4);
 
             verify_schema(conn)?;
             Ok(())
