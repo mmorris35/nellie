@@ -396,6 +396,7 @@ nellie serve [OPTIONS]
   --enable-deep-hooks    Enable background transcript watcher
   --enable-structural    Enable structural code search (Python, Rust, TypeScript/JavaScript)
   --sync-interval <MIN>  Periodic sync interval in minutes [default: 30]
+  --max-result-limit <N> Max limit for REST result lists, 1-100000 [default: built-in caps]
   --log-level <LEVEL>    Log level: trace/debug/info/warn/error [default: info]
 
 # Setup — download ONNX Runtime and embedding model (for manual builds)
@@ -421,6 +422,7 @@ nellie hooks-status [--json]  # Check hook health
 | `NELLIE_HOST` | Bind address |
 | `NELLIE_PORT` | Server port |
 | `NELLIE_ENABLE_GRAPH` | Enable knowledge graph (`true`/`false`) |
+| `NELLIE_MAX_RESULT_LIMIT` | Maximum `limit` accepted by REST endpoints that return result lists (1-100000). Unset keeps the built-in caps: 100 for search endpoints, 200 for file/lesson/checkpoint listings, 500 for `/api/v1/graph`. When set, it replaces all of those caps. Same as `--max-result-limit`. |
 | `RUST_LOG` | Log level |
 
 ## Service Setup

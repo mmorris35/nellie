@@ -55,6 +55,8 @@ pub struct ServerConfig {
     pub graph: crate::config::GraphConfig,
     /// Enable structural parsing (tree-sitter AST analysis)
     pub enable_structural: bool,
+    /// Maximum REST result limit (`None` = built-in per-endpoint caps)
+    pub max_result_limit: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -71,6 +73,7 @@ impl Default for ServerConfig {
             watch_dirs: Vec::new(),
             graph: crate::config::GraphConfig::default(),
             enable_structural: false,
+            max_result_limit: None,
         }
     }
 }
@@ -141,6 +144,7 @@ impl App {
 
         // Set structural parsing from config
         state.set_enable_structural(config.enable_structural);
+        state.set_max_result_limit(config.max_result_limit);
 
         let state = Arc::new(state);
 
@@ -238,6 +242,7 @@ impl App {
     ///
     /// Returns an error only for critical failures (none currently - all errors logged).
     #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     pub async fn start_watcher(
         &self,
         watch_dirs: Vec<std::path::PathBuf>,
@@ -618,6 +623,7 @@ mod tests {
         assert_eq!(config.embedding_threads, 4);
         assert!(config.enable_embeddings);
         assert!(config.watch_dirs.is_empty());
+        assert_eq!(config.max_result_limit, None);
     }
 
     #[test]
@@ -633,6 +639,7 @@ mod tests {
             watch_dirs: vec![std::path::PathBuf::from("/some/dir")],
             graph: crate::config::GraphConfig::default(),
             enable_structural: true,
+            max_result_limit: Some(10_000),
         };
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 9000);
@@ -642,6 +649,7 @@ mod tests {
         assert_eq!(config.embedding_threads, 8);
         assert!(!config.enable_embeddings);
         assert_eq!(config.watch_dirs.len(), 1);
+        assert_eq!(config.max_result_limit, Some(10_000));
     }
 
     #[tokio::test]
