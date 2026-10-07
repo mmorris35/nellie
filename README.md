@@ -24,7 +24,14 @@ Measured on a retrieval eval of 40 known-answer queries over ~2,400 real lessons
 
 Nellie now also records which embedding settings built its vector index, and will not mix vectors built with different settings.
 
-**Upgrade note:** existing installs must run `nellie reembed` once, with Nellie stopped. Until then Nellie refuses to start, so old and new vectors are never mixed. Expect roughly 3 minutes per 1,000 lessons, checkpoints and code chunks (about 6 items/s measured on lesson-sized text on a 4-core machine). `reembed` is safe to interrupt and rerun, and the old index is kept for rollback (reinstall the previous version to use it). Once you're happy, `nellie reembed --drop-old` removes the old index.
+**Upgrade note:** existing installs must rebuild their vector index once. Until the new index is active, the new version refuses to start, so old and new vectors are never mixed. Most of the work can happen while the previous version keeps serving:
+
+1. With the previous version still running, run the new version's `nellie reembed --no-switch`. It builds the new index beside the old one, in short write transactions, and does not change what the running server uses. This is the slow part: about 18 items/s with `--embedding-threads 3` on a 4-core x86 machine (8/s with one thread), so roughly 1.5 hours per 100,000 lessons, checkpoints and code chunks. It is safe to interrupt and rerun.
+2. Stop Nellie and install the new version.
+3. Run `nellie reembed`. It catches up with what changed since step 1 (removes vectors of deleted items, re-embeds edited lessons, embeds new items), checks that the new index matches the stored items exactly, and switches in one transaction. Measured: 3 seconds for 50 changed lessons, including startup.
+4. Start Nellie. On every start it checks that each stored item has a vector in the active index (well under a second for ~100,000 items). Items written by an old server that was still running during the switch are embedded in the background, and vectors of deleted items are removed.
+
+`nellie reembed` without step 1 also works (Nellie stopped for the whole rebuild). `--embedding-threads` (default 4) sets how many cores it uses; leave one free on a busy machine. If your install sets `ORT_DYLIB_PATH` for `nellie serve`, set it for `nellie reembed` too. The old index is kept for rollback (reinstall the previous version to use it). Once you're happy, `nellie reembed --drop-old` removes it.
 
 ## Why "middleware," not "memory store"?
 
@@ -422,6 +429,7 @@ nellie index <path> [--local]  # --local forces local embeddings (no server need
 
 # Re-embed — rebuild the vector index with the current embedding settings (Nellie stopped)
 nellie reembed [--drop-old] [--embedding-threads N] [--batch-size N]
+nellie reembed --no-switch     # build only; safe while the previous version still serves
 
 # Deep Hooks — Claude Code native memory integration
 nellie sync [--rules] [--dry-run] [--budget N] [--server URL]
