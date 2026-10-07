@@ -469,7 +469,7 @@ pub fn score_memory_relevance(memory: &MemoryFile, lesson: Option<&LessonRecord>
     );
 
     // Weighted combination: 30% recency, 70% severity
-    (recency_score * RECENCY_WEIGHT) + (severity_score * SEVERITY_WEIGHT)
+    recency_score.mul_add(RECENCY_WEIGHT, severity_score * SEVERITY_WEIGHT)
 }
 
 /// Selects the most relevant memories that fit within a line budget.
