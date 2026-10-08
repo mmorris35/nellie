@@ -349,6 +349,27 @@ enum Commands {
         skip_model: bool,
     },
 
+    /// Rebuild the vector index with the current embedding settings
+    ///
+    /// Re-embeds every lesson, checkpoint and code chunk from the text stored
+    /// in the database into new vector tables, then switches to them in one
+    /// transaction. Run it with Nellie stopped. Safe to interrupt and rerun:
+    /// rows already re-embedded are skipped. The old index is kept unless
+    /// --drop-old is given.
+    Reembed {
+        /// Drop the old vector tables once the new index is active
+        #[arg(long)]
+        drop_old: bool,
+
+        /// Number of embedding worker threads
+        #[arg(long, env = "NELLIE_EMBEDDING_THREADS", default_value = "4")]
+        embedding_threads: usize,
+
+        /// Texts per embedding request
+        #[arg(long, default_value = "16")]
+        batch_size: usize,
+    },
+
     /// Import starter lessons into the database
     ///
     /// Reads embedded bootstrap lesson files and imports them into the
@@ -483,6 +504,11 @@ async fn main() -> Result<()> {
             skip_model,
         }) => setup_command(&cli.data_dir, skip_runtime, skip_model).await,
         Some(Commands::Bootstrap { force }) => bootstrap_command(&cli.data_dir, force).await,
+        Some(Commands::Reembed {
+            drop_old,
+            embedding_threads,
+            batch_size,
+        }) => reembed_command(&cli.data_dir, drop_old, embedding_threads, batch_size).await,
         None => {
             // Default to serve command for backward compatibility
             tracing::info!("No command specified, starting server (use 'serve' explicitly)");
@@ -759,9 +785,20 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
         tracing::info!("Watching directories: {:?}", args.watch);
     }
 
+    // Hold a shared lock on the database for the server's lifetime so that
+    // `nellie reembed` cannot run underneath it.
+    let _db_lock = match nellie::reembed::DbLock::shared(&config.database_path()) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     // Initialize database
     let db = Database::open(config.database_path())?;
     init_storage(&db)?;
+    enforce_embedding_spec(&db, &config.data_dir)?;
 
     // Initialize metrics
     init_metrics();
@@ -1304,6 +1341,7 @@ async fn index_locally(paths: &[PathBuf], data_dir: &Path) -> Result<()> {
     };
     let db = Database::open(config.database_path())?;
     init_storage(&db)?;
+    enforce_embedding_spec(&db, data_dir)?;
 
     // Validate ONNX Runtime version before creating any Session (issue #60).
     match nellie::embeddings::version::check_ort_version() {
@@ -2005,6 +2043,7 @@ async fn bootstrap_command(data_dir: &Path, force: bool) -> Result<()> {
     };
     let db = Database::open(config.database_path())?;
     init_storage(&db)?;
+    enforce_embedding_spec(&db, data_dir)?;
 
     tracing::info!(
         data_dir = %data_dir.display(),
@@ -2020,6 +2059,158 @@ async fn bootstrap_command(data_dir: &Path, force: bool) -> Result<()> {
         result.imported, result.skipped
     );
 
+    Ok(())
+}
+
+/// Refuse to continue if the vector index was built with a different
+/// embedding spec than this binary uses. Records the spec of an index built
+/// by an earlier Nellie on first run.
+fn enforce_embedding_spec(db: &Database, data_dir: &Path) -> Result<()> {
+    let tokenizer = nellie::embeddings::EmbeddingConfig::from_data_dir(data_dir, 1).tokenizer_path;
+    match db.with_conn(|conn| nellie::storage::embedding_meta::check_spec(conn, &tokenizer))? {
+        Ok(()) => Ok(()),
+        Err(message) => {
+            eprintln!("{message}");
+            tracing::error!("Embedding spec mismatch; refusing to start");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Reembed command: rebuild the vector index under the current spec.
+async fn reembed_command(
+    data_dir: &Path,
+    drop_old: bool,
+    embedding_threads: usize,
+    batch_size: usize,
+) -> Result<()> {
+    use nellie::embeddings::{EmbeddingConfig, EmbeddingService};
+    use nellie::reembed::{run_reembed, DbLock, Progress, ReembedOptions};
+
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let db_path = config.database_path();
+    if !db_path.exists() {
+        return Err(nellie::Error::config(format!(
+            "no database at {}",
+            db_path.display()
+        )));
+    }
+    let lock = match DbLock::exclusive(&db_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::debug!(lock = %lock.lock_path().display(), "Holding exclusive database lock");
+
+    let db = Database::open(&db_path)?;
+    init_storage(&db)?;
+    let emb_config = EmbeddingConfig::from_data_dir(data_dir, embedding_threads.max(1));
+    db.with_conn(|conn| {
+        nellie::storage::embedding_meta::bootstrap_meta(conn, &emb_config.tokenizer_path)
+    })?;
+
+    if let Err(msg) = nellie::embeddings::version::check_ort_version() {
+        return Err(nellie::Error::internal(msg));
+    }
+    for path in [&emb_config.model_path, &emb_config.tokenizer_path] {
+        if !path.exists() {
+            return Err(nellie::Error::internal(format!(
+                "{} not found. Run `nellie setup` first.",
+                path.display()
+            )));
+        }
+    }
+    let service = EmbeddingService::new(emb_config);
+    service.init().await?;
+
+    let opts = ReembedOptions {
+        batch_size: batch_size.max(1),
+        concurrency: embedding_threads.max(1),
+        drop_old,
+    };
+    println!(
+        "Re-embedding with {}",
+        nellie::embeddings::EmbeddingSpec::current()
+    );
+    let mut last_print = std::time::Instant::now();
+    let mut on_progress = |p: &Progress| {
+        if p.done == p.total || last_print.elapsed() >= Duration::from_secs(2) {
+            last_print = std::time::Instant::now();
+            let rate = if p.elapsed_secs > 0.0 {
+                p.embedded as f64 / p.elapsed_secs
+            } else {
+                0.0
+            };
+            println!(
+                "  {:<11} {:>8}/{:<8} ({rate:.1}/s)",
+                p.kind.name(),
+                p.done,
+                p.total
+            );
+        }
+    };
+    let report = run_reembed(&db, &service, &opts, &mut on_progress).await?;
+
+    println!("Previous index: {}", report.previous_spec);
+    for (name, r) in [
+        ("lessons", &report.lessons),
+        ("checkpoints", &report.checkpoints),
+        ("chunks", &report.chunks),
+    ] {
+        let rate = if r.elapsed_secs > 0.0 {
+            r.embedded as f64 / r.elapsed_secs
+        } else {
+            0.0
+        };
+        println!(
+            "  {name:<11} total {:>8}  embedded {:>8}  already done {:>8}  {:.1}s ({rate:.1}/s)",
+            r.total, r.embedded, r.skipped, r.elapsed_secs
+        );
+        if r.empty_text > 0 {
+            println!(
+                "  WARNING: {} {name} have empty stored text; they were embedded as empty strings",
+                r.empty_text
+            );
+        }
+        if r.orphaned_old_vectors > 0 {
+            println!(
+                "  WARNING: {} vectors in {} have no stored {name} text to rebuild from \
+                 (left over from deleted items); they are not carried over",
+                r.orphaned_old_vectors,
+                match name {
+                    "lessons" => report.previous_tables.lessons,
+                    "checkpoints" => report.previous_tables.checkpoints,
+                    _ => report.previous_tables.chunks,
+                }
+            );
+        }
+    }
+    if report.switched {
+        println!(
+            "Switched to the new index ({}, {}, {}).",
+            report.active_tables.chunks,
+            report.active_tables.lessons,
+            report.active_tables.checkpoints
+        );
+        if !drop_old {
+            println!(
+                "Old tables kept ({}, {}, {}); remove them later with `nellie reembed --drop-old`.",
+                report.previous_tables.chunks,
+                report.previous_tables.lessons,
+                report.previous_tables.checkpoints
+            );
+        }
+    } else {
+        println!("Index already uses the current embedding spec; filled in any missing rows.");
+    }
+    if !report.dropped.is_empty() {
+        println!("Dropped old tables: {}", report.dropped.join(", "));
+    }
     Ok(())
 }
 

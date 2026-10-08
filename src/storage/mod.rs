@@ -12,6 +12,7 @@ mod checkpoints;
 mod checkpoints_search;
 mod chunks;
 mod connection;
+pub mod embedding_meta;
 mod file_state;
 mod lessons;
 mod lessons_search;
@@ -83,10 +84,10 @@ pub fn init_storage(db: &Database) -> crate::Result<()> {
         // Run migrations
         migrate(conn)?;
 
-        // Initialize vector tables for semantic search
-        init_chunk_vectors(conn)?;
-        init_lesson_vectors(conn)?;
-        init_checkpoint_vectors(conn)?;
+        // Create the active vector tables. On a fresh install this records
+        // the current embedding spec; an install that predates the embedding
+        // guard is left for `embedding_meta::check_spec` to identify.
+        embedding_meta::ensure_vector_tables(conn)?;
 
         // Verify schema
         verify_schema(conn)?;

@@ -413,13 +413,22 @@ pub fn create_api_router(state: Arc<McpState>) -> Router {
         .route("/api/v1/search", get(search))
         .route("/api/v1/lessons", get(list_lessons).post(create_lesson))
         .route("/api/v1/lessons/search", get(search_lessons))
-        .route("/api/v1/lessons/backfill-embeddings", post(backfill_lesson_embeddings))
+        .route(
+            "/api/v1/lessons/backfill-embeddings",
+            post(backfill_lesson_embeddings),
+        )
         .route("/api/v1/lessons/{id}", delete(delete_lesson))
         .route("/api/v1/metrics", get(tool_metrics))
         .route("/api/v1/search/hybrid", get(hybrid_search))
-        .route("/api/v1/checkpoints", get(list_checkpoints).post(create_checkpoint))
+        .route(
+            "/api/v1/checkpoints",
+            get(list_checkpoints).post(create_checkpoint),
+        )
         .route("/api/v1/checkpoints/search", get(search_checkpoints))
-        .route("/api/v1/checkpoints/backfill-embeddings", post(backfill_checkpoint_embeddings))
+        .route(
+            "/api/v1/checkpoints/backfill-embeddings",
+            post(backfill_checkpoint_embeddings),
+        )
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/graph", get(graph_query))
         .route("/api/v1/activity", get(activity_stream))
@@ -665,7 +674,7 @@ async fn create_lesson(
 
     // Generate and store embedding if service available
     if let Some(ref embedding_service) = state.embeddings {
-        let embed_text = format!("{} {}", lesson.title, body.content);
+        let embed_text = crate::embeddings::lesson_embedding_text(&lesson.title, &body.content);
         match embedding_service.embed_one(embed_text).await {
             Ok(embedding) => {
                 let _ = state
@@ -806,13 +815,10 @@ async fn backfill_lesson_embeddings(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let all_lessons = state
-        .db()
-        .with_conn(storage::list_lessons)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to list lessons for backfill");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let all_lessons = state.db().with_conn(storage::list_lessons).map_err(|e| {
+        tracing::error!(error = %e, "Failed to list lessons for backfill");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut processed = 0usize;
     let mut skipped = 0usize;
@@ -823,9 +829,10 @@ async fn backfill_lesson_embeddings(
         let has_embedding = state
             .db()
             .with_conn(|conn| {
+                let table = storage::embedding_meta::active_tables(conn)?.lessons;
                 let count: i64 = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM lesson_embeddings WHERE id = ?",
+                        &format!("SELECT COUNT(*) FROM {table} WHERE id = ?"),
                         [&lesson.id],
                         |row| row.get(0),
                     )
@@ -839,14 +846,13 @@ async fn backfill_lesson_embeddings(
             continue;
         }
 
-        let embed_text = format!("{} {}", lesson.title, lesson.content);
+        let embed_text = crate::embeddings::lesson_embedding_text(&lesson.title, &lesson.content);
         match embedding_service.embed_one(embed_text).await {
             Ok(embedding) => {
                 let lesson_id = lesson.id.clone();
-                match state
-                    .db()
-                    .with_conn(move |conn| storage::store_lesson_embedding(conn, &lesson_id, &embedding))
-                {
+                match state.db().with_conn(move |conn| {
+                    storage::store_lesson_embedding(conn, &lesson_id, &embedding)
+                }) {
                     Ok(()) => processed += 1,
                     Err(e) => {
                         tracing::warn!(error = %e, lesson_id = %lesson.id, "Failed to store backfill embedding");
@@ -861,7 +867,13 @@ async fn backfill_lesson_embeddings(
         }
     }
 
-    tracing::info!(processed, skipped, failed, total = all_lessons.len(), "Lesson embedding backfill complete");
+    tracing::info!(
+        processed,
+        skipped,
+        failed,
+        total = all_lessons.len(),
+        "Lesson embedding backfill complete"
+    );
 
     Ok(Json(BackfillResponse {
         processed,
@@ -1106,7 +1118,8 @@ async fn create_checkpoint(
 
     if let Some(ref embedding_service) = state.embeddings {
         if embedding_service.is_initialized() {
-            let text_to_embed = checkpoint.working_on.clone();
+            let text_to_embed =
+                crate::embeddings::checkpoint_embedding_text(&checkpoint.working_on);
             match embedding_service.embed_one(text_to_embed).await {
                 Ok(embedding) => {
                     let _ = state.db().with_conn(|conn| {
@@ -1154,45 +1167,40 @@ async fn search_checkpoints(
                     let results = state
                         .db()
                         .with_conn(|conn| {
-                            storage::search_checkpoints_by_embedding(
-                                conn,
-                                &query_embedding,
-                                limit,
-                            )
+                            storage::search_checkpoints_by_embedding(conn, &query_embedding, limit)
                         })
                         .map_err(|e| {
                             tracing::error!(error = %e, "Checkpoint semantic search failed");
                             StatusCode::INTERNAL_SERVER_ERROR
                         })?;
 
-                    let checkpoints: Vec<CheckpointSearchEntry> = if let Some(ref agent) =
-                        params.agent
-                    {
-                        results
-                            .into_iter()
-                            .filter(|r| r.record.agent == *agent)
-                            .map(|r| CheckpointSearchEntry {
-                                id: r.record.id,
-                                agent: r.record.agent,
-                                working_on: r.record.working_on,
-                                state: r.record.state,
-                                created_at: r.record.created_at,
-                                score: Some(r.score),
-                            })
-                            .collect()
-                    } else {
-                        results
-                            .into_iter()
-                            .map(|r| CheckpointSearchEntry {
-                                id: r.record.id,
-                                agent: r.record.agent,
-                                working_on: r.record.working_on,
-                                state: r.record.state,
-                                created_at: r.record.created_at,
-                                score: Some(r.score),
-                            })
-                            .collect()
-                    };
+                    let checkpoints: Vec<CheckpointSearchEntry> =
+                        if let Some(ref agent) = params.agent {
+                            results
+                                .into_iter()
+                                .filter(|r| r.record.agent == *agent)
+                                .map(|r| CheckpointSearchEntry {
+                                    id: r.record.id,
+                                    agent: r.record.agent,
+                                    working_on: r.record.working_on,
+                                    state: r.record.state,
+                                    created_at: r.record.created_at,
+                                    score: Some(r.score),
+                                })
+                                .collect()
+                        } else {
+                            results
+                                .into_iter()
+                                .map(|r| CheckpointSearchEntry {
+                                    id: r.record.id,
+                                    agent: r.record.agent,
+                                    working_on: r.record.working_on,
+                                    state: r.record.state,
+                                    created_at: r.record.created_at,
+                                    score: Some(r.score),
+                                })
+                                .collect()
+                        };
 
                     let total = checkpoints.len();
                     return Ok(Json(CheckpointSearchResponse {
@@ -1281,9 +1289,10 @@ async fn backfill_checkpoint_embeddings(
         let has_embedding = state
             .db()
             .with_conn(|conn| {
+                let table = storage::embedding_meta::active_tables(conn)?.checkpoints;
                 let count: i64 = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM checkpoint_embeddings WHERE id = ?",
+                        &format!("SELECT COUNT(*) FROM {table} WHERE id = ?"),
                         [&cp.id],
                         |row| row.get(0),
                     )
@@ -1297,13 +1306,15 @@ async fn backfill_checkpoint_embeddings(
             continue;
         }
 
-        match embedding_service.embed_one(cp.working_on.clone()).await {
+        match embedding_service
+            .embed_one(crate::embeddings::checkpoint_embedding_text(&cp.working_on))
+            .await
+        {
             Ok(embedding) => {
                 let cp_id = cp.id.clone();
-                match state
-                    .db()
-                    .with_conn(move |conn| storage::store_checkpoint_embedding(conn, &cp_id, &embedding))
-                {
+                match state.db().with_conn(move |conn| {
+                    storage::store_checkpoint_embedding(conn, &cp_id, &embedding)
+                }) {
                     Ok(()) => processed += 1,
                     Err(e) => {
                         tracing::warn!(error = %e, checkpoint_id = %cp.id, "Failed to store checkpoint backfill embedding");
@@ -1318,7 +1329,13 @@ async fn backfill_checkpoint_embeddings(
         }
     }
 
-    tracing::info!(processed, skipped, failed, total = all_checkpoints.len(), "Checkpoint embedding backfill complete");
+    tracing::info!(
+        processed,
+        skipped,
+        failed,
+        total = all_checkpoints.len(),
+        "Checkpoint embedding backfill complete"
+    );
 
     Ok(Json(BackfillResponse {
         processed,

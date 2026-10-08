@@ -10,6 +10,22 @@ Semantic + structural + hybrid search, self-improving knowledge graph, automatic
 [![CI](https://github.com/mmorris35/nellie/actions/workflows/ci.yml/badge.svg)](https://github.com/mmorris35/nellie/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+## What's new in 0.5.3: full-length embeddings
+
+**Fix:** Nellie was embedding only the first 128 tokens of each lesson, checkpoint and code chunk, because the bundled `tokenizer.json` for all-MiniLM-L6-v2 truncates at 128 and Nellie inherited that setting. Nellie now sets truncation itself and embeds up to 256 tokens, with the end-of-sequence (`[SEP]`) token kept intact.
+
+Measured on a retrieval eval of 40 known-answer queries over ~2,400 real lessons (same model; only the truncation changed):
+
+| | before | after |
+|---|---|---|
+| recall@1 | 0.38 | 0.47 |
+| recall@5 | 0.62 | 0.70 |
+| recall@10 | 0.70 | 0.80 |
+
+Nellie now also records which embedding settings built its vector index, and will not mix vectors built with different settings.
+
+**Upgrade note:** existing installs must run `nellie reembed` once, with Nellie stopped. Until then Nellie refuses to start, so old and new vectors are never mixed. Expect roughly 3 minutes per 1,000 lessons, checkpoints and code chunks (about 6 items/s measured on lesson-sized text on a 4-core machine). `reembed` is safe to interrupt and rerun, and the old index is kept for rollback (reinstall the previous version to use it). Once you're happy, `nellie reembed --drop-old` removes the old index.
+
 ## Why "middleware," not "memory store"?
 
 Context engineering — the practice of designing what information a model sees on each prompt — is usually done *inside* the agent: subagent spawning, model-initiated tool calls, in-loop context-window management. Every framework reimplements its own version.
@@ -403,6 +419,9 @@ nellie setup [--skip-runtime] [--skip-model] [--data-dir DIR]
 
 # Indexing — index a directory of code
 nellie index <path> [--local]  # --local forces local embeddings (no server needed)
+
+# Re-embed — rebuild the vector index with the current embedding settings (Nellie stopped)
+nellie reembed [--drop-old] [--embedding-threads N] [--batch-size N]
 
 # Deep Hooks — Claude Code native memory integration
 nellie sync [--rules] [--dry-run] [--budget N] [--server URL]

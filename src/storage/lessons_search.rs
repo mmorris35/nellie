@@ -2,29 +2,23 @@
 
 use rusqlite::Connection;
 
+use super::embedding_meta::{active_tables, ensure_vector_tables};
 use super::models::{LessonRecord, SearchResult};
 use crate::error::StorageError;
 use crate::Result;
 
-const LESSON_VEC_TABLE: &str = "lesson_embeddings";
+/// Name of the active lesson vector table (see `embedding_meta`).
+fn lesson_vec_table(conn: &Connection) -> Result<&'static str> {
+    Ok(active_tables(conn)?.lessons)
+}
 
-/// Initialize lesson vector table.
+/// Initialize the active vector tables (chunks, lessons, checkpoints).
 ///
 /// # Errors
 ///
-/// Returns an error if the table cannot be created.
+/// Returns an error if the tables cannot be created.
 pub fn init_lesson_vectors(conn: &Connection) -> Result<()> {
-    let sql = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {LESSON_VEC_TABLE} USING vec0(
-            id TEXT PRIMARY KEY,
-            embedding FLOAT[384]
-        )"
-    );
-
-    conn.execute(&sql, [])
-        .map_err(|e| StorageError::Vector(format!("failed to create lesson vec table: {e}")))?;
-
-    Ok(())
+    ensure_vector_tables(conn)
 }
 
 /// Store lesson embedding.
@@ -33,17 +27,16 @@ pub fn init_lesson_vectors(conn: &Connection) -> Result<()> {
 ///
 /// Returns an error if the embedding cannot be stored.
 pub fn store_lesson_embedding(conn: &Connection, lesson_id: &str, embedding: &[f32]) -> Result<()> {
+    let table = lesson_vec_table(conn)?;
+
     // Delete old embedding if exists
-    conn.execute(
-        &format!("DELETE FROM {LESSON_VEC_TABLE} WHERE id = ?"),
-        [lesson_id],
-    )
-    .ok();
+    conn.execute(&format!("DELETE FROM {table} WHERE id = ?"), [lesson_id])
+        .ok();
 
     // Insert new embedding
     let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
     conn.execute(
-        &format!("INSERT INTO {LESSON_VEC_TABLE} (id, embedding) VALUES (?, ?)"),
+        &format!("INSERT INTO {table} (id, embedding) VALUES (?, ?)"),
         rusqlite::params![lesson_id, blob],
     )
     .map_err(|e| StorageError::Vector(format!("failed to store lesson embedding: {e}")))?;
@@ -66,8 +59,9 @@ pub fn search_lessons_by_embedding(
         .flat_map(|f| f.to_le_bytes())
         .collect();
 
+    let table = lesson_vec_table(conn)?;
     let sql = format!(
-        "SELECT id, distance FROM {LESSON_VEC_TABLE} WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
+        "SELECT id, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
     );
 
     let mut stmt = conn

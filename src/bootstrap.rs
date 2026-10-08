@@ -271,7 +271,8 @@ pub async fn run_bootstrap(
 
         // Generate and store embedding if service is available
         if let Some(ref svc) = embedding_service {
-            let embed_text = format!("{} {}", parsed.title, parsed.content);
+            let embed_text =
+                crate::embeddings::lesson_embedding_text(&parsed.title, &parsed.content);
             match svc.embed_one(embed_text).await {
                 Ok(embedding) => {
                     if let Err(e) =

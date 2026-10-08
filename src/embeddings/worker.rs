@@ -8,7 +8,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use ort::session::Session;
 use ort::value::Value;
 use parking_lot::Mutex;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 use super::model::{EMBEDDING_DIM, MAX_SEQ_LENGTH};
 use crate::error::EmbeddingError;
@@ -163,12 +163,18 @@ fn process_request(
         .map_err(|e| EmbeddingError::Tokenization(format!("failed to tokenize: {e}")))?;
 
     let batch_size = encodings.len();
+    // Truncation happens inside the tokenizer (see `configure_tokenizer`), so
+    // every encoding already ends with [SEP] and fits the model. Never cut ids
+    // here: slicing after tokenization would drop the trailing [SEP].
     let max_len = encodings
         .iter()
         .map(|e| e.get_ids().len())
         .max()
-        .unwrap_or(0)
-        .min(MAX_SEQ_LENGTH);
+        .unwrap_or(0);
+    debug_assert!(
+        max_len <= MAX_SEQ_LENGTH,
+        "tokenizer produced {max_len} ids; truncation is not configured"
+    );
 
     // Create padded input vectors (i64 is standard for BERT-like models)
     let mut input_ids_vec: Vec<i64> = vec![0; batch_size * max_len];
@@ -281,19 +287,164 @@ fn mean_pool_embedding(
     sum
 }
 
-/// Load tokenizer from file.
+/// Load tokenizer from file, with Nellie's truncation and padding applied.
 ///
 /// # Errors
 ///
-/// Returns an error if the tokenizer cannot be loaded.
+/// Returns an error if the tokenizer cannot be loaded or configured.
 pub fn load_tokenizer(path: impl AsRef<std::path::Path>) -> Result<Tokenizer> {
-    Tokenizer::from_file(path.as_ref())
-        .map_err(|e| EmbeddingError::Tokenization(format!("failed to load tokenizer: {e}")).into())
+    let mut tokenizer = Tokenizer::from_file(path.as_ref())
+        .map_err(|e| EmbeddingError::Tokenization(format!("failed to load tokenizer: {e}")))?;
+    configure_tokenizer(&mut tokenizer)?;
+    Ok(tokenizer)
+}
+
+/// Apply Nellie's truncation and padding settings to a tokenizer.
+///
+/// Rule: never inherit truncation or padding from `tokenizer.json`. The file
+/// shipped with all-MiniLM-L6-v2 truncates at 128 tokens and pads to a fixed
+/// 128, which silently caps what gets embedded. Truncation is set here, inside
+/// the tokenizer, so the post-processor still adds [CLS] ... [SEP] around the
+/// truncated text. Padding is disabled; the worker pads each batch itself and
+/// masks the padding out of mean pooling.
+///
+/// # Errors
+///
+/// Returns an error if the truncation parameters are rejected.
+pub fn configure_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: MAX_SEQ_LENGTH,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+            direction: TruncationDirection::Right,
+        }))
+        .map_err(|e| EmbeddingError::Tokenization(format!("failed to set truncation: {e}")))?;
+    tokenizer.with_padding(None);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CLS_ID: u32 = 101;
+    const SEP_ID: u32 = 102;
+
+    /// A tiny word-level tokenizer serialised with the same truncation,
+    /// padding and post-processor settings as the all-MiniLM-L6-v2 file.
+    fn synthetic_tokenizer_json(dir: &std::path::Path) -> std::path::PathBuf {
+        let json = r#"{
+          "version": "1.0",
+          "truncation": {"direction": "Right", "max_length": 128, "strategy": "LongestFirst", "stride": 0},
+          "padding": {"strategy": {"Fixed": 128}, "direction": "Right", "pad_to_multiple_of": null,
+                      "pad_id": 0, "pad_type_id": 0, "pad_token": "[PAD]"},
+          "added_tokens": [],
+          "normalizer": null,
+          "pre_tokenizer": {"type": "WhitespaceSplit"},
+          "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                       {"Sequence": {"id": "A", "type_id": 0}},
+                       {"SpecialToken": {"id": "[SEP]", "type_id": 0}}],
+            "pair": [{"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                     {"Sequence": {"id": "A", "type_id": 0}},
+                     {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+                     {"Sequence": {"id": "B", "type_id": 1}},
+                     {"SpecialToken": {"id": "[SEP]", "type_id": 1}}],
+            "special_tokens": {
+              "[CLS]": {"id": "[CLS]", "ids": [101], "tokens": ["[CLS]"]},
+              "[SEP]": {"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}
+            }
+          },
+          "decoder": null,
+          "model": {"type": "WordLevel",
+                    "vocab": {"[PAD]": 0, "[UNK]": 1, "word": 2, "[CLS]": 101, "[SEP]": 102},
+                    "unk_token": "[UNK]"}
+        }"#;
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn long_text(words: usize) -> String {
+        vec!["word"; words].join(" ")
+    }
+
+    fn assert_truncated_with_sep(tokenizer: &Tokenizer, cls: u32, sep: u32) {
+        let enc = tokenizer.encode(long_text(1000), true).unwrap();
+        let ids = enc.get_ids();
+        assert_eq!(ids.len(), MAX_SEQ_LENGTH);
+        assert_eq!(ids[0], cls);
+        assert_eq!(*ids.last().unwrap(), sep, "[SEP] must be the last token");
+        assert!(enc.get_attention_mask().iter().all(|&m| m == 1));
+    }
+
+    #[test]
+    fn test_shipped_settings_would_truncate_at_128() {
+        // Documents the bug: inheriting the file's settings caps input at 128.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = Tokenizer::from_file(synthetic_tokenizer_json(dir.path())).unwrap();
+        let enc = raw.encode(long_text(1000), true).unwrap();
+        assert_eq!(enc.get_ids().len(), 128);
+    }
+
+    #[test]
+    fn test_load_tokenizer_truncates_to_256_keeping_sep() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = load_tokenizer(synthetic_tokenizer_json(dir.path())).unwrap();
+        assert_truncated_with_sep(&tokenizer, CLS_ID, SEP_ID);
+    }
+
+    #[test]
+    fn test_load_tokenizer_does_not_pad() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = load_tokenizer(synthetic_tokenizer_json(dir.path())).unwrap();
+        let enc = tokenizer.encode("word word", true).unwrap();
+        assert_eq!(enc.get_ids(), &[CLS_ID, 2, 2, SEP_ID]);
+        assert_eq!(enc.get_attention_mask(), &[1, 1, 1, 1]);
+    }
+
+    /// Path of the real all-MiniLM-L6-v2 tokenizer.json, if provided.
+    fn real_tokenizer_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("NELLIE_TEST_TOKENIZER").map(std::path::PathBuf::from)
+    }
+
+    #[test]
+    fn test_real_tokenizer_truncation_and_padding() {
+        let Some(path) = real_tokenizer_path() else {
+            eprintln!("NELLIE_TEST_TOKENIZER not set; skipping");
+            return;
+        };
+        let tokenizer = load_tokenizer(&path).unwrap();
+        let cls = tokenizer.token_to_id("[CLS]").unwrap();
+        let sep = tokenizer.token_to_id("[SEP]").unwrap();
+        assert_truncated_with_sep(&tokenizer, cls, sep);
+
+        let short = tokenizer.encode("hello world", true).unwrap();
+        assert_eq!(short.get_ids().len(), 4, "short input must not be padded");
+        assert_eq!(*short.get_ids().last().unwrap(), sep);
+    }
+
+    #[test]
+    fn test_real_tokenizer_newline_and_space_join_are_identical() {
+        // Older insert paths joined lesson title and content with "\n", others
+        // with " ". The BERT normaliser treats both as whitespace, so the
+        // shared `lesson_embedding_text` format embeds identically.
+        let Some(path) = real_tokenizer_path() else {
+            eprintln!("NELLIE_TEST_TOKENIZER not set; skipping");
+            return;
+        };
+        let tokenizer = load_tokenizer(&path).unwrap();
+        let a = tokenizer.encode("Title here\nSome content", true).unwrap();
+        let b = tokenizer
+            .encode(
+                crate::embeddings::lesson_embedding_text("Title here", "Some content"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(a.get_ids(), b.get_ids());
+    }
 
     #[test]
     fn test_mean_pool_embedding() {

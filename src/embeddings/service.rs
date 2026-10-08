@@ -5,11 +5,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tokenizers::Tokenizer;
 use tokio::sync::RwLock;
 
 use super::model::EmbeddingModel;
-use super::worker::EmbeddingWorker;
+use super::worker::{load_tokenizer, EmbeddingWorker};
 use crate::error::EmbeddingError;
 use crate::Result;
 
@@ -94,11 +93,8 @@ impl EmbeddingService {
             let session = model.session();
             drop(model);
 
-            // Load tokenizer
-            let tokenizer =
-                Tokenizer::from_file(&self.inner.config.tokenizer_path).map_err(|e| {
-                    EmbeddingError::Tokenization(format!("failed to load tokenizer: {e}"))
-                })?;
+            // Load tokenizer (truncation/padding set by Nellie, not the file)
+            let tokenizer = load_tokenizer(&self.inner.config.tokenizer_path)?;
 
             // Create worker pool
             let worker =
@@ -223,6 +219,63 @@ mod tests {
             "/var/lib/nellie/models/tokenizer.json"
         );
         assert_eq!(config.num_workers, 4);
+    }
+
+    /// Embedding service on the real all-MiniLM-L6-v2 files, if provided
+    /// via `NELLIE_TEST_MODEL` and `NELLIE_TEST_TOKENIZER`.
+    async fn real_service() -> Option<EmbeddingService> {
+        let model_path = std::env::var_os("NELLIE_TEST_MODEL")?;
+        let tokenizer_path = std::env::var_os("NELLIE_TEST_TOKENIZER")?;
+        if let Err(e) = super::super::version::check_ort_version() {
+            panic!("NELLIE_TEST_MODEL is set but ONNX Runtime cannot be loaded: {e}");
+        }
+        let service = EmbeddingService::new(EmbeddingConfig {
+            model_path: model_path.into(),
+            tokenizer_path: tokenizer_path.into(),
+            num_workers: 1,
+        });
+        service.init().await.unwrap();
+        Some(service)
+    }
+
+    fn words(n: usize) -> String {
+        vec!["river"; n].join(" ")
+    }
+
+    #[tokio::test]
+    async fn test_real_model_embeds_up_to_256_tokens() {
+        let Some(service) = real_service().await else {
+            eprintln!("NELLIE_TEST_MODEL/NELLIE_TEST_TOKENIZER not set; skipping");
+            return;
+        };
+        let embed = |head: usize, tail: &str| {
+            let service = service.clone();
+            let text = format!("{} {tail}", words(head));
+            async move { service.embed_one(text).await.unwrap() }
+        };
+
+        // Texts that differ only after token ~150 embed differently (the old
+        // 128-token cap made them identical).
+        let a = embed(150, "apples oranges bananas").await;
+        let b = embed(150, "rockets engines satellites").await;
+        assert!(a.iter().zip(&b).any(|(x, y)| (x - y).abs() > 1e-4));
+
+        // Texts that differ only after token 256 embed identically.
+        let c = embed(300, "apples oranges bananas").await;
+        let d = embed(300, "rockets engines satellites").await;
+        assert!(c.iter().zip(&d).all(|(x, y)| (x - y).abs() < 1e-6));
+
+        // A short text embeds the same alone and batched with a long one:
+        // batch padding is masked out.
+        let short = service.embed_one("hello world".to_string()).await.unwrap();
+        let batch = service
+            .embed_batch(vec!["hello world".to_string(), words(400)])
+            .await
+            .unwrap();
+        assert!(short
+            .iter()
+            .zip(&batch[0])
+            .all(|(x, y)| (x - y).abs() < 1e-4));
     }
 
     #[test]

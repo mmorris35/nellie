@@ -285,7 +285,7 @@ impl NellieMcpHandler {
         // Generate and store embedding if available
         if let Some(ref embeddings) = self.embeddings {
             if embeddings.is_initialized() {
-                let text = format!("{}\n{}", lesson.title, lesson.content);
+                let text = crate::embeddings::lesson_embedding_text(&lesson.title, &lesson.content);
                 let embeddings_clone = embeddings.clone();
                 let lesson_id = lesson.id;
                 let db = self.db.clone();
@@ -341,7 +341,7 @@ impl NellieMcpHandler {
         // Generate and store embedding if available
         if let Some(ref embeddings) = self.embeddings {
             if embeddings.is_initialized() {
-                let text = checkpoint.working_on;
+                let text = crate::embeddings::checkpoint_embedding_text(&checkpoint.working_on);
                 let embeddings_clone = embeddings.clone();
                 let checkpoint_id = checkpoint.id;
                 let db = self.db.clone();

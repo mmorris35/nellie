@@ -49,6 +49,7 @@ pub mod config;
 pub mod embeddings;
 pub mod error;
 pub mod graph;
+pub mod reembed;
 pub mod server;
 pub mod setup;
 pub mod storage;
