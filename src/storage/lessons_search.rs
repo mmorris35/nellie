@@ -106,6 +106,10 @@ pub const LESSON_RRF_K: f32 = 60.0;
 /// both lists start to outrank the top hit of one list.
 pub const LESSON_MIN_CANDIDATES: usize = 10;
 
+/// Upper bound on results from one lesson search (matches the largest
+/// configurable REST result limit).
+const LESSON_MAX_RESULTS: usize = 100_000;
+
 /// Maximum number of query words passed to the full-text index.
 const MAX_KEYWORD_TERMS: usize = 32;
 
@@ -274,6 +278,9 @@ pub fn search_lessons_hybrid(
     query_embedding: Option<&[f32]>,
     limit: usize,
 ) -> Result<Vec<LessonSearchHit>> {
+    // Callers pass a request-supplied limit; bound it so neither the SQL
+    // depth nor the result allocation can be driven arbitrarily high.
+    let limit = limit.min(LESSON_MAX_RESULTS);
     let depth = limit.max(LESSON_MIN_CANDIDATES);
     let keyword = search_lessons_by_keyword(conn, query, depth)?;
     let vector: Vec<(String, f32)> = match query_embedding {
@@ -315,7 +322,7 @@ pub fn search_lessons_hybrid(
     fused.truncate(limit);
 
     let best = 2.0 * rrf(1);
-    let mut results = Vec::with_capacity(fused.len());
+    let mut results = Vec::new();
     for (id, f) in fused {
         let Ok(record) = super::lessons::get_lesson(conn, id) else {
             continue;
