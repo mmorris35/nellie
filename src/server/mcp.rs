@@ -1697,10 +1697,12 @@ async fn handle_search_lessons(
         .await
         .map_err(|e| format!("Failed to generate query embedding: {e}"))?;
 
-    // Search lessons using vector similarity
+    // Fuse keyword and vector rankings (see storage::search_lessons_hybrid)
     let lessons = state
         .db
-        .with_conn(|conn| crate::storage::search_lessons_by_embedding(conn, &embedding, limit))
+        .with_conn(|conn| {
+            crate::storage::search_lessons_hybrid(conn, query, Some(&embedding), limit)
+        })
         .map_err(|e| e.to_string())?;
 
     Ok(serde_json::to_value(&lessons).unwrap_or_default())

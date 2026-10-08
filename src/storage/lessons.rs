@@ -2,6 +2,7 @@
 
 use rusqlite::{params, Connection};
 
+use super::lessons_search::retry_on_schema_change;
 use super::models::LessonRecord;
 use crate::error::StorageError;
 use crate::Result;
@@ -15,21 +16,23 @@ pub fn insert_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
     let tags_json = serde_json::to_string(&lesson.tags)
         .map_err(|e| StorageError::Database(format!("failed to serialize tags: {e}")))?;
 
-    conn.execute(
-        "INSERT INTO lessons (id, title, content, tags, severity, agent, repo, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![
-            lesson.id,
-            lesson.title,
-            lesson.content,
-            tags_json,
-            lesson.severity,
-            lesson.agent,
-            lesson.repo,
-            lesson.created_at,
-            lesson.updated_at,
-        ],
-    )
+    retry_on_schema_change(conn, || {
+        conn.execute(
+            "INSERT INTO lessons (id, title, content, tags, severity, agent, repo, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                lesson.id,
+                lesson.title,
+                lesson.content,
+                tags_json,
+                lesson.severity,
+                lesson.agent,
+                lesson.repo,
+                lesson.created_at,
+                lesson.updated_at,
+            ],
+        )
+    })
     .map_err(|e| StorageError::Database(format!("failed to insert lesson: {e}")))?;
 
     tracing::trace!(id = %lesson.id, "Inserted lesson");
@@ -89,8 +92,8 @@ pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
         .as_secs();
     let now_i64 = i64::try_from(now).unwrap_or_default();
 
-    let rows = conn
-        .execute(
+    let rows = retry_on_schema_change(conn, || {
+        conn.execute(
             "UPDATE lessons SET title = ?, content = ?, tags = ?, severity = ?, updated_at = ?
              WHERE id = ?",
             params![
@@ -102,7 +105,8 @@ pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
                 lesson.id
             ],
         )
-        .map_err(|e| StorageError::Database(format!("failed to update lesson: {e}")))?;
+    })
+    .map_err(|e| StorageError::Database(format!("failed to update lesson: {e}")))?;
 
     if rows == 0 {
         return Err(StorageError::NotFound {
@@ -121,9 +125,10 @@ pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
 ///
 /// Returns an error if the lesson is not found or database deletion fails.
 pub fn delete_lesson(conn: &Connection, id: &str) -> Result<()> {
-    let rows = conn
-        .execute("DELETE FROM lessons WHERE id = ?", [id])
-        .map_err(|e| StorageError::Database(format!("failed to delete lesson: {e}")))?;
+    let rows = retry_on_schema_change(conn, || {
+        conn.execute("DELETE FROM lessons WHERE id = ?", [id])
+    })
+    .map_err(|e| StorageError::Database(format!("failed to delete lesson: {e}")))?;
 
     if rows == 0 {
         return Err(StorageError::NotFound {

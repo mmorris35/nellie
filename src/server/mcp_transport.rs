@@ -210,9 +210,10 @@ impl NellieMcpHandler {
         }
 
         let embeddings_clone = embeddings.clone();
+        let query_text = req.query.clone();
         let embedding = match std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(async { embeddings_clone.embed_one(req.query.clone()).await })
+            rt.block_on(async { embeddings_clone.embed_one(query_text).await })
         })
         .join()
         {
@@ -223,10 +224,9 @@ impl NellieMcpHandler {
             Err(_) => return serde_json::json!({"error": "Embedding thread panicked"}).to_string(),
         };
 
-        match self
-            .db
-            .with_conn(|conn| crate::storage::search_lessons_by_embedding(conn, &embedding, limit))
-        {
+        match self.db.with_conn(|conn| {
+            crate::storage::search_lessons_hybrid(conn, &req.query, Some(&embedding), limit)
+        }) {
             Ok(lessons) => serde_json::to_string(&lessons).unwrap_or_else(|_| "[]".to_string()),
             Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
         }
