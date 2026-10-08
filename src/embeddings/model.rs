@@ -34,6 +34,18 @@ impl EmbeddingModel {
     ///
     /// Returns an error if the model cannot be loaded.
     pub fn load(model_path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_threads(model_path, 1)
+    }
+
+    /// Load the model with a session that may use `intra_threads` threads
+    /// for each inference. The session runs one inference at a time, so this
+    /// is what makes a single large job (such as `nellie reembed`) use
+    /// several cores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model cannot be loaded.
+    pub fn load_with_threads(model_path: impl AsRef<Path>, intra_threads: usize) -> Result<Self> {
         let model_path = model_path.as_ref().to_path_buf();
 
         if !model_path.exists() {
@@ -50,7 +62,7 @@ impl EmbeddingModel {
             .map_err(|e| EmbeddingError::Runtime(format!("failed to create session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| EmbeddingError::Runtime(format!("failed to set optimization level: {e}")))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads.max(1))
             .map_err(|e| EmbeddingError::Runtime(format!("failed to set threads: {e}")))?
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelLoad(format!("failed to load model: {e}")))?;

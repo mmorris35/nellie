@@ -23,6 +23,11 @@ pub struct EmbeddingConfig {
 
     /// Number of worker threads.
     pub num_workers: usize,
+
+    /// Threads ONNX Runtime may use for one inference. The workers share one
+    /// session, which runs one inference at a time, so this (not
+    /// `num_workers`) is what spreads embedding over several cores.
+    pub intra_threads: usize,
 }
 
 impl EmbeddingConfig {
@@ -37,6 +42,7 @@ impl EmbeddingConfig {
             model_path: models_dir.join("all-MiniLM-L6-v2.onnx"),
             tokenizer_path: models_dir.join("tokenizer.json"),
             num_workers,
+            intra_threads: 1,
         }
     }
 }
@@ -89,16 +95,17 @@ impl EmbeddingService {
 
             // Load model and extract session (drop model so Arc refcount = 1
             // for try_unwrap in the worker pool)
-            let model = EmbeddingModel::load(&self.inner.config.model_path)?;
+            let config = &self.inner.config;
+            let model =
+                EmbeddingModel::load_with_threads(&config.model_path, config.intra_threads)?;
             let session = model.session();
             drop(model);
 
             // Load tokenizer (truncation/padding set by Nellie, not the file)
-            let tokenizer = load_tokenizer(&self.inner.config.tokenizer_path)?;
+            let tokenizer = load_tokenizer(&config.tokenizer_path)?;
 
             // Create worker pool
-            let worker =
-                EmbeddingWorker::new(session, Arc::new(tokenizer), self.inner.config.num_workers)?;
+            let worker = EmbeddingWorker::new(session, Arc::new(tokenizer), config.num_workers)?;
 
             *worker_guard = Some(worker);
         }
@@ -233,6 +240,7 @@ mod tests {
             model_path: model_path.into(),
             tokenizer_path: tokenizer_path.into(),
             num_workers: 1,
+            intra_threads: 1,
         });
         service.init().await.unwrap();
         Some(service)

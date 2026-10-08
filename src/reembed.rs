@@ -7,6 +7,16 @@
 //! on its own. When every row is present, one transaction makes the new
 //! tables active in `embedding_meta`. Old tables are kept unless
 //! `--drop-old` is given.
+//!
+//! With `--no-switch` the new tables are built while an older Nellie keeps
+//! serving the database: every write is a short transaction, and the active
+//! tables are left alone. The time the build started is kept in
+//! `reembed_state`. The switching run (Nellie stopped) then catches up with
+//! what changed meanwhile: it removes vectors whose row was deleted,
+//! re-embeds lessons edited since the build started, embeds rows added since,
+//! and switches only when the new tables match the stored rows exactly.
+//! Checkpoints are never edited, and changed code files get new chunk rows
+//! with fresh ids, so for those adding and removing rows is enough.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
@@ -111,6 +121,9 @@ pub struct ReembedOptions {
     pub concurrency: usize,
     /// Drop vector tables that are no longer active once the switch is done.
     pub drop_old: bool,
+    /// Make the new tables active once they are complete. Without it the
+    /// new tables are only built, which is safe while a server is running.
+    pub switch: bool,
 }
 
 impl Default for ReembedOptions {
@@ -119,6 +132,7 @@ impl Default for ReembedOptions {
             batch_size: 16,
             concurrency: 4,
             drop_old: false,
+            switch: true,
         }
     }
 }
@@ -152,6 +166,11 @@ pub struct KindReport {
     /// Vectors in the previously active table with no stored row to rebuild
     /// them from (left over from deleted items). They are not carried over.
     pub orphaned_old_vectors: u64,
+    /// Vectors removed from the new table because their row was deleted
+    /// after they were embedded.
+    pub orphans_removed: u64,
+    /// Lessons re-embedded because they were edited after the build started.
+    pub refreshed: u64,
     /// Rows that could not be embedded: `(id, error)`. While any remain the
     /// index is not switched.
     pub failed: Vec<(String, String)>,
@@ -170,6 +189,9 @@ pub struct ReembedReport {
     pub active_tables: VectorTables,
     /// Whether this run switched the active tables.
     pub switched: bool,
+    /// When the build of the new tables started (Unix seconds), if they are
+    /// not active yet.
+    pub build_started_at: Option<i64>,
     /// Tables dropped by `--drop-old`.
     pub dropped: Vec<&'static str>,
     /// Lessons.
@@ -234,17 +256,120 @@ fn has_vector(conn: &Connection, table: &str, id: &Value) -> Result<bool> {
     .map_err(|e| db_err("failed to check vector", &e))
 }
 
-fn insert_vectors(conn: &Connection, table: &str, rows: &[(Value, Vec<f32>)]) -> Result<()> {
+/// Insert vectors, skipping ids that already have one or whose row has been
+/// deleted meanwhile (a server may write the same tables). Returns how many
+/// were inserted. Run inside a transaction.
+fn insert_vectors(
+    conn: &Connection,
+    kind: Kind,
+    table: &str,
+    rows: &[(Value, Vec<f32>)],
+) -> Result<u64> {
     let sql = format!("INSERT INTO {table} (id, embedding) VALUES (?, ?)");
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| db_err("failed to prepare insert", &e))?;
+    let mut inserted = 0;
     for (id, embedding) in rows {
+        if has_vector(conn, table, id)? || !has_source(conn, kind, id)? {
+            continue;
+        }
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         stmt.execute(rusqlite::params![id, blob])
             .map_err(|e| db_err("failed to insert vector", &e))?;
+        inserted += 1;
     }
-    Ok(())
+    Ok(inserted)
+}
+
+fn has_source(conn: &Connection, kind: Kind, id: &Value) -> Result<bool> {
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?)",
+            kind.source_table()
+        ),
+        [id],
+        |r| r.get(0),
+    )
+    .map_err(|e| db_err("failed to check source row", &e))
+}
+
+/// Vectors in `table` whose source row no longer exists.
+fn orphan_count(conn: &Connection, kind: Kind, table: &str) -> Result<u64> {
+    let src = kind.source_table();
+    count(
+        conn,
+        &format!("SELECT COUNT(*) FROM {table} WHERE id NOT IN (SELECT id FROM {src})"),
+    )
+}
+
+/// Delete the vectors with these ids from `table`.
+fn delete_vectors(conn: &Connection, table: &str, ids: &[Value]) -> Result<u64> {
+    let mut stmt = conn
+        .prepare(&format!("DELETE FROM {table} WHERE id = ?"))
+        .map_err(|e| db_err("failed to prepare delete", &e))?;
+    let mut deleted = 0;
+    for id in ids {
+        deleted += stmt
+            .execute([id])
+            .map_err(|e| db_err("failed to delete vector", &e))?;
+    }
+    Ok(deleted as u64)
+}
+
+fn select_ids(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Value>> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| db_err("failed to prepare id query", &e))?;
+    let ids = stmt
+        .query_map(params, |r| r.get::<_, Value>(0))
+        .map_err(|e| db_err("failed to read ids", &e))?;
+    ids.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| db_err("failed to read id", &e))
+}
+
+/// Remove vectors in `table` whose source row has been deleted.
+fn remove_orphans(db: &Database, kind: Kind, table: &str) -> Result<u64> {
+    let src = kind.source_table();
+    db.with_transaction(|conn| {
+        let ids = select_ids(
+            conn,
+            &format!("SELECT id FROM {table} WHERE id NOT IN (SELECT id FROM {src})"),
+            [],
+        )?;
+        delete_vectors(conn, table, &ids)
+    })
+}
+
+/// Remove the vectors of lessons edited at or after `since`, so they are
+/// embedded again from their current text.
+fn remove_edited_lessons(db: &Database, table: &str, since: i64) -> Result<u64> {
+    db.with_transaction(|conn| {
+        let ids = select_ids(
+            conn,
+            &format!(
+                "SELECT id FROM lessons WHERE updated_at >= ? AND id IN (SELECT id FROM {table})"
+            ),
+            [since],
+        )?;
+        delete_vectors(conn, table, &ids)
+    })
+}
+
+/// Record when building `target` started, keeping the earliest time if an
+/// earlier run already started it. Returns the recorded time.
+fn record_build_start(conn: &Connection, target: &VectorTables) -> Result<i64> {
+    conn.execute(
+        "INSERT OR IGNORE INTO reembed_state (lesson_table, started_at) VALUES (?, ?)",
+        rusqlite::params![target.lessons, chrono::Utc::now().timestamp()],
+    )
+    .map_err(|e| db_err("failed to record reembed start", &e))?;
+    conn.query_row(
+        "SELECT started_at FROM reembed_state WHERE lesson_table = ?",
+        [target.lessons],
+        |r| r.get(0),
+    )
+    .map_err(|e| db_err("failed to read reembed start", &e))
 }
 
 fn id_string(id: &Value) -> String {
@@ -371,9 +496,7 @@ async fn reembed_kind<E: Embedder>(
                 }
             }
         }
-        db.with_transaction(|conn| insert_vectors(conn, target, &rows))?;
-
-        report.embedded += rows.len() as u64;
+        report.embedded += db.with_transaction(|conn| insert_vectors(conn, kind, target, &rows))?;
         progress(&Progress {
             kind,
             done: report.skipped + report.embedded,
@@ -395,7 +518,9 @@ async fn reembed_kind<E: Embedder>(
 ///
 /// The caller must have recorded the existing index's spec first (see
 /// `embedding_meta::bootstrap_meta`) and must hold the exclusive
-/// [`DbLock`] so no server writes meanwhile.
+/// [`DbLock`] so no server of this version writes meanwhile. With
+/// `opts.switch` unset, an older server (which takes no lock) may keep
+/// writing; the switching run catches up with its changes.
 ///
 /// # Errors
 ///
@@ -414,32 +539,72 @@ pub async fn run_reembed<E: Embedder>(
 
     // If the active tables already match the current spec, top them up in
     // place; otherwise build the tables named for the current spec.
-    let target = if before.spec == current {
+    let in_place = before.spec == current;
+    let target = if in_place {
         before.tables
     } else {
         CURRENT_TABLES
     };
+    let mut report = ReembedReport {
+        previous_spec: before.spec.clone(),
+        previous_tables: before.tables,
+        active_tables: before.tables,
+        switched: false,
+        build_started_at: None,
+        dropped: Vec::new(),
+        lessons: KindReport::default(),
+        checkpoints: KindReport::default(),
+        chunks: KindReport::default(),
+    };
+    if in_place && !opts.switch {
+        // The active tables are what a running server writes; nothing to
+        // pre-build.
+        return Ok(report);
+    }
+
     db.with_conn(|conn| create_vector_tables(conn, &target))?;
+    if !in_place {
+        report.build_started_at =
+            Some(db.with_transaction(|conn| record_build_start(conn, &target))?);
+    }
 
     let mut reports = Vec::with_capacity(3);
     for kind in Kind::ALL {
-        reports.push(
-            reembed_kind(
-                db,
-                embedder,
-                kind,
-                kind.vector_table(&target),
-                kind.vector_table(&before.tables),
-                opts,
-                progress,
-            )
-            .await?,
-        );
+        let table = kind.vector_table(&target);
+        // Catch up with deletions and edits made while the tables were built.
+        // Only the switching run needs this; it runs with Nellie stopped.
+        let (orphans_removed, refreshed) = if opts.switch {
+            let orphans = remove_orphans(db, kind, table)?;
+            let edited = match (kind, report.build_started_at) {
+                (Kind::Lessons, Some(since)) => remove_edited_lessons(db, table, since)?,
+                _ => 0,
+            };
+            (orphans, edited)
+        } else {
+            (0, 0)
+        };
+        let mut r = reembed_kind(
+            db,
+            embedder,
+            kind,
+            table,
+            kind.vector_table(&before.tables),
+            opts,
+            progress,
+        )
+        .await?;
+        r.orphans_removed = orphans_removed;
+        r.refreshed = refreshed;
+        reports.push(r);
     }
+    let mut kinds = reports.into_iter();
+    report.lessons = kinds.next().unwrap_or_default();
+    report.checkpoints = kinds.next().unwrap_or_default();
+    report.chunks = kinds.next().unwrap_or_default();
 
     let failed: Vec<String> = Kind::ALL
         .iter()
-        .zip(&reports)
+        .zip([&report.lessons, &report.checkpoints, &report.chunks])
         .flat_map(|(kind, r)| {
             r.failed
                 .iter()
@@ -454,18 +619,30 @@ pub async fn run_reembed<E: Embedder>(
             failed.join("\n  ")
         )));
     }
+    if !opts.switch {
+        return Ok(report);
+    }
 
-    // One transaction: verify completeness, then switch.
-    let switched = db.with_transaction(|conn| {
+    // One transaction: verify the new tables match the stored rows exactly,
+    // then switch.
+    report.switched = db.with_transaction(|conn| {
         for kind in Kind::ALL {
-            let missing = missing_count(conn, kind, kind.vector_table(&target))?;
-            if missing > 0 {
+            let table = kind.vector_table(&target);
+            let missing = missing_count(conn, kind, table)?;
+            let orphans = orphan_count(conn, kind, table)?;
+            if missing > 0 || orphans > 0 {
                 return Err(Error::internal(format!(
-                    "{missing} {} were added while reembedding; run `nellie reembed` again",
+                    "{} changed while reembedding ({missing} added, {orphans} deleted); \
+                     is a Nellie server still running? Stop it and run `nellie reembed` again",
                     kind.name()
                 )));
             }
         }
+        conn.execute(
+            "DELETE FROM reembed_state WHERE lesson_table = ?",
+            [target.lessons],
+        )
+        .map_err(|e| db_err("failed to clear reembed state", &e))?;
         let active = active_meta(conn)?;
         if active.is_some_and(|m| m.spec == current && m.tables == target) {
             return Ok(false);
@@ -473,24 +650,91 @@ pub async fn run_reembed<E: Embedder>(
         record_active(conn, &current, &target, "reembed")?;
         Ok(true)
     })?;
+    report.active_tables = target;
+    report.build_started_at = None;
 
-    let dropped = if opts.drop_old {
-        drop_inactive_tables(db, &target)?
-    } else {
-        Vec::new()
-    };
+    if opts.drop_old {
+        report.dropped = drop_inactive_tables(db, &target)?;
+    }
+    Ok(report)
+}
 
-    let mut reports = reports.into_iter();
-    Ok(ReembedReport {
-        previous_spec: before.spec,
-        previous_tables: before.tables,
-        active_tables: target,
-        switched,
-        dropped,
-        lessons: reports.next().unwrap_or_default(),
-        checkpoints: reports.next().unwrap_or_default(),
-        chunks: reports.next().unwrap_or_default(),
+/// How far a kind's active vector table is out of step with its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexGap {
+    /// Which rows.
+    pub kind: Kind,
+    /// Stored rows with no vector.
+    pub missing: u64,
+    /// Vectors whose row no longer exists.
+    pub orphaned: u64,
+}
+
+/// Compare each kind's rows with its vectors in `tables`, one query per kind.
+///
+/// Rows can lack vectors when an older Nellie, which does not know about the
+/// switch to new tables, kept writing after `nellie reembed` switched.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub fn index_gaps(conn: &Connection, tables: &VectorTables) -> Result<Vec<IndexGap>> {
+    Kind::ALL
+        .iter()
+        .map(|&kind| {
+            let src = kind.source_table();
+            let vec = kind.vector_table(tables);
+            let (missing, orphaned): (i64, i64) = conn
+                .query_row(
+                    &format!(
+                        "SELECT (SELECT COUNT(*) FROM {src} WHERE id NOT IN (SELECT id FROM {vec})),
+                                (SELECT COUNT(*) FROM {vec} WHERE id NOT IN (SELECT id FROM {src}))"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| db_err("failed to compare index with rows", &e))?;
+            Ok(IndexGap {
+                kind,
+                missing: u64::try_from(missing).unwrap_or(0),
+                orphaned: u64::try_from(orphaned).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// Remove vectors in `tables` whose row no longer exists. Returns how many
+/// were removed.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub fn remove_orphaned_vectors(db: &Database, tables: &VectorTables) -> Result<u64> {
+    Kind::ALL.iter().try_fold(0, |n, &kind| {
+        Ok(n + remove_orphans(db, kind, kind.vector_table(tables))?)
     })
+}
+
+/// Embed every row that has no vector in `tables`, using the same text as
+/// the insert paths. Safe while the server is writing: rows that gain a
+/// vector or are deleted meanwhile are skipped.
+///
+/// # Errors
+///
+/// Returns an error if embedding or storage fails.
+pub async fn embed_missing<E: Embedder>(
+    db: &Database,
+    embedder: &E,
+    tables: &VectorTables,
+    opts: &ReembedOptions,
+) -> Result<Vec<(Kind, KindReport)>> {
+    let mut reports = Vec::with_capacity(3);
+    for kind in Kind::ALL {
+        let table = kind.vector_table(tables);
+        let report = reembed_kind(db, embedder, kind, table, table, opts, &mut |_| {}).await?;
+        reports.push((kind, report));
+    }
+    Ok(reports)
 }
 
 /// Drop known vector tables other than `active`. Only valid once the active
@@ -608,6 +852,7 @@ mod tests {
         init_storage, insert_checkpoint, insert_chunk, insert_lesson, migrate,
         search_lessons_by_embedding, CheckpointRecord, ChunkRecord, LessonRecord,
     };
+    use rusqlite::OptionalExtension;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Deterministic embedder; fails once `fail_after` requests have run.
@@ -666,7 +911,11 @@ mod tests {
             migrate(conn)?;
             create_vector_tables(conn, &LEGACY_TABLES)?;
             for i in 0..lessons {
-                let lesson = LessonRecord::new(format!("Lesson {i}"), format!("Body {i}"), vec![]);
+                let mut lesson =
+                    LessonRecord::new(format!("Lesson {i}"), format!("Body {i}"), vec![]);
+                // Written well before any reembed run starts.
+                lesson.created_at -= 1000;
+                lesson.updated_at -= 1000;
                 insert_lesson(conn, &lesson)?;
                 let blob: Vec<u8> = placeholder_embedding("old")
                     .iter()
@@ -701,6 +950,7 @@ mod tests {
             batch_size: 2,
             concurrency: 2,
             drop_old: false,
+            switch: true,
         }
     }
 
@@ -854,6 +1104,322 @@ mod tests {
             .await
             .unwrap();
         assert!(report.switched);
+    }
+
+    fn vector(db: &Database, table: &str, id: &Value) -> Option<Vec<f32>> {
+        db.with_conn(|conn| {
+            let blob: Option<Vec<u8>> = conn
+                .query_row(
+                    &format!("SELECT embedding FROM {table} WHERE id = ?"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            Ok(blob.map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            }))
+        })
+        .unwrap()
+    }
+
+    /// Every stored row has exactly one vector in `tables` and nothing else.
+    fn assert_index_matches(db: &Database, tables: &VectorTables) {
+        let gaps = db.with_conn(|conn| index_gaps(conn, tables)).unwrap();
+        for gap in gaps {
+            assert_eq!((gap.missing, gap.orphaned), (0, 0), "{gap:?}");
+        }
+    }
+
+    /// Writes the way an older Nellie does: no lock, no `embedding_meta`,
+    /// vectors only in the legacy tables, own connection.
+    fn old_server_conn(dir: &Path) -> Connection {
+        crate::storage::init_sqlite_vec();
+        Connection::open(dir.join("nellie.db")).unwrap()
+    }
+
+    fn old_server_add_lesson(conn: &Connection, title: &str) -> LessonRecord {
+        let lesson = LessonRecord::new(title, "written by the old server", vec![]);
+        insert_lesson(conn, &lesson).unwrap();
+        let blob: Vec<u8> = placeholder_embedding("old")
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        conn.execute(
+            "INSERT INTO lesson_embeddings (id, embedding) VALUES (?, ?)",
+            rusqlite::params![lesson.id, blob],
+        )
+        .unwrap();
+        lesson
+    }
+
+    #[tokio::test]
+    async fn prebuild_runs_beside_an_old_server_and_final_run_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = legacy_db(dir.path(), 20);
+
+        // Pre-build while an older server keeps writing on its own connection.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let dir = dir.path().to_path_buf();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let conn = old_server_conn(&dir);
+                let mut n = 0;
+                while (!stop.load(Ordering::SeqCst) || n < 5) && n < 200 {
+                    old_server_add_lesson(&conn, &format!("Concurrent {n}"));
+                    n += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                n
+            })
+        };
+        let mut o = opts();
+        o.switch = false;
+        let pre = run_reembed(&db, &FakeEmbedder::ok(), &o, &mut |_| {})
+            .await
+            .unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let concurrent = writer.join().unwrap();
+        assert!(!pre.switched);
+        let started = pre.build_started_at.unwrap();
+        // Not switched; the old server's tables are still active.
+        assert_eq!(db.with_conn(active_tables).unwrap(), LEGACY_TABLES);
+        let recorded: i64 = db
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row("SELECT started_at FROM reembed_state", [], |r| r.get(0))
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(recorded, started);
+
+        // More changes by the old server after the pre-build: insert, delete,
+        // edit, and a re-indexed code file.
+        let old = old_server_conn(dir.path());
+        let lessons = db.with_conn(crate::storage::list_lessons).unwrap();
+        let deleted = lessons.iter().find(|l| l.title == "Lesson 3").unwrap();
+        let mut edited = lessons
+            .iter()
+            .find(|l| l.title == "Lesson 4")
+            .unwrap()
+            .clone();
+        crate::storage::delete_lesson(&old, &deleted.id).unwrap();
+        edited.content = "edited while the old server ran".to_string();
+        crate::storage::update_lesson(&old, &edited).unwrap();
+        let added = old_server_add_lesson(&old, "Added after pre-build");
+        let checkpoint = CheckpointRecord::new("agent", "new checkpoint", serde_json::json!({}));
+        insert_checkpoint(&old, &checkpoint).unwrap();
+        let old_chunk: i64 = old
+            .query_row("SELECT id FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        old.execute("DELETE FROM chunks WHERE file_path = '/src/a.rs'", [])
+            .unwrap();
+        let new_chunk = insert_chunk(
+            &old,
+            &ChunkRecord::new("/src/a.rs", 0, 1, 3, "fn a() { changed }", "hash2"),
+        )
+        .unwrap();
+        assert_ne!(old_chunk, new_chunk, "changed files get fresh chunk ids");
+        drop(old);
+
+        // A second pre-build keeps the original start time.
+        let again = run_reembed(&db, &FakeEmbedder::ok(), &o, &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(again.build_started_at, Some(started));
+
+        // Final run, Nellie stopped: catch up and switch.
+        let report = run_reembed(&db, &FakeEmbedder::ok(), &opts(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(report.switched);
+        assert_eq!(report.lessons.orphans_removed, 1);
+        // The edited lesson, plus lessons the old server added after the
+        // start that a pre-build already embedded (re-embedding them is the
+        // conservative choice: they too were written after the start).
+        assert!(
+            (1..=concurrent + 2).contains(&report.lessons.refreshed),
+            "refreshed {} with {concurrent} concurrent inserts",
+            report.lessons.refreshed
+        );
+        assert_eq!(report.chunks.orphans_removed, 1);
+        assert_eq!(db.with_conn(active_tables).unwrap(), CURRENT_TABLES);
+        assert_index_matches(&db, &CURRENT_TABLES);
+        assert_eq!(rows(&db, CURRENT_TABLES.lessons), 20 - 1 + concurrent + 1);
+        assert_eq!(rows(&db, CURRENT_TABLES.checkpoints), 2);
+        assert_eq!(rows(&db, CURRENT_TABLES.chunks), 1);
+
+        // Vectors reflect the current text.
+        let text =
+            |l: &LessonRecord| placeholder_embedding(&lesson_embedding_text(&l.title, &l.content));
+        let lesson_vec =
+            |id: &str| vector(&db, CURRENT_TABLES.lessons, &Value::Text(id.to_string()));
+        assert_eq!(lesson_vec(&edited.id).unwrap(), text(&edited));
+        assert_eq!(lesson_vec(&added.id).unwrap(), text(&added));
+        assert!(lesson_vec(&deleted.id).is_none());
+        assert_eq!(
+            vector(&db, CURRENT_TABLES.chunks, &Value::Integer(new_chunk)).unwrap(),
+            placeholder_embedding(&chunk_embedding_text("fn a() { changed }"))
+        );
+        // Build state is cleared once switched.
+        assert_eq!(
+            db.with_conn(|conn| count(conn, "SELECT COUNT(*) FROM reembed_state"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn no_switch_leaves_an_up_to_date_index_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("nellie.db")).unwrap();
+        init_storage(&db).unwrap();
+        db.with_conn(|conn| insert_lesson(conn, &LessonRecord::new("t", "c", vec![])))
+            .unwrap();
+        let mut o = opts();
+        o.switch = false;
+        let report = run_reembed(&db, &FakeEmbedder::ok(), &o, &mut |_| {})
+            .await
+            .unwrap();
+        assert!(report.build_started_at.is_none());
+        assert_eq!(report.lessons.embedded, 0);
+        assert_eq!(rows(&db, CURRENT_TABLES.lessons), 0);
+    }
+
+    /// Adds a lesson the first time it embeds a chunk: a server writing
+    /// during the switching run.
+    struct WriterEmbedder {
+        db: Database,
+        written: std::sync::atomic::AtomicBool,
+    }
+
+    impl Embedder for WriterEmbedder {
+        fn embed(&self, texts: Vec<String>) -> impl Future<Output = Result<Vec<Vec<f32>>>> + Send {
+            if texts.iter().any(|t| t.contains("fn a()"))
+                && !self.written.swap(true, Ordering::SeqCst)
+            {
+                self.db
+                    .with_conn(|conn| insert_lesson(conn, &LessonRecord::new("late", "x", vec![])))
+                    .unwrap();
+            }
+            async move { Ok(texts.iter().map(|t| placeholder_embedding(t)).collect()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn rows_added_during_the_switching_run_block_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = legacy_db(dir.path(), 3);
+        let embedder = WriterEmbedder {
+            db: db.clone(),
+            written: std::sync::atomic::AtomicBool::new(false),
+        };
+        let err = run_reembed(&db, &embedder, &opts(), &mut |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lessons changed while reembedding"), "{err}");
+        assert_eq!(db.with_conn(active_tables).unwrap(), LEGACY_TABLES);
+        // A rerun picks the row up and switches.
+        let report = run_reembed(&db, &embedder, &opts(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(report.switched);
+        assert_index_matches(&db, &CURRENT_TABLES);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_fills_rows_an_old_server_wrote_after_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = legacy_db(dir.path(), 5);
+        run_reembed(&db, &FakeEmbedder::ok(), &opts(), &mut |_| {})
+            .await
+            .unwrap();
+        // Nothing to do: every count is zero.
+        assert_index_matches(&db, &CURRENT_TABLES);
+
+        // An older server was still running and kept writing to the legacy
+        // tables after the switch.
+        let old = old_server_conn(dir.path());
+        let added = old_server_add_lesson(&old, "after switch");
+        let removed = db
+            .with_conn(crate::storage::list_lessons)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.title == "Lesson 0")
+            .unwrap();
+        crate::storage::delete_lesson(&old, &removed.id).unwrap();
+        insert_checkpoint(
+            &old,
+            &CheckpointRecord::new("agent", "after switch", serde_json::json!({})),
+        )
+        .unwrap();
+        drop(old);
+
+        let gaps = db
+            .with_conn(|conn| index_gaps(conn, &CURRENT_TABLES))
+            .unwrap();
+        let by_kind = |k: Kind| gaps.iter().find(|g| g.kind == k).copied().unwrap();
+        assert_eq!(by_kind(Kind::Lessons).missing, 1);
+        assert_eq!(by_kind(Kind::Lessons).orphaned, 1);
+        assert_eq!(by_kind(Kind::Checkpoints).missing, 1);
+        assert_eq!(
+            by_kind(Kind::Chunks),
+            IndexGap {
+                kind: Kind::Chunks,
+                missing: 0,
+                orphaned: 0
+            }
+        );
+
+        assert_eq!(remove_orphaned_vectors(&db, &CURRENT_TABLES).unwrap(), 1);
+        let reports = embed_missing(&db, &FakeEmbedder::ok(), &CURRENT_TABLES, &opts())
+            .await
+            .unwrap();
+        let embedded: u64 = reports.iter().map(|(_, r)| r.embedded).sum();
+        assert_eq!(embedded, 2);
+        assert_index_matches(&db, &CURRENT_TABLES);
+        assert_eq!(
+            vector(&db, CURRENT_TABLES.lessons, &Value::Text(added.id.clone())).unwrap(),
+            placeholder_embedding(&lesson_embedding_text(&added.title, &added.content))
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_missing_skips_rows_that_got_a_vector_meanwhile() {
+        let db = Database::open_in_memory().unwrap();
+        init_storage(&db).unwrap();
+        let lesson = LessonRecord::new("t", "c", vec![]);
+        db.with_conn(|conn| insert_lesson(conn, &lesson)).unwrap();
+        // The server stores its own vector after the row was picked up.
+        let rows = vec![(
+            Value::Text(lesson.id.clone()),
+            placeholder_embedding("server"),
+        )];
+        db.with_conn(|conn| {
+            crate::storage::store_lesson_embedding(conn, &lesson.id, &placeholder_embedding("x"))
+        })
+        .unwrap();
+        let inserted = db
+            .with_transaction(|conn| {
+                insert_vectors(conn, Kind::Lessons, CURRENT_TABLES.lessons, &rows)
+            })
+            .unwrap();
+        assert_eq!(inserted, 0);
+        // Rows deleted meanwhile are skipped too.
+        let gone = vec![(
+            Value::Text("deleted".to_string()),
+            placeholder_embedding("x"),
+        )];
+        let inserted = db
+            .with_transaction(|conn| {
+                insert_vectors(conn, Kind::Lessons, CURRENT_TABLES.lessons, &gone)
+            })
+            .unwrap();
+        assert_eq!(inserted, 0);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::error::StorageError;
 use crate::Result;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Run all pending migrations.
 ///
@@ -47,6 +47,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     if current_version < 4 {
         migrate_v4(conn)?;
+    }
+
+    if current_version < 5 {
+        migrate_v5(conn)?;
     }
 
     Ok(())
@@ -318,6 +322,27 @@ fn migrate_v4(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration v5: when an unfinished `nellie reembed` started writing each
+/// set of new vector tables.
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    tracing::info!("Applying migration v5: Reembed progress");
+
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS reembed_state (
+            lesson_table TEXT PRIMARY KEY,
+            started_at INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(|e| StorageError::Migration(format!("v5 migration failed: {e}")))?;
+
+    record_migration(conn, 5)?;
+    tracing::info!("Migration v5 complete");
+
+    Ok(())
+}
+
 /// Verify all expected tables exist.
 ///
 /// # Errors
@@ -336,6 +361,7 @@ pub fn verify_schema(conn: &Connection) -> Result<()> {
         "symbols",
         "structural_edges",
         "embedding_meta",
+        "reembed_state",
     ];
 
     for table in tables {
@@ -659,7 +685,7 @@ mod tests {
 
             let version = get_current_version(conn)?;
             assert_eq!(version, SCHEMA_VERSION);
-            assert_eq!(version, 4);
+            assert_eq!(version, 5);
 
             verify_schema(conn)?;
             Ok(())

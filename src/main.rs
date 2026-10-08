@@ -356,12 +356,21 @@ enum Commands {
     /// transaction. Run it with Nellie stopped. Safe to interrupt and rerun:
     /// rows already re-embedded are skipped. The old index is kept unless
     /// --drop-old is given.
+    ///
+    /// To keep downtime short, first run `nellie reembed --no-switch` while
+    /// the previous Nellie version is still serving; then stop it, install
+    /// this version and run `nellie reembed` to catch up and switch.
     Reembed {
         /// Drop the old vector tables once the new index is active
         #[arg(long)]
         drop_old: bool,
 
-        /// Number of embedding worker threads
+        /// Only build the new tables; do not switch to them. Safe while an
+        /// older Nellie version is still serving the database
+        #[arg(long, conflicts_with = "drop_old")]
+        no_switch: bool,
+
+        /// Threads used for embedding (one inference spread over all of them)
         #[arg(long, env = "NELLIE_EMBEDDING_THREADS", default_value = "4")]
         embedding_threads: usize,
 
@@ -506,9 +515,19 @@ async fn main() -> Result<()> {
         Some(Commands::Bootstrap { force }) => bootstrap_command(&cli.data_dir, force).await,
         Some(Commands::Reembed {
             drop_old,
+            no_switch,
             embedding_threads,
             batch_size,
-        }) => reembed_command(&cli.data_dir, drop_old, embedding_threads, batch_size).await,
+        }) => {
+            reembed_command(
+                &cli.data_dir,
+                drop_old,
+                no_switch,
+                embedding_threads,
+                batch_size,
+            )
+            .await
+        }
         None => {
             // Default to serve command for backward compatibility
             tracing::info!("No command specified, starting server (use 'serve' explicitly)");
@@ -799,6 +818,7 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
     let db = Database::open(config.database_path())?;
     init_storage(&db)?;
     enforce_embedding_spec(&db, &config.data_dir)?;
+    let index_missing = reconcile_index(&db)?;
 
     // Initialize metrics
     init_metrics();
@@ -843,6 +863,19 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
     let indexer_db = db.clone();
 
     let app = App::new(server_config.clone(), db).await?;
+
+    if index_missing > 0 {
+        if let Some(embeddings) = app.embeddings() {
+            let db = indexer_db.clone();
+            let threads = args.embedding_threads;
+            tokio::spawn(async move { fill_index_gaps(db, embeddings, threads).await });
+        } else {
+            tracing::warn!(
+                index_missing,
+                "Embeddings unavailable; rows without vectors stay out of semantic search"
+            );
+        }
+    }
 
     // Wire up transcript watcher for Deep Hooks if enabled
     if args.enable_deep_hooks {
@@ -2077,10 +2110,70 @@ fn enforce_embedding_spec(db: &Database, data_dir: &Path) -> Result<()> {
     }
 }
 
+/// Check the active vector tables against the stored rows (one query per
+/// kind). Removes vectors whose row is gone and returns how many rows have no
+/// vector. Rows can lack vectors when an older Nellie kept writing after
+/// `nellie reembed` switched to new tables.
+fn reconcile_index(db: &Database) -> Result<u64> {
+    use nellie::reembed::{index_gaps, remove_orphaned_vectors};
+
+    let tables = db.with_conn(nellie::storage::embedding_meta::active_tables)?;
+    let gaps = db.with_conn(|conn| index_gaps(conn, &tables))?;
+    let missing: u64 = gaps.iter().map(|g| g.missing).sum();
+    let orphaned: u64 = gaps.iter().map(|g| g.orphaned).sum();
+    if orphaned > 0 {
+        let removed = remove_orphaned_vectors(db, &tables)?;
+        tracing::info!(removed, "Removed vectors whose rows no longer exist");
+    }
+    if missing > 0 {
+        let count = |i: usize| gaps.get(i).map_or(0, |g| g.missing);
+        tracing::info!(
+            lessons = count(0),
+            checkpoints = count(1),
+            chunks = count(2),
+            "Rows without vectors in the active index; embedding them in the background"
+        );
+    }
+    Ok(missing)
+}
+
+/// Embed the rows found by [`reconcile_index`] while the server runs.
+async fn fill_index_gaps(
+    db: Database,
+    embeddings: nellie::embeddings::EmbeddingService,
+    threads: usize,
+) {
+    use nellie::reembed::{embed_missing, ReembedOptions};
+
+    let started = std::time::Instant::now();
+    let opts = ReembedOptions {
+        concurrency: threads.max(1),
+        ..ReembedOptions::default()
+    };
+    let result = match db.with_conn(nellie::storage::embedding_meta::active_tables) {
+        Ok(tables) => embed_missing(&db, &embeddings, &tables, &opts).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(reports) => {
+            let embedded: u64 = reports.iter().map(|(_, r)| r.embedded).sum();
+            let failed: usize = reports.iter().map(|(_, r)| r.failed.len()).sum();
+            tracing::info!(
+                embedded,
+                failed,
+                secs = started.elapsed().as_secs_f64(),
+                "Embedded rows that had no vector"
+            );
+        }
+        Err(e) => tracing::error!(error = %e, "Failed to embed rows that had no vector"),
+    }
+}
+
 /// Reembed command: rebuild the vector index under the current spec.
 async fn reembed_command(
     data_dir: &Path,
     drop_old: bool,
+    no_switch: bool,
     embedding_threads: usize,
     batch_size: usize,
 ) -> Result<()> {
@@ -2108,8 +2201,20 @@ async fn reembed_command(
     tracing::debug!(lock = %lock.lock_path().display(), "Holding exclusive database lock");
 
     let db = Database::open(&db_path)?;
+    // An older Nellie may be writing (`--no-switch`): wait for its short
+    // write transactions rather than failing.
+    db.with_conn(|conn| {
+        conn.busy_timeout(Duration::from_secs(60))
+            .map_err(|e| nellie::Error::internal(format!("failed to set busy timeout: {e}")))
+    })?;
     init_storage(&db)?;
-    let emb_config = EmbeddingConfig::from_data_dir(data_dir, embedding_threads.max(1));
+    let threads = embedding_threads.max(1);
+    // One session using every thread: as fast as one session per thread,
+    // without a copy of the model per thread.
+    let emb_config = EmbeddingConfig {
+        intra_threads: threads,
+        ..EmbeddingConfig::from_data_dir(data_dir, threads)
+    };
     db.with_conn(|conn| {
         nellie::storage::embedding_meta::bootstrap_meta(conn, &emb_config.tokenizer_path)
     })?;
@@ -2130,13 +2235,20 @@ async fn reembed_command(
 
     let opts = ReembedOptions {
         batch_size: batch_size.max(1),
-        concurrency: embedding_threads.max(1),
+        concurrency: threads,
         drop_old,
+        switch: !no_switch,
     };
     println!(
-        "Re-embedding with {}",
-        nellie::embeddings::EmbeddingSpec::current()
+        "Re-embedding with {}{}",
+        nellie::embeddings::EmbeddingSpec::current(),
+        if no_switch {
+            " (building only; the active index is not changed)"
+        } else {
+            ""
+        }
     );
+    let started = std::time::Instant::now();
     let mut last_print = std::time::Instant::now();
     let mut on_progress = |p: &Progress| {
         if p.done == p.total || last_print.elapsed() >= Duration::from_secs(2) {
@@ -2156,6 +2268,10 @@ async fn reembed_command(
     };
     let report = run_reembed(&db, &service, &opts, &mut on_progress).await?;
 
+    if no_switch && report.build_started_at.is_none() {
+        println!("Index already uses the current embedding spec; nothing to build.");
+        return Ok(());
+    }
     println!("Previous index: {}", report.previous_spec);
     for (name, r) in [
         ("lessons", &report.lessons),
@@ -2171,6 +2287,12 @@ async fn reembed_command(
             "  {name:<11} total {:>8}  embedded {:>8}  already done {:>8}  {:.1}s ({rate:.1}/s)",
             r.total, r.embedded, r.skipped, r.elapsed_secs
         );
+        if r.orphans_removed > 0 || r.refreshed > 0 {
+            println!(
+                "  {name:<11} caught up: {} deleted since the build started, {} edited and re-embedded",
+                r.orphans_removed, r.refreshed
+            );
+        }
         if r.empty_text > 0 {
             println!(
                 "  WARNING: {} {name} have empty stored text; they were embedded as empty strings",
@@ -2190,9 +2312,16 @@ async fn reembed_command(
             );
         }
     }
-    if report.switched {
+    if no_switch {
         println!(
-            "Switched to the new index ({}, {}, {}).",
+            "New index built in {:.1}s but not active. Next: stop Nellie, then run \
+             `nellie reembed` with this version to catch up and switch.",
+            started.elapsed().as_secs_f64()
+        );
+    } else if report.switched {
+        println!(
+            "Switched to the new index in {:.1}s ({}, {}, {}).",
+            started.elapsed().as_secs_f64(),
             report.active_tables.chunks,
             report.active_tables.lessons,
             report.active_tables.checkpoints
