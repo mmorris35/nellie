@@ -402,6 +402,15 @@ pub fn init_start_time() {
     START_TIME.get_or_init(std::time::Instant::now);
 }
 
+/// Clamp a requested result count to `1..=cap`.
+///
+/// `cap` is the configured maximum result limit when set, otherwise the
+/// endpoint's built-in `default_cap`.
+fn result_limit(state: &McpState, requested: i64, default_cap: i64) -> i64 {
+    let cap = state.max_result_limit.map_or(default_cap, i64::from);
+    requested.clamp(1, cap)
+}
+
 /// Create the dashboard API router.
 pub fn create_api_router(state: Arc<McpState>) -> Router {
     // Initialize start time on first router creation
@@ -486,7 +495,7 @@ async fn list_files(
 
     // Apply pagination manually (storage returns all paths)
     let offset = params.offset.max(0) as usize;
-    let limit = params.limit.clamp(1, 200) as usize;
+    let limit = result_limit(&state, params.limit, 200) as usize;
 
     let page: Vec<FileEntry> = files
         .into_iter()
@@ -522,7 +531,7 @@ async fn search(
         }));
     }
 
-    let limit = params.limit.clamp(1, 100);
+    let limit = result_limit(&state, params.limit, 100);
 
     // Try semantic search if embeddings available
     if let Some(ref embedding_service) = state.embeddings {
@@ -621,7 +630,7 @@ async fn list_lessons(
     let total = lessons.len();
 
     let offset = params.offset.max(0) as usize;
-    let limit = params.limit.clamp(1, 200) as usize;
+    let limit = result_limit(&state, params.limit, 200) as usize;
 
     let page: Vec<LessonEntry> = lessons
         .into_iter()
@@ -729,7 +738,7 @@ async fn search_lessons(
         }));
     }
 
-    let limit = params.limit.clamp(1, 100) as usize;
+    let limit = result_limit(&state, params.limit, 100) as usize;
 
     // Try semantic search if embeddings available
     if let Some(ref embedding_service) = state.embeddings {
@@ -997,7 +1006,7 @@ async fn hybrid_search(
         }));
     }
 
-    let limit = usize::try_from(params.limit.clamp(1, 100)).unwrap_or(100);
+    let limit = usize::try_from(result_limit(&state, params.limit, 100)).unwrap_or(100);
     let expansion_depth = usize::try_from(params.expansion_depth.clamp(0, 5)).unwrap_or(2);
 
     // Step 1: Vector search (semantic or text fallback)
@@ -1064,7 +1073,7 @@ async fn list_checkpoints(
     State(state): State<Arc<McpState>>,
     Query(params): Query<CheckpointQuery>,
 ) -> impl IntoResponse {
-    let limit = usize::try_from(params.limit.clamp(1, 200)).unwrap_or(20);
+    let limit = usize::try_from(result_limit(&state, params.limit, 200)).unwrap_or(20);
 
     let checkpoints = if let Some(ref agent) = params.agent {
         state
@@ -1158,7 +1167,7 @@ async fn search_checkpoints(
         }));
     }
 
-    let limit = params.limit.clamp(1, 100) as usize;
+    let limit = result_limit(&state, params.limit, 100) as usize;
 
     if let Some(ref embedding_service) = state.embeddings {
         if embedding_service.is_initialized() {
@@ -1492,7 +1501,7 @@ async fn graph_query(
     State(state): State<Arc<McpState>>,
     Query(params): Query<GraphQueryParams>,
 ) -> impl IntoResponse {
-    let limit = usize::try_from(params.limit.clamp(1, 500)).unwrap_or(50);
+    let limit = usize::try_from(result_limit(&state, params.limit, 500)).unwrap_or(50);
 
     let response = match state.graph.as_ref() {
         Some(graph_lock) => {
@@ -2299,5 +2308,90 @@ mod tests {
         let result: GraphResponse = serde_json::from_slice(&body).unwrap();
         // No graph configured, so empty
         assert!(result.nodes.is_empty());
+    }
+
+    fn create_test_state_with_max(max: Option<u32>) -> Arc<McpState> {
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn(|conn| migrate(conn)).unwrap();
+        let mut state = McpState::new(db);
+        state.set_max_result_limit(max);
+        Arc::new(state)
+    }
+
+    #[test]
+    fn test_result_limit_default_caps_unchanged() {
+        let state = create_test_state_with_max(None);
+        for cap in [100, 200, 500] {
+            assert_eq!(result_limit(&state, 0, cap), 1);
+            assert_eq!(result_limit(&state, -7, cap), 1);
+            assert_eq!(result_limit(&state, 20, cap), 20);
+            assert_eq!(result_limit(&state, cap, cap), cap);
+            assert_eq!(result_limit(&state, 10_000, cap), cap);
+        }
+    }
+
+    #[test]
+    fn test_result_limit_override() {
+        let state = create_test_state_with_max(Some(10_000));
+        for cap in [100, 200, 500] {
+            assert_eq!(result_limit(&state, 0, cap), 1);
+            assert_eq!(result_limit(&state, 20, cap), 20);
+            assert_eq!(result_limit(&state, 5_000, cap), 5_000);
+            assert_eq!(result_limit(&state, 50_000, cap), 10_000);
+        }
+
+        // A configured value below a built-in cap lowers it too.
+        let state = create_test_state_with_max(Some(50));
+        assert_eq!(result_limit(&state, 500, 500), 50);
+    }
+
+    async fn list_lessons_count(state: Arc<McpState>, limit: i64) -> usize {
+        let response = create_api_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/lessons?limit={limit}&offset=0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lessons: LessonListResponse = serde_json::from_slice(&body).unwrap();
+        lessons.lessons.len()
+    }
+
+    fn insert_lessons(state: &McpState, n: usize) {
+        state
+            .db()
+            .with_conn(|conn| {
+                for i in 0..n {
+                    let lesson = storage::LessonRecord::new(
+                        format!("Lesson {i}"),
+                        "content",
+                        vec!["test".to_string()],
+                    );
+                    storage::insert_lesson(conn, &lesson)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_lessons_limit_default_cap() {
+        let state = create_test_state_with_max(None);
+        insert_lessons(&state, 250);
+        assert_eq!(list_lessons_count(state, 1_000).await, 200);
+    }
+
+    #[tokio::test]
+    async fn test_list_lessons_limit_override() {
+        let state = create_test_state_with_max(Some(10_000));
+        insert_lessons(&state, 250);
+        assert_eq!(list_lessons_count(Arc::clone(&state), 1_000).await, 250);
+        assert_eq!(list_lessons_count(state, 230).await, 230);
     }
 }

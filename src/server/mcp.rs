@@ -174,6 +174,9 @@ pub struct McpState {
     pub enable_structural: bool,
     /// True while structural graph bootstrap is running in the background.
     pub structural_bootstrapping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Maximum `limit` accepted by REST result-count parameters.
+    /// `None` keeps the built-in per-endpoint caps.
+    pub max_result_limit: Option<u32>,
 }
 
 impl McpState {
@@ -189,6 +192,7 @@ impl McpState {
             structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            max_result_limit: None,
         }
     }
 
@@ -205,6 +209,7 @@ impl McpState {
             structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            max_result_limit: None,
         }
     }
 
@@ -220,6 +225,7 @@ impl McpState {
             structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            max_result_limit: None,
         }
     }
 
@@ -240,6 +246,7 @@ impl McpState {
             structural_bootstrapping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            max_result_limit: None,
         }
     }
 
@@ -277,6 +284,11 @@ impl McpState {
     /// Enable structural parsing.
     pub fn set_enable_structural(&mut self, enable: bool) {
         self.enable_structural = enable;
+    }
+
+    /// Override the maximum REST result limit (`None` = built-in per-endpoint caps).
+    pub fn set_max_result_limit(&mut self, max: Option<u32>) {
+        self.max_result_limit = max;
     }
 }
 

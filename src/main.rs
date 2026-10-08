@@ -109,6 +109,15 @@ enum Commands {
         /// Useful for resume-after-crash scenarios where a walk would be wasteful.
         #[arg(long, default_value_t = false)]
         skip_initial_walk: bool,
+
+        /// Maximum `limit` accepted by REST endpoints that return result lists
+        /// (1-100000). Unset keeps the built-in per-endpoint caps (100/200/500).
+        #[arg(
+            long,
+            env = "NELLIE_MAX_RESULT_LIMIT",
+            value_parser = clap::value_parser!(u32).range(1..=100_000)
+        )]
+        max_result_limit: Option<u32>,
     },
 
     /// Manually index a directory
@@ -427,6 +436,7 @@ async fn main() -> Result<()> {
             enable_deep_hooks,
             sync_interval,
             skip_initial_walk,
+            max_result_limit,
         }) => {
             serve_command(ServeCommandArgs {
                 data_dir: cli.data_dir,
@@ -442,6 +452,7 @@ async fn main() -> Result<()> {
                 enable_deep_hooks,
                 sync_interval,
                 skip_initial_walk,
+                max_result_limit,
             })
             .await
         }
@@ -545,6 +556,7 @@ async fn main() -> Result<()> {
                 enable_deep_hooks: false,
                 sync_interval: 30,
                 skip_initial_walk: false,
+                max_result_limit: None,
             })
             .await
         }
@@ -567,6 +579,7 @@ struct ServeCommandArgs {
     enable_deep_hooks: bool,
     sync_interval: u64,
     skip_initial_walk: bool,
+    max_result_limit: Option<u32>,
 }
 
 /// Background task for transcript watcher.
@@ -857,6 +870,7 @@ async fn serve_command(args: ServeCommandArgs) -> Result<()> {
             ..nellie::config::GraphConfig::default()
         },
         enable_structural: args.enable_structural,
+        max_result_limit: args.max_result_limit,
     };
 
     // Clone db for the indexer before giving it to the App
@@ -2364,6 +2378,7 @@ mod tests {
             enable_deep_hooks,
             sync_interval,
             skip_initial_walk,
+            max_result_limit,
         }) = cli.command
         {
             assert_eq!(host, "0.0.0.0");
@@ -2376,8 +2391,32 @@ mod tests {
             assert!(!enable_deep_hooks);
             assert_eq!(sync_interval, 30);
             assert!(!skip_initial_walk);
+            assert_eq!(max_result_limit, None);
         } else {
             panic!("Expected Serve command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_serve_max_result_limit() {
+        let cli = Cli::try_parse_from(["nellie", "serve", "--max-result-limit", "10000"]).unwrap();
+        if let Some(Commands::Serve {
+            max_result_limit, ..
+        }) = cli.command
+        {
+            assert_eq!(max_result_limit, Some(10_000));
+        } else {
+            panic!("Expected Serve command");
+        }
+
+        for ok in ["1", "100000"] {
+            assert!(Cli::try_parse_from(["nellie", "serve", "--max-result-limit", ok]).is_ok());
+        }
+        for bad in ["0", "100001", "-5", "abc"] {
+            assert!(
+                Cli::try_parse_from(["nellie", "serve", "--max-result-limit", bad]).is_err(),
+                "expected {bad} to be rejected"
+            );
         }
     }
 
