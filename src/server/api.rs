@@ -109,7 +109,7 @@ pub struct LessonSearchResponse {
     pub search_type: String,
 }
 
-/// Lesson search result entry (includes score for semantic results).
+/// Lesson search result entry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LessonSearchEntry {
     pub id: String,
@@ -118,8 +118,18 @@ pub struct LessonSearchEntry {
     pub severity: String,
     pub tags: Vec<String>,
     pub created_at: i64,
+    /// Fused relevance in `[0, 1]` (see `storage::LessonSearchHit::score`);
+    /// absent for substring-match fallback results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,
+    /// Cosine similarity between query and lesson vectors; `null` if the
+    /// lesson was found by keyword search only.
+    #[serde(default)]
+    pub similarity: Option<f32>,
+    /// 1-based position in the keyword (BM25) ranking; `null` if the lesson
+    /// was found by vector search only.
+    #[serde(default)]
+    pub keyword_rank: Option<usize>,
 }
 
 /// Embedding backfill response.
@@ -721,10 +731,13 @@ async fn delete_lesson(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/v1/lessons/search - Semantic search over lessons.
+/// GET /api/v1/lessons/search - Search over lessons.
 ///
-/// Uses embedding similarity when the embedding service is available,
-/// falls back to text search (LIKE) otherwise.
+/// Fuses keyword (BM25) and vector rankings when the embedding service is
+/// available (`search_type: "hybrid"`); otherwise ranks by keywords alone,
+/// falling back to a substring match if that finds nothing
+/// (`search_type: "text"`). See [`storage::search_lessons_hybrid`] for what
+/// `score` means.
 async fn search_lessons(
     State(state): State<Arc<McpState>>,
     Query(params): Query<LessonSearchQuery>,
@@ -738,80 +751,86 @@ async fn search_lessons(
         }));
     }
 
-    let limit = result_limit(&state, params.limit, 100) as usize;
+    let limit = result_limit(
+        &state,
+        params.limit,
+        i64::try_from(storage::LESSON_SEARCH_DEFAULT_CAP).unwrap_or(100),
+    ) as usize;
 
-    // Try semantic search if embeddings available
+    let mut query_embedding = None;
     if let Some(ref embedding_service) = state.embeddings {
         match embedding_service.embed_one(params.q.clone()).await {
-            Ok(query_embedding) => {
-                let results = state
-                    .db()
-                    .with_conn(|conn| {
-                        storage::search_lessons_by_embedding(conn, &query_embedding, limit)
-                    })
-                    .map_err(|e| {
-                        tracing::error!(error = %e, "Lesson semantic search failed");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-
-                let lessons: Vec<LessonSearchEntry> = results
-                    .into_iter()
-                    .map(|r| LessonSearchEntry {
-                        id: r.record.id,
-                        title: r.record.title,
-                        content: r.record.content,
-                        severity: r.record.severity,
-                        tags: r.record.tags,
-                        created_at: r.record.created_at,
-                        score: Some(r.score),
-                    })
-                    .collect();
-
-                let total = lessons.len();
-                return Ok(Json(LessonSearchResponse {
-                    lessons,
-                    query: params.q,
-                    total,
-                    search_type: "semantic".to_string(),
-                }));
-            }
+            Ok(embedding) => query_embedding = Some(embedding),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "Lesson embedding failed, falling back to text search"
+                    "Lesson embedding failed, falling back to keyword search"
                 );
             }
         }
     }
 
-    // Fallback to text search
     let results = state
         .db()
-        .with_conn(|conn| storage::search_lessons_by_text(conn, &params.q, limit))
+        .with_conn(|conn| {
+            storage::search_lessons_hybrid(conn, &params.q, query_embedding.as_deref(), limit)
+        })
         .map_err(|e| {
-            tracing::error!(error = %e, "Lesson text search failed");
+            tracing::error!(error = %e, "Lesson search failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let lessons: Vec<LessonSearchEntry> = results
+    let search_type = if query_embedding.is_some() {
+        "hybrid"
+    } else {
+        "text"
+    };
+
+    let mut lessons: Vec<LessonSearchEntry> = results
         .into_iter()
-        .map(|l| LessonSearchEntry {
-            id: l.id,
-            title: l.title,
-            content: l.content,
-            severity: l.severity,
-            tags: l.tags,
-            created_at: l.created_at,
-            score: None,
+        .map(|r| LessonSearchEntry {
+            id: r.record.id,
+            title: r.record.title,
+            content: r.record.content,
+            severity: r.record.severity,
+            tags: r.record.tags,
+            created_at: r.record.created_at,
+            score: Some(r.score),
+            similarity: r.similarity,
+            keyword_rank: r.keyword_rank,
         })
         .collect();
+
+    if lessons.is_empty() && query_embedding.is_none() {
+        // Substring match catches partial words the tokenizer would not.
+        lessons = state
+            .db()
+            .with_conn(|conn| storage::search_lessons_by_text(conn, &params.q, limit))
+            .map_err(|e| {
+                tracing::error!(error = %e, "Lesson text search failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .into_iter()
+            .map(|l| LessonSearchEntry {
+                id: l.id,
+                title: l.title,
+                content: l.content,
+                severity: l.severity,
+                tags: l.tags,
+                created_at: l.created_at,
+                score: None,
+                similarity: None,
+                keyword_rank: None,
+            })
+            .collect();
+    }
 
     let total = lessons.len();
     Ok(Json(LessonSearchResponse {
         lessons,
         query: params.q,
         total,
-        search_type: "text".to_string(),
+        search_type: search_type.to_string(),
     }))
 }
 
@@ -1809,6 +1828,7 @@ mod tests {
         let app = create_api_router(state);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/lessons/search?q=Rust")
@@ -1827,6 +1847,28 @@ mod tests {
         assert_eq!(result.total, 1);
         assert_eq!(result.search_type, "text");
         assert!(result.lessons[0].title.contains("Rust"));
+        // Ranked by keywords alone: first in one of two possible rankings.
+        assert_eq!(result.lessons[0].score, Some(0.5));
+        assert_eq!(result.lessons[0].similarity, None);
+        assert_eq!(result.lessons[0].keyword_rank, Some(1));
+
+        // A partial word the full-text index cannot match falls back to a
+        // substring match, which has no score.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lessons/search?q=Rus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: LessonSearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.search_type, "text");
         assert!(result.lessons[0].score.is_none());
     }
 

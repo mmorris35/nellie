@@ -8,7 +8,7 @@ use crate::error::StorageError;
 use crate::Result;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Run all pending migrations.
 ///
@@ -51,6 +51,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     if current_version < 5 {
         migrate_v5(conn)?;
+    }
+
+    if current_version < 6 {
+        migrate_v6(conn)?;
     }
 
     Ok(())
@@ -343,6 +347,72 @@ fn migrate_v5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration v6: full-text index over lessons for keyword search.
+///
+/// `lessons_fts` is an FTS5 table holding a copy of each lesson's title,
+/// content and tags (the JSON text; the tokenizer drops the punctuation).
+/// Triggers on `lessons` keep it in sync, so every writer (including raw SQL
+/// and future code paths) updates it in the same statement transaction as the
+/// row change. The lesson id is stored as an UNINDEXED column rather than
+/// relying on `lessons.rowid`, because `lessons` has a TEXT primary key and
+/// `VACUUM` may renumber its rowids. Existing lessons are backfilled here;
+/// the whole migration runs under one savepoint so a failure leaves no
+/// half-built index.
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    tracing::info!("Applying migration v6: Lesson full-text index");
+
+    conn.execute_batch("SAVEPOINT migrate_v6")
+        .map_err(|e| StorageError::Migration(format!("v6 migration failed: {e}")))?;
+
+    let result = conn
+        .execute_batch(
+            r"
+        CREATE VIRTUAL TABLE IF NOT EXISTS lessons_fts USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            tags,
+            tokenize = 'porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS lessons_fts_insert AFTER INSERT ON lessons BEGIN
+            INSERT INTO lessons_fts (id, title, content, tags)
+            VALUES (new.id, new.title, new.content, new.tags);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS lessons_fts_delete AFTER DELETE ON lessons BEGIN
+            DELETE FROM lessons_fts WHERE id = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS lessons_fts_update
+        AFTER UPDATE OF id, title, content, tags ON lessons BEGIN
+            DELETE FROM lessons_fts WHERE id = old.id;
+            INSERT INTO lessons_fts (id, title, content, tags)
+            VALUES (new.id, new.title, new.content, new.tags);
+        END;
+
+        DELETE FROM lessons_fts;
+        INSERT INTO lessons_fts (id, title, content, tags)
+            SELECT id, title, content, tags FROM lessons;
+        ",
+        )
+        .map_err(|e| StorageError::Migration(format!("v6 migration failed: {e}")).into())
+        .and_then(|()| record_migration(conn, 6));
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE migrate_v6")
+                .map_err(|e| StorageError::Migration(format!("v6 migration failed: {e}")))?;
+            tracing::info!("Migration v6 complete");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO migrate_v6; RELEASE migrate_v6");
+            Err(e)
+        }
+    }
+}
+
 /// Verify all expected tables exist.
 ///
 /// # Errors
@@ -362,6 +432,7 @@ pub fn verify_schema(conn: &Connection) -> Result<()> {
         "structural_edges",
         "embedding_meta",
         "reembed_state",
+        "lessons_fts",
     ];
 
     for table in tables {
@@ -685,7 +756,7 @@ mod tests {
 
             let version = get_current_version(conn)?;
             assert_eq!(version, SCHEMA_VERSION);
-            assert_eq!(version, 5);
+            assert_eq!(version, 6);
 
             verify_schema(conn)?;
             Ok(())

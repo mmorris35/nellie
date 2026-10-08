@@ -1674,7 +1674,11 @@ async fn handle_search_lessons(
     args: &serde_json::Value,
 ) -> std::result::Result<serde_json::Value, String> {
     let query = args["query"].as_str().ok_or("query is required")?;
-    let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+    // Same cap as REST lesson search (NELLIE_MAX_RESULT_LIMIT, else 100).
+    let limit = crate::storage::lesson_search_limit(
+        args["limit"].as_u64().unwrap_or(5) as usize,
+        state.max_result_limit,
+    );
 
     // CRITICAL: Embedding service MUST be initialized for semantic search
     let embeddings = state.embeddings.as_ref().ok_or_else(|| {
@@ -1697,10 +1701,12 @@ async fn handle_search_lessons(
         .await
         .map_err(|e| format!("Failed to generate query embedding: {e}"))?;
 
-    // Search lessons using vector similarity
+    // Fuse keyword and vector rankings (see storage::search_lessons_hybrid)
     let lessons = state
         .db
-        .with_conn(|conn| crate::storage::search_lessons_by_embedding(conn, &embedding, limit))
+        .with_conn(|conn| {
+            crate::storage::search_lessons_hybrid(conn, query, Some(&embedding), limit)
+        })
         .map_err(|e| e.to_string())?;
 
     Ok(serde_json::to_value(&lessons).unwrap_or_default())

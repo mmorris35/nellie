@@ -53,9 +53,11 @@ pub use lessons::{
     list_lessons_by_agent, list_lessons_by_severity, update_lesson,
 };
 pub use lessons_search::{
-    filter_lessons_by_tag_and_severity, get_all_tags, init_lesson_vectors,
-    search_lessons_by_embedding, search_lessons_by_tag, search_lessons_by_tags_all,
-    search_lessons_by_tags_any, search_lessons_by_text, store_lesson_embedding,
+    filter_lessons_by_tag_and_severity, get_all_tags, init_lesson_vectors, lesson_keyword_query,
+    lesson_search_limit, search_lessons_by_embedding, search_lessons_by_keyword,
+    search_lessons_by_tag, search_lessons_by_tags_all, search_lessons_by_tags_any,
+    search_lessons_by_text, search_lessons_hybrid, store_lesson_embedding, LessonSearchHit,
+    LESSON_MIN_CANDIDATES, LESSON_RRF_K, LESSON_SEARCH_DEFAULT_CAP,
 };
 pub use models::{CheckpointRecord, ChunkRecord, FileState, LessonRecord, SearchResult};
 pub use schema::{migrate, verify_schema, SCHEMA_VERSION};

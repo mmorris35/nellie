@@ -198,7 +198,8 @@ impl NellieMcpHandler {
 
     #[tool(description = "Search previously recorded lessons learned")]
     fn search_lessons(&self, Parameters(req): Parameters<SearchLessonsRequest>) -> String {
-        let limit = req.limit.unwrap_or(5) as usize;
+        // This transport has no server config, so it uses the default cap.
+        let limit = crate::storage::lesson_search_limit(req.limit.unwrap_or(5) as usize, None);
 
         let Some(ref embeddings) = self.embeddings else {
             return serde_json::json!({"error": "Embedding service not initialized"}).to_string();
@@ -210,9 +211,10 @@ impl NellieMcpHandler {
         }
 
         let embeddings_clone = embeddings.clone();
+        let query_text = req.query.clone();
         let embedding = match std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(async { embeddings_clone.embed_one(req.query.clone()).await })
+            rt.block_on(async { embeddings_clone.embed_one(query_text).await })
         })
         .join()
         {
@@ -223,10 +225,9 @@ impl NellieMcpHandler {
             Err(_) => return serde_json::json!({"error": "Embedding thread panicked"}).to_string(),
         };
 
-        match self
-            .db
-            .with_conn(|conn| crate::storage::search_lessons_by_embedding(conn, &embedding, limit))
-        {
+        match self.db.with_conn(|conn| {
+            crate::storage::search_lessons_hybrid(conn, &req.query, Some(&embedding), limit)
+        }) {
             Ok(lessons) => serde_json::to_string(&lessons).unwrap_or_else(|_| "[]".to_string()),
             Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
         }

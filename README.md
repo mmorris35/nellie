@@ -345,7 +345,7 @@ mcp:
 |------|-------------|
 | `search_code` | Semantic search across indexed code |
 | `search_hybrid` | Vector search + graph expansion for richer context |
-| `search_lessons` | Find lessons by natural language |
+| `search_lessons` | Find lessons by natural language or exact terms (keyword + vector fusion, see below) |
 | `search_checkpoints` | Search checkpoints by content |
 
 **Memory:**
@@ -384,6 +384,33 @@ mcp:
 | `query_structure` | Query function/class relationships — callers, callees, definitions |
 | `get_review_context` | Get semantic context for code review of changed files |
 
+### How lesson search ranks results
+
+`search_lessons` (MCP) and `GET /api/v1/lessons/search` combine two rankings:
+
+- **Keyword**: BM25 over each lesson's title, content and tags (SQLite FTS5,
+  Porter stemming). This finds exact identifiers an embedding model blurs:
+  error codes, message ids, commit hashes, file names, hostnames.
+- **Vector**: similarity between the query and lesson embeddings.
+
+Each ranking contributes its top `max(limit, 10)` lessons, and the union is
+ordered by Reciprocal Rank Fusion: a lesson scores the sum of `1 / (60 + rank)`
+over the rankings it appears in. Every query word is quoted before it reaches
+FTS5, so operators (`AND`, `NEAR`, `*`, `col:`, `-`, quotes, parentheses) are
+searched as text and cannot change or break the query. A query of only common
+words (or no words) is ranked by vectors alone; without an embedding service
+the REST endpoint ranks by keywords alone (`search_type: "text"`).
+
+What the result fields mean:
+
+| Field | Meaning |
+|-------|---------|
+| `score` | Fused relevance in `[0, 1]`: the lesson's RRF sum divided by the largest possible sum, `2 / 61` (first in both rankings). Results are ordered by it and, because the denominator is fixed, it is comparable across queries. `1.0` = first in both rankings; first in one ranking and absent from the other ≈ `0.5`; when only one ranking runs (no embedding service, or a query of only common words) the top hit scores `0.5`. It is not a cosine similarity. |
+| `similarity` | Cosine similarity between the query and lesson vectors, or `null` if the lesson was found by keyword search only. |
+| `keyword_rank` | 1-based position in the keyword (BM25) ranking, or `null` if the lesson was found by vector search only. |
+| `distance` (MCP) | L2 distance between the query and lesson vectors (`0..2`), or `null` if the lesson was found by keyword search only. |
+| `search_type` (REST) | `hybrid` (both rankings), `text` (no embedding service: keywords, then a substring match whose results have no `score`), `none` (empty query). |
+
 ## REST API
 
 | Endpoint | Method | Description |
@@ -396,6 +423,7 @@ mcp:
 | `/api/v1/search` | GET | Semantic code search |
 | `/api/v1/search/hybrid` | GET | Hybrid search (vector + graph) |
 | `/api/v1/lessons` | GET/POST | List or add lessons |
+| `/api/v1/lessons/search` | GET | Search lessons (`q`, `limit`; keyword + vector fusion) |
 | `/api/v1/lessons/{id}` | DELETE | Delete a lesson |
 | `/api/v1/checkpoints` | GET | List checkpoints |
 | `/api/v1/agents` | GET | List agents |

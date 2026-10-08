@@ -112,7 +112,7 @@ Use `nellie.add_lesson` when you learn something worth remembering:
 ```
 
 **Other search tools:**
-- `search_lessons` — search only lessons by text
+- `search_lessons` — search only lessons (keyword + semantic fusion; exact identifiers like error codes match too)
 - `search_checkpoints` — search checkpoints by text, optionally filtered by agent
 - `search_code` — semantic code search across indexed repositories
 - `query_graph` — traverse the knowledge graph by entity label
