@@ -69,6 +69,17 @@ const SIMILARITY_THRESHOLD: f64 = 0.85;
 /// but differ significantly overall.
 const CONTENT_PREVIEW_LENGTH: usize = 200;
 
+fn truncate_to_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Weight for recency in relevance scoring (0.0..1.0).
 ///
 /// Memories that have been recently updated score higher.
@@ -238,8 +249,10 @@ fn are_duplicates(a: &MemoryFile, b: &MemoryFile) -> bool {
         return true;
     }
 
-    let content_a = &a.content[..a.content.len().min(CONTENT_PREVIEW_LENGTH)];
-    let content_b = &b.content[..b.content.len().min(CONTENT_PREVIEW_LENGTH)];
+    let end_a = truncate_to_char_boundary(&a.content, CONTENT_PREVIEW_LENGTH);
+    let end_b = truncate_to_char_boundary(&b.content, CONTENT_PREVIEW_LENGTH);
+    let content_a = &a.content[..end_a];
+    let content_b = &b.content[..end_b];
     let content_similarity = jaro_winkler(content_a, content_b);
 
     content_similarity >= SIMILARITY_THRESHOLD
