@@ -16,8 +16,10 @@ pub use model::{
 };
 pub use service::{placeholder_embedding, EmbeddingConfig, EmbeddingService};
 pub use spec::{
-    checkpoint_embedding_text, chunk_embedding_text, lesson_embedding_text, EmbeddingSpec,
-    MODEL_ID, NORMALISATION_L2, SPECIAL_TOKENS_INTACT, SPECIAL_TOKENS_TRUNCATED,
+    checkpoint_embedding_text, chunk_embedding_text, lesson_embedding_text, lesson_section_texts,
+    EmbeddingSpec, LESSON_SECTION_OVERLAP, LESSON_SECTION_TOKENS, LESSON_VECTORS_SECTIONS,
+    LESSON_VECTORS_WHOLE, MODEL_ID, NORMALISATION_L2, SPECIAL_TOKENS_INTACT,
+    SPECIAL_TOKENS_TRUNCATED,
 };
 pub use worker::{configure_tokenizer, load_tokenizer, EmbeddingWorker};
 

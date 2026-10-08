@@ -391,7 +391,13 @@ mcp:
 - **Keyword**: BM25 over each lesson's title, content and tags (SQLite FTS5,
   Porter stemming). This finds exact identifiers an embedding model blurs:
   error codes, message ids, commit hashes, file names, hostnames.
-- **Vector**: similarity between the query and lesson embeddings.
+- **Vector**: similarity between the query and lesson embeddings. The model
+  reads at most 256 tokens, so a longer lesson gets one vector per section:
+  its paragraphs are grouped into sections of up to 200 tokens (measured with
+  the model's tokenizer), consecutive sections repeat up to 40 tokens of
+  whole paragraphs, and each section is prefixed with the title. A lesson
+  ranks by its best section, so a fact deep in a long lesson can still be
+  found. Shorter lessons keep a single vector.
 
 Each ranking contributes its top `max(limit, 10)` lessons, and the union is
 ordered by Reciprocal Rank Fusion: a lesson scores the sum of `1 / (60 + rank)`
@@ -401,12 +407,19 @@ searched as text and cannot change or break the query. A query of only common
 words (or no words) is ranked by vectors alone; without an embedding service
 the REST endpoint ranks by keywords alone (`search_type: "text"`).
 
+**Upgrading an existing index:** per-section lesson vectors are a new index
+layout, so the first start after upgrading asks for `nellie reembed` (the
+same steps as in the 0.5.3 upgrade note above, including the `--no-switch`
+pre-build). Only lessons are embedded again; code chunk and checkpoint
+vectors are reused as they are, so the rebuild takes minutes rather than
+hours.
+
 What the result fields mean:
 
 | Field | Meaning |
 |-------|---------|
 | `score` | Fused relevance in `[0, 1]`: the lesson's RRF sum divided by the largest possible sum, `2 / 61` (first in both rankings). Results are ordered by it and, because the denominator is fixed, it is comparable across queries. `1.0` = first in both rankings; first in one ranking and absent from the other ≈ `0.5`; when only one ranking runs (no embedding service, or a query of only common words) the top hit scores `0.5`. It is not a cosine similarity. |
-| `similarity` | Cosine similarity between the query and lesson vectors, or `null` if the lesson was found by keyword search only. |
+| `similarity` | Cosine similarity between the query and the lesson's best-matching vector (section), or `null` if the lesson was found by keyword search only. |
 | `keyword_rank` | 1-based position in the keyword (BM25) ranking, or `null` if the lesson was found by vector search only. |
 | `distance` (MCP) | L2 distance between the query and lesson vectors (`0..2`), or `null` if the lesson was found by keyword search only. |
 | `search_type` (REST) | `hybrid` (both rankings), `text` (no embedding service: keywords, then a substring match whose results have no `score`), `none` (empty query). |

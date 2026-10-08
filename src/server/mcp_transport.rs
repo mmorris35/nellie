@@ -285,17 +285,17 @@ impl NellieMcpHandler {
         // Generate and store embedding if available
         if let Some(ref embeddings) = self.embeddings {
             if embeddings.is_initialized() {
-                let text = crate::embeddings::lesson_embedding_text(&lesson.title, &lesson.content);
                 let embeddings_clone = embeddings.clone();
                 let lesson_id = lesson.id;
+                let (title, content) = (lesson.title, lesson.content);
                 let db = self.db.clone();
                 std::thread::spawn(move || {
                     if let Ok(rt) = tokio::runtime::Runtime::new() {
-                        if let Ok(embedding) =
-                            rt.block_on(async { embeddings_clone.embed_one(text).await })
-                        {
+                        if let Ok(vectors) = rt.block_on(async {
+                            embeddings_clone.embed_lesson(&title, &content).await
+                        }) {
                             let _ = db.with_conn(|conn| {
-                                crate::storage::store_lesson_embedding(conn, &lesson_id, &embedding)
+                                crate::storage::store_lesson_embeddings(conn, &lesson_id, &vectors)
                             });
                         }
                     }

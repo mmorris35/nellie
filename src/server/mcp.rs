@@ -1875,14 +1875,15 @@ async fn handle_add_lesson(
     // Generate and store embedding for semantic search
     if let Some(ref embeddings) = state.embeddings {
         if embeddings.is_initialized() {
-            // Same text format as every other lesson insert path and reembed
-            let text_to_embed =
-                crate::embeddings::lesson_embedding_text(&lesson.title, &lesson.content);
-
-            if let Ok(embedding) = embeddings.embed_one(text_to_embed).await {
-                // Store embedding in vector table (ignore errors, embedding is optional for backward compat)
+            // Same texts (one per section) as every other lesson insert path
+            // and reembed
+            if let Ok(vectors) = embeddings
+                .embed_lesson(&lesson.title, &lesson.content)
+                .await
+            {
+                // Store embeddings in vector table (ignore errors, embedding is optional for backward compat)
                 let _ = state.db.with_conn(|conn| {
-                    crate::storage::store_lesson_embedding(conn, &lesson.id, &embedding)
+                    crate::storage::store_lesson_embeddings(conn, &lesson.id, &vectors)
                 });
             }
         }

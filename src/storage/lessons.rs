@@ -92,6 +92,15 @@ pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
         .as_secs();
     let now_i64 = i64::try_from(now).unwrap_or_default();
 
+    let text_changed = match conn.query_row(
+        "SELECT title, content FROM lessons WHERE id = ?",
+        [&lesson.id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ) {
+        Ok((title, content)) => title != lesson.title || content != lesson.content,
+        Err(_) => true,
+    };
+
     let rows = retry_on_schema_change(conn, || {
         conn.execute(
             "UPDATE lessons SET title = ?, content = ?, tags = ?, severity = ?, updated_at = ?
@@ -116,7 +125,22 @@ pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
         .into());
     }
 
+    // Vectors of the old text no longer describe the lesson; the caller
+    // stores new ones (or the next server start embeds the lesson again).
+    if text_changed {
+        forget_vectors(conn, &lesson.id);
+    }
+
     Ok(())
+}
+
+/// Remove a lesson's vectors from the active vector table. Best effort: the
+/// lesson row change has already happened, and leftover vectors are removed
+/// at the next server start anyway.
+fn forget_vectors(conn: &Connection, id: &str) {
+    if let Err(e) = super::lessons_search::remove_active_lesson_vectors(conn, id) {
+        tracing::warn!(lesson_id = %id, error = %e, "Failed to remove lesson vectors");
+    }
 }
 
 /// Delete a lesson by ID.
@@ -137,6 +161,9 @@ pub fn delete_lesson(conn: &Connection, id: &str) -> Result<()> {
         }
         .into());
     }
+
+    // All of the lesson's vectors (every section) go with it.
+    forget_vectors(conn, id);
 
     Ok(())
 }

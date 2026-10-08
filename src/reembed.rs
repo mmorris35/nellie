@@ -27,26 +27,45 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, Row};
 
 use crate::embeddings::{
-    checkpoint_embedding_text, chunk_embedding_text, lesson_embedding_text, EmbeddingService,
-    EmbeddingSpec,
+    checkpoint_embedding_text, chunk_embedding_text, lesson_embedding_text, lesson_section_texts,
+    EmbeddingService, EmbeddingSpec,
 };
 use crate::error::StorageError;
 use crate::storage::embedding_meta::{
-    active_meta, create_vector_tables, record_active, table_exists, VectorTables, CURRENT_TABLES,
-    KNOWN_TABLE_SETS,
+    active_meta, create_vector_tables, is_section_table, owner_column, record_active, table_exists,
+    VectorTables, CURRENT_TABLES, KNOWN_TABLE_SETS,
 };
 use crate::storage::Database;
+use crate::storage::{insert_lesson_vectors, section_id};
 use crate::{Error, Result};
 
 /// Anything that can turn texts into embedding vectors.
 pub trait Embedder: Sync {
     /// Embed a batch of texts, returning one vector per text.
     fn embed(&self, texts: Vec<String>) -> impl Future<Output = Result<Vec<Vec<f32>>>> + Send;
+
+    /// Texts to embed for a lesson stored with one vector per section.
+    ///
+    /// The default measures length in whitespace-separated words, which is
+    /// only good enough for tests; [`EmbeddingService`] uses its tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text cannot be measured.
+    fn lesson_texts(&self, title: &str, content: &str) -> Result<Vec<String>> {
+        Ok(lesson_section_texts(title, content, |t| {
+            t.split_whitespace().count()
+        }))
+    }
 }
 
 impl Embedder for EmbeddingService {
     fn embed(&self, texts: Vec<String>) -> impl Future<Output = Result<Vec<Vec<f32>>>> + Send {
         self.embed_batch(texts)
+    }
+
+    fn lesson_texts(&self, title: &str, content: &str) -> Result<Vec<String>> {
+        Self::lesson_texts(self, title, content)
     }
 }
 
@@ -99,15 +118,30 @@ impl Kind {
         }
     }
 
-    /// Build the embedded text from a row of `SELECT id, <text_columns>`,
-    /// using the same function as the insert paths.
-    fn text_from_row(self, row: &Row<'_>) -> rusqlite::Result<String> {
+    /// The text columns of a row of `SELECT id, <text_columns>`.
+    fn columns_from_row(self, row: &Row<'_>) -> rusqlite::Result<Vec<String>> {
+        let n = match self {
+            Self::Lessons => 2,
+            Self::Checkpoints | Self::Chunks => 1,
+        };
+        (1..=n).map(|i| row.get::<_, String>(i)).collect()
+    }
+
+    /// The texts to embed for a row (one per vector), using the same
+    /// functions as the insert paths. Lessons stored in a section table get
+    /// one text per section.
+    fn texts<E: Embedder>(
+        self,
+        embedder: &E,
+        table: &str,
+        columns: &[String],
+    ) -> Result<Vec<String>> {
+        let col = |i: usize| columns.get(i).map_or("", String::as_str);
         Ok(match self {
-            Self::Lessons => {
-                lesson_embedding_text(&row.get::<_, String>(1)?, &row.get::<_, String>(2)?)
-            }
-            Self::Checkpoints => checkpoint_embedding_text(&row.get::<_, String>(1)?),
-            Self::Chunks => chunk_embedding_text(&row.get::<_, String>(1)?),
+            Self::Lessons if is_section_table(table) => embedder.lesson_texts(col(0), col(1))?,
+            Self::Lessons => vec![lesson_embedding_text(col(0), col(1))],
+            Self::Checkpoints => vec![checkpoint_embedding_text(col(0))],
+            Self::Chunks => vec![chunk_embedding_text(col(0))],
         })
     }
 }
@@ -216,19 +250,21 @@ fn count(conn: &Connection, sql: &str) -> Result<u64> {
 /// Source rows not yet present in `target`.
 fn missing_count(conn: &Connection, kind: Kind, target: &str) -> Result<u64> {
     let src = kind.source_table();
+    let owner = owner_column(target);
     count(
         conn,
-        &format!("SELECT COUNT(*) FROM {src} WHERE id NOT IN (SELECT id FROM {target})"),
+        &format!("SELECT COUNT(*) FROM {src} WHERE id NOT IN (SELECT {owner} FROM {target})"),
     )
 }
 
-/// Next page of source rows after `after` (keyset pagination by id).
+/// Next page of source rows after `after` (keyset pagination by id), with
+/// their text columns.
 fn next_page(
     conn: &Connection,
     kind: Kind,
     after: &Value,
     limit: usize,
-) -> Result<Vec<(Value, String)>> {
+) -> Result<Vec<(Value, Vec<String>)>> {
     let sql = format!(
         "SELECT id, {} FROM {} WHERE id > ? ORDER BY id LIMIT ?",
         kind.text_columns(),
@@ -240,43 +276,61 @@ fn next_page(
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt
         .query_map(rusqlite::params![after, limit], |row| {
-            Ok((row.get::<_, Value>(0)?, kind.text_from_row(row)?))
+            Ok((row.get::<_, Value>(0)?, kind.columns_from_row(row)?))
         })
         .map_err(|e| db_err("failed to read source rows", &e))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| db_err("failed to read source row", &e))
 }
 
+/// Does the row `id` have its vectors in `table`? A lesson's sections are
+/// always written together, so section 0 stands for all of them (and keeps
+/// this a primary-key lookup).
 fn has_vector(conn: &Connection, table: &str, id: &Value) -> Result<bool> {
+    let key = match id {
+        Value::Text(lesson) if is_section_table(table) => Value::Text(section_id(lesson, 0)),
+        other => other.clone(),
+    };
     conn.query_row(
         &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?)"),
-        [id],
+        [key],
         |r| r.get(0),
     )
     .map_err(|e| db_err("failed to check vector", &e))
 }
 
-/// Insert vectors, skipping ids that already have one or whose row has been
-/// deleted meanwhile (a server may write the same tables). Returns how many
-/// were inserted. Run inside a transaction.
+/// Insert vectors (one or more per row), skipping rows that already have
+/// them or whose row has been deleted meanwhile (a server may write the same
+/// tables). Returns how many rows got vectors. Run inside a transaction.
 fn insert_vectors(
     conn: &Connection,
     kind: Kind,
     table: &str,
-    rows: &[(Value, Vec<f32>)],
+    rows: &[(Value, Vec<Vec<f32>>)],
 ) -> Result<u64> {
     let sql = format!("INSERT INTO {table} (id, embedding) VALUES (?, ?)");
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| db_err("failed to prepare insert", &e))?;
     let mut inserted = 0;
-    for (id, embedding) in rows {
+    for (id, embeddings) in rows {
         if has_vector(conn, table, id)? || !has_source(conn, kind, id)? {
             continue;
         }
-        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        stmt.execute(rusqlite::params![id, blob])
-            .map_err(|e| db_err("failed to insert vector", &e))?;
+        if let (Kind::Lessons, Value::Text(lesson)) = (kind, id) {
+            insert_lesson_vectors(conn, table, lesson, embeddings)?;
+        } else {
+            let [embedding] = embeddings.as_slice() else {
+                return Err(Error::internal(format!(
+                    "{} rows take one vector, got {}",
+                    kind.name(),
+                    embeddings.len()
+                )));
+            };
+            let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            stmt.execute(rusqlite::params![id, blob])
+                .map_err(|e| db_err("failed to insert vector", &e))?;
+        }
         inserted += 1;
     }
     Ok(inserted)
@@ -297,13 +351,14 @@ fn has_source(conn: &Connection, kind: Kind, id: &Value) -> Result<bool> {
 /// Vectors in `table` whose source row no longer exists.
 fn orphan_count(conn: &Connection, kind: Kind, table: &str) -> Result<u64> {
     let src = kind.source_table();
+    let owner = owner_column(table);
     count(
         conn,
-        &format!("SELECT COUNT(*) FROM {table} WHERE id NOT IN (SELECT id FROM {src})"),
+        &format!("SELECT COUNT(*) FROM {table} WHERE {owner} NOT IN (SELECT id FROM {src})"),
     )
 }
 
-/// Delete the vectors with these ids from `table`.
+/// Delete the vectors with these vector-row ids from `table`.
 fn delete_vectors(conn: &Connection, table: &str, ids: &[Value]) -> Result<u64> {
     let mut stmt = conn
         .prepare(&format!("DELETE FROM {table} WHERE id = ?"))
@@ -328,13 +383,15 @@ fn select_ids(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Re
         .map_err(|e| db_err("failed to read id", &e))
 }
 
-/// Remove vectors in `table` whose source row has been deleted.
+/// Remove vectors in `table` whose source row has been deleted. Returns how
+/// many vectors were removed.
 fn remove_orphans(db: &Database, kind: Kind, table: &str) -> Result<u64> {
     let src = kind.source_table();
+    let owner = owner_column(table);
     db.with_transaction(|conn| {
         let ids = select_ids(
             conn,
-            &format!("SELECT id FROM {table} WHERE id NOT IN (SELECT id FROM {src})"),
+            &format!("SELECT id FROM {table} WHERE {owner} NOT IN (SELECT id FROM {src})"),
             [],
         )?;
         delete_vectors(conn, table, &ids)
@@ -342,17 +399,22 @@ fn remove_orphans(db: &Database, kind: Kind, table: &str) -> Result<u64> {
 }
 
 /// Remove the vectors of lessons edited at or after `since`, so they are
-/// embedded again from their current text.
+/// embedded again from their current text. Returns how many lessons lost
+/// their vectors.
 fn remove_edited_lessons(db: &Database, table: &str, since: i64) -> Result<u64> {
+    let owner = owner_column(table);
     db.with_transaction(|conn| {
+        let edited = format!(
+            "SELECT id FROM lessons WHERE updated_at >= ? AND id IN (SELECT {owner} FROM {table})"
+        );
+        let lessons = select_ids(conn, &edited, [since])?;
         let ids = select_ids(
             conn,
-            &format!(
-                "SELECT id FROM lessons WHERE updated_at >= ? AND id IN (SELECT id FROM {table})"
-            ),
+            &format!("SELECT id FROM {table} WHERE {owner} IN ({edited})"),
             [since],
         )?;
-        delete_vectors(conn, table, &ids)
+        delete_vectors(conn, table, &ids)?;
+        Ok(u64::try_from(lessons.len()).unwrap_or(u64::MAX))
     })
 }
 
@@ -380,33 +442,36 @@ fn id_string(id: &Value) -> String {
     }
 }
 
-/// A batch failed: embed its rows one at a time to find the rows that cannot
-/// be embedded. If none succeed the failure is not row-specific (e.g. the
-/// model is unavailable) and `batch_err` is returned.
+/// One text of a pending row: `(row index, text index, text)`.
+type PendingText<'a> = (usize, usize, &'a str);
+
+/// A batch failed: embed its texts one at a time to find the ones that
+/// cannot be embedded. If none succeed the failure is not row-specific (e.g.
+/// the model is unavailable) and `batch_err` is returned. Failures are
+/// recorded per row in `errors`.
 async fn embed_one_by_one<E: Embedder>(
     embedder: &E,
-    chunk: &[(Value, String)],
+    chunk: &[PendingText<'_>],
     batch_err: Error,
-    rows: &mut Vec<(Value, Vec<f32>)>,
-    failed: &mut Vec<(String, String)>,
+    vectors: &mut [Vec<Option<Vec<f32>>>],
+    errors: &mut [Option<String>],
 ) -> Result<()> {
-    let mut chunk_failed = Vec::new();
-    let before = rows.len();
-    for (id, text) in chunk {
-        match embedder.embed(vec![text.clone()]).await {
-            Ok(mut v) if v.len() == 1 => rows.push((id.clone(), v.remove(0))),
-            Ok(v) => chunk_failed.push((id_string(id), format!("{} vectors for 1 text", v.len()))),
-            Err(e) => chunk_failed.push((id_string(id), e.to_string())),
+    let mut any_ok = false;
+    for &(row, index, text) in chunk {
+        match embedder.embed(vec![text.to_string()]).await {
+            Ok(mut v) if v.len() == 1 => {
+                vectors[row][index] = Some(v.remove(0));
+                any_ok = true;
+            }
+            Ok(v) => errors[row] = Some(format!("{} vectors for 1 text", v.len())),
+            Err(e) => errors[row] = Some(e.to_string()),
         }
     }
-    if rows.len() == before {
-        return Err(batch_err);
+    if any_ok {
+        Ok(())
+    } else {
+        Err(batch_err)
     }
-    for (id, e) in &chunk_failed {
-        tracing::warn!(id = %id, error = %e, "Row could not be embedded");
-    }
-    failed.extend(chunk_failed);
-    Ok(())
 }
 
 async fn reembed_kind<E: Embedder>(
@@ -433,7 +498,10 @@ async fn reembed_kind<E: Embedder>(
         let orphaned_old_vectors = if previous != target && table_exists(conn, previous)? {
             count(
                 conn,
-                &format!("SELECT COUNT(*) FROM {previous} WHERE id NOT IN (SELECT id FROM {src})"),
+                &format!(
+                    "SELECT COUNT(*) FROM {previous} WHERE {} NOT IN (SELECT id FROM {src})",
+                    owner_column(previous)
+                ),
             )?
         } else {
             0
@@ -453,8 +521,9 @@ async fn reembed_kind<E: Embedder>(
     let mut after = Value::Integer(i64::MIN);
 
     loop {
-        // Collect up to `group` rows that are not in the new table yet.
-        let mut pending: Vec<(Value, String)> = Vec::with_capacity(group);
+        // Collect up to `group` rows that are not in the new table yet, with
+        // the texts to embed for each (several for a sectioned lesson).
+        let mut pending: Vec<(Value, Vec<String>)> = Vec::with_capacity(group);
         let mut exhausted = false;
         while pending.len() < group {
             let page = db.with_conn(|conn| next_page(conn, kind, &after, group))?;
@@ -463,23 +532,46 @@ async fn reembed_kind<E: Embedder>(
                 break;
             }
             after = page[page.len() - 1].0.clone();
-            for (id, text) in page {
-                if !db.with_conn(|conn| has_vector(conn, target, &id))? {
-                    pending.push((id, text));
+            for (id, columns) in page {
+                if db.with_conn(|conn| has_vector(conn, target, &id))? {
+                    continue;
+                }
+                match kind.texts(embedder, target, &columns) {
+                    Ok(texts) => pending.push((id, texts)),
+                    Err(e) => {
+                        tracing::warn!(id = %id_string(&id), error = %e, "Row could not be embedded");
+                        report.failed.push((id_string(&id), e.to_string()));
+                    }
                 }
             }
         }
         if pending.is_empty() {
-            break;
+            if exhausted {
+                break;
+            }
+            continue;
         }
 
-        // Embed in parallel requests, then commit the whole group at once.
-        let requests = pending
+        // Embed all texts in parallel requests, then commit the whole group
+        // at once.
+        let texts: Vec<PendingText<'_>> = pending
+            .iter()
+            .enumerate()
+            .flat_map(|(row, (_, texts))| {
+                texts
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, text)| (row, index, text.as_str()))
+            })
+            .collect();
+        let requests = texts
             .chunks(batch_size)
-            .map(|chunk| embedder.embed(chunk.iter().map(|(_, t)| t.clone()).collect()));
+            .map(|chunk| embedder.embed(chunk.iter().map(|&(_, _, t)| t.to_string()).collect()));
         let results = futures::future::join_all(requests).await;
-        let mut rows = Vec::with_capacity(pending.len());
-        for (chunk, result) in pending.chunks(batch_size).zip(results) {
+        let mut vectors: Vec<Vec<Option<Vec<f32>>>> =
+            pending.iter().map(|(_, t)| vec![None; t.len()]).collect();
+        let mut errors: Vec<Option<String>> = vec![None; pending.len()];
+        for (chunk, result) in texts.chunks(batch_size).zip(results) {
             match result {
                 Ok(embeddings) => {
                     if embeddings.len() != chunk.len() {
@@ -489,10 +581,23 @@ async fn reembed_kind<E: Embedder>(
                             chunk.len()
                         )));
                     }
-                    rows.extend(chunk.iter().map(|(id, _)| id.clone()).zip(embeddings));
+                    for (&(row, index, _), embedding) in chunk.iter().zip(embeddings) {
+                        vectors[row][index] = Some(embedding);
+                    }
                 }
                 Err(e) => {
-                    embed_one_by_one(embedder, chunk, e, &mut rows, &mut report.failed).await?;
+                    embed_one_by_one(embedder, chunk, e, &mut vectors, &mut errors).await?;
+                }
+            }
+        }
+        let mut rows = Vec::with_capacity(pending.len());
+        for (((id, _), row_vectors), error) in pending.into_iter().zip(vectors).zip(errors) {
+            match (error, row_vectors.into_iter().collect::<Option<Vec<_>>>()) {
+                (None, Some(embeddings)) => rows.push((id, embeddings)),
+                (error, _) => {
+                    let error = error.unwrap_or_else(|| "missing vector".to_string());
+                    tracing::warn!(id = %id_string(&id), error = %error, "Row could not be embedded");
+                    report.failed.push((id_string(&id), error));
                 }
             }
         }
@@ -684,11 +789,13 @@ pub fn index_gaps(conn: &Connection, tables: &VectorTables) -> Result<Vec<IndexG
         .map(|&kind| {
             let src = kind.source_table();
             let vec = kind.vector_table(tables);
+            // A lesson in a section table is missing when it has no section.
+            let owner = owner_column(vec);
             let (missing, orphaned): (i64, i64) = conn
                 .query_row(
                     &format!(
-                        "SELECT (SELECT COUNT(*) FROM {src} WHERE id NOT IN (SELECT id FROM {vec})),
-                                (SELECT COUNT(*) FROM {vec} WHERE id NOT IN (SELECT id FROM {src}))"
+                        "SELECT (SELECT COUNT(*) FROM {src} WHERE id NOT IN (SELECT {owner} FROM {vec})),
+                                (SELECT COUNT(*) FROM {vec} WHERE {owner} NOT IN (SELECT id FROM {src}))"
                     ),
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1106,12 +1213,17 @@ mod tests {
         assert!(report.switched);
     }
 
+    /// The vector of a row (section 0 for a lesson in a section table).
     fn vector(db: &Database, table: &str, id: &Value) -> Option<Vec<f32>> {
+        let key = match id {
+            Value::Text(lesson) if is_section_table(table) => Value::Text(section_id(lesson, 0)),
+            other => other.clone(),
+        };
         db.with_conn(|conn| {
             let blob: Option<Vec<u8>> = conn
                 .query_row(
                     &format!("SELECT embedding FROM {table} WHERE id = ?"),
-                    [id],
+                    [key],
                     |r| r.get(0),
                 )
                 .optional()
@@ -1351,7 +1463,9 @@ mod tests {
             .into_iter()
             .find(|l| l.title == "Lesson 0")
             .unwrap();
-        crate::storage::delete_lesson(&old, &removed.id).unwrap();
+        // The old server deletes the row but not the new tables' vectors.
+        old.execute("DELETE FROM lessons WHERE id = ?", [&removed.id])
+            .unwrap();
         insert_checkpoint(
             &old,
             &CheckpointRecord::new("agent", "after switch", serde_json::json!({})),
@@ -1388,6 +1502,256 @@ mod tests {
         );
     }
 
+    /// Six 60-word paragraphs: two sections with the test embedder's
+    /// word-count tokenizer.
+    fn long_content(tag: &str) -> String {
+        (0..6)
+            .map(|p| {
+                (0..60)
+                    .map(|w| format!("{tag}{p}w{w}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn sections_of(db: &Database, lesson_id: &str) -> u64 {
+        db.with_conn(|conn| {
+            let n: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {} WHERE lesson_id = ?",
+                        CURRENT_TABLES.lessons
+                    ),
+                    [lesson_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            Ok(u64::try_from(n).unwrap())
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn long_lessons_get_one_vector_per_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = legacy_db(dir.path(), 3);
+        let long = LessonRecord::new("Long lesson", long_content("x"), vec![]);
+        db.with_conn(|conn| insert_lesson(conn, &long)).unwrap();
+        let texts = FakeEmbedder::ok()
+            .lesson_texts(&long.title, &long.content)
+            .unwrap();
+        assert_eq!(texts.len(), 2);
+
+        let report = run_reembed(&db, &FakeEmbedder::ok(), &opts(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(report.switched);
+        assert_eq!(report.lessons.embedded, 4);
+        assert_eq!(rows(&db, CURRENT_TABLES.lessons), 3 + 2);
+        assert_eq!(sections_of(&db, &long.id), 2);
+        assert_index_matches(&db, &CURRENT_TABLES);
+
+        // A query matching the second section finds the lesson, at that
+        // section's distance, once.
+        let query = placeholder_embedding(&texts[1]);
+        let hits = db
+            .with_conn(|conn| search_lessons_by_embedding(conn, &query, 10))
+            .unwrap();
+        assert_eq!(hits[0].record.id, long.id);
+        assert!(hits[0].distance < 1e-3);
+        assert_eq!(hits.iter().filter(|h| h.record.id == long.id).count(), 1);
+        assert_eq!(hits.len(), 4);
+
+        // Startup repair: a lesson with no section rows is missing, and is
+        // embedded again with all its sections.
+        db.with_conn(|conn| {
+            conn.execute(
+                &format!("DELETE FROM {} WHERE lesson_id = ?", CURRENT_TABLES.lessons),
+                [&long.id],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let gaps = db
+            .with_conn(|conn| index_gaps(conn, &CURRENT_TABLES))
+            .unwrap();
+        assert_eq!(gaps[0].kind, Kind::Lessons);
+        assert_eq!((gaps[0].missing, gaps[0].orphaned), (1, 0));
+        embed_missing(&db, &FakeEmbedder::ok(), &CURRENT_TABLES, &opts())
+            .await
+            .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 2);
+        assert_index_matches(&db, &CURRENT_TABLES);
+
+        // Orphaned sections (a row deleted behind the index's back) are
+        // counted per vector and all removed.
+        db.with_conn(|conn| {
+            conn.execute("DELETE FROM lessons WHERE id = ?", [&long.id])
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let gaps = db
+            .with_conn(|conn| index_gaps(conn, &CURRENT_TABLES))
+            .unwrap();
+        assert_eq!((gaps[0].missing, gaps[0].orphaned), (0, 2));
+        assert_eq!(remove_orphaned_vectors(&db, &CURRENT_TABLES).unwrap(), 2);
+        assert_index_matches(&db, &CURRENT_TABLES);
+    }
+
+    #[tokio::test]
+    async fn deleting_or_editing_a_lesson_removes_all_its_sections() {
+        let db = Database::open_in_memory().unwrap();
+        init_storage(&db).unwrap();
+        let mut long = LessonRecord::new("Long lesson", long_content("y"), vec![]);
+        let other = LessonRecord::new("Other", "short", vec![]);
+        db.with_conn(|conn| {
+            insert_lesson(conn, &long)?;
+            insert_lesson(conn, &other)
+        })
+        .unwrap();
+        embed_missing(&db, &FakeEmbedder::ok(), &CURRENT_TABLES, &opts())
+            .await
+            .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 2);
+
+        // Storing new vectors replaces every old section.
+        db.with_conn(|conn| {
+            crate::storage::store_lesson_embeddings(
+                conn,
+                &long.id,
+                &[
+                    placeholder_embedding("a"),
+                    placeholder_embedding("b"),
+                    placeholder_embedding("c"),
+                ],
+            )
+        })
+        .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 3);
+        db.with_conn(|conn| {
+            crate::storage::store_lesson_embedding(conn, &long.id, &placeholder_embedding("d"))
+        })
+        .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 1);
+
+        // A tag-only edit keeps the vectors; a text edit drops them all.
+        long.tags = vec!["tag".to_string()];
+        db.with_conn(|conn| crate::storage::update_lesson(conn, &long))
+            .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 1);
+        long.content = long_content("z");
+        db.with_conn(|conn| crate::storage::update_lesson(conn, &long))
+            .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 0);
+        embed_missing(&db, &FakeEmbedder::ok(), &CURRENT_TABLES, &opts())
+            .await
+            .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 2);
+
+        db.with_conn(|conn| crate::storage::delete_lesson(conn, &long.id))
+            .unwrap();
+        assert_eq!(sections_of(&db, &long.id), 0);
+        assert_eq!(sections_of(&db, &other.id), 1);
+        assert_index_matches(&db, &CURRENT_TABLES);
+    }
+
+    #[tokio::test]
+    async fn rebuild_from_whole_lesson_tables_only_embeds_lessons() {
+        use crate::embeddings::LESSON_VECTORS_WHOLE;
+        use crate::storage::embedding_meta::MINILM256_WHOLE_TABLES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("nellie.db")).unwrap();
+        let whole = EmbeddingSpec {
+            lesson_vectors: LESSON_VECTORS_WHOLE.to_string(),
+            ..EmbeddingSpec::current()
+        };
+        let long = LessonRecord::new("Long lesson", long_content("w"), vec![]);
+        db.with_conn(|conn| {
+            migrate(conn)?;
+            create_vector_tables(conn, &MINILM256_WHOLE_TABLES)?;
+            record_active(conn, &whole, &MINILM256_WHOLE_TABLES, "fresh")?;
+            let blob = |t: &str| -> Vec<u8> {
+                placeholder_embedding(t)
+                    .iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect()
+            };
+            for mut lesson in [LessonRecord::new("Short", "body", vec![]), long.clone()] {
+                // Written well before the rebuild starts.
+                lesson.created_at -= 1000;
+                lesson.updated_at -= 1000;
+                insert_lesson(conn, &lesson)?;
+                conn.execute(
+                    "INSERT INTO lesson_embeddings_minilm256 (id, embedding) VALUES (?, ?)",
+                    rusqlite::params![lesson.id, blob("whole")],
+                )
+                .unwrap();
+            }
+            let checkpoint = CheckpointRecord::new("agent", "cp", serde_json::json!({}));
+            insert_checkpoint(conn, &checkpoint)?;
+            conn.execute(
+                "INSERT INTO checkpoint_embeddings_minilm256 (id, embedding) VALUES (?, ?)",
+                rusqlite::params![checkpoint.id, blob("cp")],
+            )
+            .unwrap();
+            let chunk = insert_chunk(
+                conn,
+                &ChunkRecord::new("/src/a.rs", 0, 1, 3, "fn a() {}", "h"),
+            )?;
+            conn.execute(
+                "INSERT INTO chunk_embeddings_minilm256 (id, embedding) VALUES (?, ?)",
+                rusqlite::params![chunk, blob("chunk")],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        init_storage(&db).unwrap();
+        // The guard asks for a rebuild.
+        assert!(db
+            .with_conn(|conn| crate::storage::embedding_meta::check_spec(
+                conn,
+                Path::new("/nonexistent/tokenizer.json")
+            ))
+            .unwrap()
+            .is_err());
+
+        // Pre-build beside a running server, then the switching run.
+        let mut o = opts();
+        o.switch = false;
+        let pre = run_reembed(&db, &FakeEmbedder::ok(), &o, &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(pre.lessons.embedded, 2);
+        assert_eq!((pre.checkpoints.embedded, pre.chunks.embedded), (0, 0));
+        assert_eq!((pre.checkpoints.skipped, pre.chunks.skipped), (1, 1));
+        o.switch = true;
+        o.drop_old = true;
+        let report = run_reembed(&db, &FakeEmbedder::ok(), &o, &mut |_| {})
+            .await
+            .unwrap();
+        assert!(report.switched);
+        assert_eq!(report.lessons.embedded, 0);
+        assert_eq!(report.dropped, vec![MINILM256_WHOLE_TABLES.lessons]);
+        assert_eq!(db.with_conn(active_tables).unwrap(), CURRENT_TABLES);
+        assert_eq!(sections_of(&db, &long.id), 2);
+        // Chunk and checkpoint vectors were kept, not re-embedded.
+        assert_eq!(rows(&db, CURRENT_TABLES.chunks), 1);
+        assert_index_matches(&db, &CURRENT_TABLES);
+        assert!(db
+            .with_conn(|conn| crate::storage::embedding_meta::check_spec(
+                conn,
+                Path::new("/nonexistent/tokenizer.json")
+            ))
+            .unwrap()
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn embed_missing_skips_rows_that_got_a_vector_meanwhile() {
         let db = Database::open_in_memory().unwrap();
@@ -1397,7 +1761,7 @@ mod tests {
         // The server stores its own vector after the row was picked up.
         let rows = vec![(
             Value::Text(lesson.id.clone()),
-            placeholder_embedding("server"),
+            vec![placeholder_embedding("server")],
         )];
         db.with_conn(|conn| {
             crate::storage::store_lesson_embedding(conn, &lesson.id, &placeholder_embedding("x"))
@@ -1412,7 +1776,7 @@ mod tests {
         // Rows deleted meanwhile are skipped too.
         let gone = vec![(
             Value::Text("deleted".to_string()),
-            placeholder_embedding("x"),
+            vec![placeholder_embedding("x")],
         )];
         let inserted = db
             .with_transaction(|conn| {

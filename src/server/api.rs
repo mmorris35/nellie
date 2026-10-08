@@ -693,12 +693,14 @@ async fn create_lesson(
 
     // Generate and store embedding if service available
     if let Some(ref embedding_service) = state.embeddings {
-        let embed_text = crate::embeddings::lesson_embedding_text(&lesson.title, &body.content);
-        match embedding_service.embed_one(embed_text).await {
-            Ok(embedding) => {
+        match embedding_service
+            .embed_lesson(&lesson.title, &lesson.content)
+            .await
+        {
+            Ok(embeddings) => {
                 let _ = state
                     .db()
-                    .with_conn(|conn| storage::store_lesson_embedding(conn, &id, &embedding));
+                    .with_conn(|conn| storage::store_lesson_embeddings(conn, &id, &embeddings));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to generate lesson embedding");
@@ -852,17 +854,7 @@ async fn backfill_lesson_embeddings(
         // Check if embedding already exists by attempting a search with a dummy
         let has_embedding = state
             .db()
-            .with_conn(|conn| {
-                let table = storage::embedding_meta::active_tables(conn)?.lessons;
-                let count: i64 = conn
-                    .query_row(
-                        &format!("SELECT COUNT(*) FROM {table} WHERE id = ?"),
-                        [&lesson.id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                Ok::<bool, crate::Error>(count > 0)
-            })
+            .with_conn(|conn| storage::lesson_has_vectors(conn, &lesson.id))
             .unwrap_or(false);
 
         if has_embedding {
@@ -870,12 +862,14 @@ async fn backfill_lesson_embeddings(
             continue;
         }
 
-        let embed_text = crate::embeddings::lesson_embedding_text(&lesson.title, &lesson.content);
-        match embedding_service.embed_one(embed_text).await {
-            Ok(embedding) => {
+        match embedding_service
+            .embed_lesson(&lesson.title, &lesson.content)
+            .await
+        {
+            Ok(embeddings) => {
                 let lesson_id = lesson.id.clone();
                 match state.db().with_conn(move |conn| {
-                    storage::store_lesson_embedding(conn, &lesson_id, &embedding)
+                    storage::store_lesson_embeddings(conn, &lesson_id, &embeddings)
                 }) {
                     Ok(()) => processed += 1,
                     Err(e) => {

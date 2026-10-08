@@ -1,11 +1,11 @@
-//! Lesson semantic search.
+//! Lesson search: keyword, vector (one or more vectors per lesson) and fused.
 
 use std::collections::HashMap;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::embedding_meta::{active_tables, ensure_vector_tables};
+use super::embedding_meta::{active_tables, ensure_vector_tables, is_section_table, owner_column};
 use super::models::{LessonRecord, SearchResult};
 use crate::error::StorageError;
 use crate::Result;
@@ -24,30 +24,163 @@ pub fn init_lesson_vectors(conn: &Connection) -> Result<()> {
     ensure_vector_tables(conn)
 }
 
-/// Store lesson embedding.
+/// Row id of section `index` of a lesson in a section table.
+#[must_use]
+pub fn section_id(lesson_id: &str, index: usize) -> String {
+    format!("{lesson_id}#{index}")
+}
+
+fn to_blob(embedding: &[f32]) -> Vec<u8> {
+    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Insert a lesson's vectors into `table` (no existing rows are touched).
+///
+/// A section table gets one row per vector, keyed by [`section_id`]; a
+/// whole-lesson table takes exactly one vector.
+///
+/// # Errors
+///
+/// Returns an error if the vector count does not fit the table or an insert
+/// fails.
+pub fn insert_lesson_vectors(
+    conn: &Connection,
+    table: &str,
+    lesson_id: &str,
+    embeddings: &[Vec<f32>],
+) -> Result<()> {
+    let err =
+        |e: rusqlite::Error| StorageError::Vector(format!("failed to store lesson embedding: {e}"));
+    if is_section_table(table) {
+        if embeddings.is_empty() {
+            return Err(
+                StorageError::Vector("a lesson needs at least one vector".to_string()).into(),
+            );
+        }
+        let mut stmt = conn
+            .prepare(&format!(
+                "INSERT INTO {table} (id, embedding, lesson_id) VALUES (?, ?, ?)"
+            ))
+            .map_err(err)?;
+        for (i, embedding) in embeddings.iter().enumerate() {
+            stmt.execute(rusqlite::params![
+                section_id(lesson_id, i),
+                to_blob(embedding),
+                lesson_id
+            ])
+            .map_err(err)?;
+        }
+    } else {
+        let [embedding] = embeddings else {
+            return Err(StorageError::Vector(format!(
+                "{table} holds one vector per lesson, got {}",
+                embeddings.len()
+            ))
+            .into());
+        };
+        conn.execute(
+            &format!("INSERT INTO {table} (id, embedding) VALUES (?, ?)"),
+            rusqlite::params![lesson_id, to_blob(embedding)],
+        )
+        .map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Remove every vector of a lesson from `table`. Returns how many rows were
+/// removed.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub fn remove_lesson_vectors(conn: &Connection, table: &str, lesson_id: &str) -> Result<usize> {
+    let owner = owner_column(table);
+    conn.execute(
+        &format!("DELETE FROM {table} WHERE {owner} = ?"),
+        [lesson_id],
+    )
+    .map_err(|e| StorageError::Vector(format!("failed to remove lesson vectors: {e}")).into())
+}
+
+/// Remove a lesson's vectors from the active table, if vector tables are set
+/// up (used when a lesson is deleted or its text changes).
+///
+/// # Errors
+///
+/// Returns an error if the metadata cannot be read or the delete fails.
+pub fn remove_active_lesson_vectors(conn: &Connection, lesson_id: &str) -> Result<()> {
+    let Some(meta) = super::embedding_meta::active_meta(conn)? else {
+        return Ok(());
+    };
+    if super::embedding_meta::table_exists(conn, meta.tables.lessons)? {
+        remove_lesson_vectors(conn, meta.tables.lessons, lesson_id)?;
+    }
+    Ok(())
+}
+
+/// Store a lesson's vectors (one per section, see
+/// `EmbeddingService::embed_lesson`), replacing any it had.
+///
+/// # Errors
+///
+/// Returns an error if the vectors cannot be stored.
+pub fn store_lesson_embeddings(
+    conn: &Connection,
+    lesson_id: &str,
+    embeddings: &[Vec<f32>],
+) -> Result<()> {
+    let table = lesson_vec_table(conn)?;
+    conn.execute_batch("SAVEPOINT store_lesson_vectors")
+        .map_err(|e| StorageError::Vector(format!("failed to store lesson embedding: {e}")))?;
+    let result = remove_lesson_vectors(conn, table, lesson_id)
+        .and_then(|_| insert_lesson_vectors(conn, table, lesson_id, embeddings));
+    let end = if result.is_ok() {
+        "RELEASE store_lesson_vectors"
+    } else {
+        "ROLLBACK TO store_lesson_vectors; RELEASE store_lesson_vectors"
+    };
+    conn.execute_batch(end)
+        .map_err(|e| StorageError::Vector(format!("failed to store lesson embedding: {e}")))?;
+    result
+}
+
+/// Store a single vector for a lesson, replacing any it had.
 ///
 /// # Errors
 ///
 /// Returns an error if the embedding cannot be stored.
 pub fn store_lesson_embedding(conn: &Connection, lesson_id: &str, embedding: &[f32]) -> Result<()> {
-    let table = lesson_vec_table(conn)?;
-
-    // Delete old embedding if exists
-    conn.execute(&format!("DELETE FROM {table} WHERE id = ?"), [lesson_id])
-        .ok();
-
-    // Insert new embedding
-    let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-    conn.execute(
-        &format!("INSERT INTO {table} (id, embedding) VALUES (?, ?)"),
-        rusqlite::params![lesson_id, blob],
-    )
-    .map_err(|e| StorageError::Vector(format!("failed to store lesson embedding: {e}")))?;
-
-    Ok(())
+    store_lesson_embeddings(conn, lesson_id, &[embedding.to_vec()])
 }
 
+/// Does the lesson have vectors in the active table? (A lesson's sections
+/// are written together, so section 0 stands for all of them.)
+///
+/// # Errors
+///
+/// Returns an error if the lookup fails.
+pub fn lesson_has_vectors(conn: &Connection, lesson_id: &str) -> Result<bool> {
+    let table = lesson_vec_table(conn)?;
+    let key = if is_section_table(table) {
+        section_id(lesson_id, 0)
+    } else {
+        lesson_id.to_string()
+    };
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?)"),
+        [key],
+        |row| row.get(0),
+    )
+    .map_err(|e| StorageError::Vector(format!("failed to check lesson vectors: {e}")).into())
+}
+
+/// Largest `k` sqlite-vec accepts in one KNN query.
+const MAX_KNN: usize = 4096;
+
 /// Search lessons by embedding similarity.
+///
+/// With per-section vectors a lesson ranks by its best (closest) section,
+/// and `distance` is that section's distance.
 ///
 /// # Errors
 ///
@@ -57,28 +190,45 @@ pub fn search_lessons_by_embedding(
     query_embedding: &[f32],
     limit: usize,
 ) -> Result<Vec<SearchResult<LessonRecord>>> {
-    let blob: Vec<u8> = query_embedding
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
-
+    let blob = to_blob(query_embedding);
     let table = lesson_vec_table(conn)?;
+    let owner = owner_column(table);
     let sql = format!(
-        "SELECT id, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
+        "SELECT {owner}, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
     );
-
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| StorageError::Vector(format!("failed to prepare search: {e}")))?;
 
-    let candidates: Vec<(String, f32)> = stmt
-        .query_map(
-            rusqlite::params![blob, i64::try_from(limit).unwrap_or(10)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| StorageError::Vector(e.to_string()))?
-        .filter_map(std::result::Result::ok)
-        .collect();
+    // Fetch sections until `limit` distinct lessons are found (each lesson
+    // can contribute several sections) or the table is exhausted.
+    let mut k = if is_section_table(table) {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    }
+    .clamp(1, MAX_KNN);
+    let candidates = loop {
+        let rows: Vec<(String, f32)> = stmt
+            .query_map(
+                rusqlite::params![blob, i64::try_from(k).unwrap_or(10)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| StorageError::Vector(e.to_string()))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let best: Vec<(String, f32)> = rows
+            .iter()
+            .filter(|(id, _)| seen.insert(id.as_str()))
+            .take(limit)
+            .cloned()
+            .collect();
+        if best.len() >= limit || rows.len() < k || k >= MAX_KNN {
+            break best;
+        }
+        k = k.saturating_mul(2).min(MAX_KNN);
+    };
 
     let mut results = Vec::new();
     for (id, distance) in candidates {
@@ -201,8 +351,9 @@ pub struct LessonSearchHit {
     /// service, or a query with no searchable words) the top hit scores `0.5`.
     pub score: f32,
 
-    /// Cosine similarity between the query and lesson vectors (`-1..1`),
-    /// or `None` if the lesson was found by keyword search only.
+    /// Cosine similarity between the query and the lesson's closest vector
+    /// (its best section, for a long lesson) in `-1..1`, or `None` if the
+    /// lesson was found by keyword search only.
     pub similarity: Option<f32>,
 
     /// L2 distance between the query and lesson vectors (`0..2`), or `None`
@@ -259,7 +410,8 @@ struct Fused {
 
 /// Search lessons by fusing keyword (BM25) and vector rankings.
 ///
-/// Each retriever returns its top `max(limit, LESSON_MIN_CANDIDATES)` lessons;
+/// The vector ranking orders lessons by their best section (see
+/// [`search_lessons_by_embedding`]). Each retriever returns its top `max(limit, LESSON_MIN_CANDIDATES)` lessons;
 /// the union is ranked by Reciprocal Rank Fusion with [`LESSON_RRF_K`]. Pass
 /// `query_embedding = None` to rank by keywords alone; a query with no
 /// searchable words (empty or only stopwords) is ranked by vectors alone.
@@ -923,13 +1075,14 @@ mod tests {
         let db = setup_db();
         db.with_conn(|conn| {
             use crate::storage::LessonRecord;
-            // Roll the database back to schema v5 with lessons already present.
+            // Roll the database back to before the full-text index, with
+            // lessons already present.
             conn.execute_batch(
                 "DROP TRIGGER lessons_fts_insert;
                  DROP TRIGGER lessons_fts_update;
                  DROP TRIGGER lessons_fts_delete;
                  DROP TABLE lessons_fts;
-                 DELETE FROM schema_migrations WHERE version = 6;",
+                 DELETE FROM schema_migrations WHERE version >= 6;",
             )
             .unwrap();
             insert_lesson(conn, &LessonRecord::new("Old one", "persimmon", vec![]))?;
@@ -1004,6 +1157,35 @@ mod tests {
                 search_lessons_hybrid(conn, "qx77zz", Some(&query), 1)?.len(),
                 1
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn many_sections_of_one_lesson_do_not_crowd_out_others() {
+        let db = setup_vector_db();
+        db.with_conn(|conn| {
+            use crate::storage::LessonRecord;
+            let long = LessonRecord::new("Long", "many sections", vec![]);
+            insert_lesson(conn, &long)?;
+            // 50 sections, all closer to the query than any other lesson.
+            let sections: Vec<Vec<f32>> = (0..50).map(|i| mixed_vector(1, 10 + i, 0.05)).collect();
+            store_lesson_embeddings(conn, &long.id, &sections)?;
+            for i in 0..5_u8 {
+                let other = LessonRecord::new(format!("Other {i}"), "x", vec![]);
+                insert_lesson(conn, &other)?;
+                store_lesson_embedding(
+                    conn,
+                    &other.id,
+                    &mixed_vector(1, 100 + usize::from(i), 1.0 + f32::from(i)),
+                )?;
+            }
+            let hits = search_lessons_by_embedding(conn, &axis_vector(1), 3)?;
+            let titles: Vec<&str> = hits.iter().map(|h| h.record.title.as_str()).collect();
+            assert_eq!(titles, vec!["Long", "Other 0", "Other 1"]);
+            // The lesson's distance is its best section's.
+            assert!(hits[0].distance < hits[1].distance);
             Ok(())
         })
         .unwrap();
