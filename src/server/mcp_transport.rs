@@ -523,16 +523,11 @@ impl NellieMcpHandler {
 
 impl ServerHandler for NellieMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Nellie is a semantic code memory system. Use search_code to find code, \
-                 search_lessons/add_lesson for lessons learned, and checkpoint tools for \
-                 agent state recovery."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Nellie is a semantic code memory system. Use search_code to find code, \
+             search_lessons/add_lesson for lessons learned, and checkpoint tools for \
+             agent state recovery.",
+        )
     }
 
     fn list_tools(
@@ -676,11 +671,12 @@ pub async fn start_mcp_server(
     let db_clone = db.clone();
     let embeddings_clone = embeddings.clone();
 
-    let mcp_config = StreamableHttpServerConfig {
-        stateful_mode: true,
-        cancellation_token: ct.child_token(),
-        ..Default::default()
-    };
+    // rmcp >= 1.4 checks the Host header (RUSTSEC-2026-0189, DNS rebinding);
+    // the default allows only localhost, 127.0.0.1 and ::1, matching the
+    // 127.0.0.1 default bind.
+    let mcp_config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(true)
+        .with_cancellation_token(ct.child_token());
 
     let service: StreamableHttpService<NellieMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(
