@@ -1674,7 +1674,11 @@ async fn handle_search_lessons(
     args: &serde_json::Value,
 ) -> std::result::Result<serde_json::Value, String> {
     let query = args["query"].as_str().ok_or("query is required")?;
-    let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+    // Same cap as REST lesson search (NELLIE_MAX_RESULT_LIMIT, else 100).
+    let limit = crate::storage::lesson_search_limit(
+        args["limit"].as_u64().unwrap_or(5) as usize,
+        state.max_result_limit,
+    );
 
     // CRITICAL: Embedding service MUST be initialized for semantic search
     let embeddings = state.embeddings.as_ref().ok_or_else(|| {

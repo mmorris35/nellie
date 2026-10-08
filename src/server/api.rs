@@ -751,7 +751,11 @@ async fn search_lessons(
         }));
     }
 
-    let limit = result_limit(&state, params.limit, 100) as usize;
+    let limit = result_limit(
+        &state,
+        params.limit,
+        i64::try_from(storage::LESSON_SEARCH_DEFAULT_CAP).unwrap_or(100),
+    ) as usize;
 
     let mut query_embedding = None;
     if let Some(ref embedding_service) = state.embeddings {

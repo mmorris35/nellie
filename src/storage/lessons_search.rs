@@ -110,6 +110,21 @@ pub const LESSON_MIN_CANDIDATES: usize = 10;
 /// configurable REST result limit).
 const LESSON_MAX_RESULTS: usize = 100_000;
 
+/// Default cap on a lesson-search `limit`.
+///
+/// Applies when no maximum result limit is configured (`--max-result-limit` /
+/// `NELLIE_MAX_RESULT_LIMIT`). Shared by REST and MCP so both entry points
+/// enforce the same limit.
+pub const LESSON_SEARCH_DEFAULT_CAP: usize = 100;
+
+/// Clamp a requested lesson-search limit to `1..=cap`, where `cap` is the
+/// configured maximum result limit or [`LESSON_SEARCH_DEFAULT_CAP`].
+#[must_use]
+pub fn lesson_search_limit(requested: usize, max_result_limit: Option<u32>) -> usize {
+    let cap = max_result_limit.map_or(LESSON_SEARCH_DEFAULT_CAP, |m| m as usize);
+    requested.clamp(1, cap.max(1))
+}
+
 /// Maximum number of query words passed to the full-text index.
 const MAX_KEYWORD_TERMS: usize = 32;
 
@@ -1264,5 +1279,17 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn lesson_search_limit_uses_configured_cap_or_default() {
+        assert_eq!(lesson_search_limit(5, None), 5);
+        assert_eq!(lesson_search_limit(0, None), 1);
+        assert_eq!(
+            lesson_search_limit(1_000_000, None),
+            LESSON_SEARCH_DEFAULT_CAP
+        );
+        assert_eq!(lesson_search_limit(1_000_000, Some(10_000)), 10_000);
+        assert_eq!(lesson_search_limit(50, Some(20)), 20);
     }
 }

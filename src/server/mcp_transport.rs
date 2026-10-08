@@ -198,7 +198,8 @@ impl NellieMcpHandler {
 
     #[tool(description = "Search previously recorded lessons learned")]
     fn search_lessons(&self, Parameters(req): Parameters<SearchLessonsRequest>) -> String {
-        let limit = req.limit.unwrap_or(5) as usize;
+        // This transport has no server config, so it uses the default cap.
+        let limit = crate::storage::lesson_search_limit(req.limit.unwrap_or(5) as usize, None);
 
         let Some(ref embeddings) = self.embeddings else {
             return serde_json::json!({"error": "Embedding service not initialized"}).to_string();
