@@ -47,16 +47,50 @@ pub const LEGACY_TABLES: VectorTables = VectorTables {
     checkpoints: "checkpoint_embeddings",
 };
 
-/// Tables for [`EmbeddingSpec::current`] (all-MiniLM-L6-v2, 256 tokens).
-pub const CURRENT_TABLES: VectorTables = VectorTables {
+/// Tables for all-MiniLM-L6-v2 at 256 tokens with one vector per lesson
+/// (`lesson_vectors = whole`).
+pub const MINILM256_WHOLE_TABLES: VectorTables = VectorTables {
     chunks: "chunk_embeddings_minilm256",
     lessons: "lesson_embeddings_minilm256",
     checkpoints: "checkpoint_embeddings_minilm256",
 };
 
+/// Tables for [`EmbeddingSpec::current`].
+///
+/// all-MiniLM-L6-v2 at 256 tokens with one vector per lesson section. Chunk
+/// and checkpoint vectors are the same as in [`MINILM256_WHOLE_TABLES`], so
+/// those tables are shared and a rebuild from there only embeds lessons.
+pub const CURRENT_TABLES: VectorTables = VectorTables {
+    chunks: "chunk_embeddings_minilm256",
+    lessons: LESSON_SECTIONS_TABLE,
+    checkpoints: "checkpoint_embeddings_minilm256",
+};
+
+/// Lesson vector table with one row per lesson section. Its rows are keyed
+/// `<lesson id>#<section number>` and carry the lesson id in `lesson_id`.
+pub const LESSON_SECTIONS_TABLE: &str = "lesson_sections_minilm256";
+
 /// Every table set this binary knows. Names read from the database must be
 /// one of these.
-pub const KNOWN_TABLE_SETS: [VectorTables; 2] = [LEGACY_TABLES, CURRENT_TABLES];
+pub const KNOWN_TABLE_SETS: [VectorTables; 3] =
+    [LEGACY_TABLES, MINILM256_WHOLE_TABLES, CURRENT_TABLES];
+
+/// Does this vector table hold several rows (sections) per lesson?
+#[must_use]
+pub fn is_section_table(table: &str) -> bool {
+    table == LESSON_SECTIONS_TABLE
+}
+
+/// Column of a vector table that holds the id of the row it was embedded
+/// from: `lesson_id` for section tables, `id` otherwise.
+#[must_use]
+pub fn owner_column(table: &str) -> &'static str {
+    if is_section_table(table) {
+        "lesson_id"
+    } else {
+        "id"
+    }
+}
 
 /// The active row of `embedding_meta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +129,8 @@ pub fn active_meta(conn: &Connection) -> Result<Option<ActiveMeta>> {
     let row = conn
         .query_row(
             "SELECT id, model_id, dim, max_len, special_tokens, query_prompt, doc_prompt,
-                    normalisation, chunk_table, lesson_table, checkpoint_table, source
+                    normalisation, chunk_table, lesson_table, checkpoint_table, source,
+                    lesson_vectors
              FROM embedding_meta WHERE active = 1",
             [],
             |row| {
@@ -109,6 +144,7 @@ pub fn active_meta(conn: &Connection) -> Result<Option<ActiveMeta>> {
                         query_prompt: row.get(5)?,
                         doc_prompt: row.get(6)?,
                         normalisation: row.get(7)?,
+                        lesson_vectors: row.get(12)?,
                     },
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
@@ -195,11 +231,18 @@ pub fn create_vector_tables(conn: &Connection, tables: &VectorTables) -> Result<
         (tables.lessons, "TEXT"),
         (tables.checkpoints, "TEXT"),
     ] {
+        // A section table also stores the owning lesson's id (a vec0
+        // metadata column).
+        let owner = if is_section_table(name) {
+            ",\n                    lesson_id TEXT"
+        } else {
+            ""
+        };
         conn.execute(
             &format!(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING vec0(
                     id {id_type} PRIMARY KEY,
-                    embedding FLOAT[{EMBEDDING_DIM}]
+                    embedding FLOAT[{EMBEDDING_DIM}]{owner}
                 )"
             ),
             [],
@@ -226,8 +269,8 @@ pub fn record_active(
     conn.execute(
         "INSERT INTO embedding_meta (model_id, dim, max_len, special_tokens, query_prompt,
              doc_prompt, normalisation, chunk_table, lesson_table, checkpoint_table, active,
-             source, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+             source, recorded_at, lesson_vectors)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
         params![
             spec.model_id,
             i64::try_from(spec.dim).unwrap_or(i64::MAX),
@@ -241,6 +284,7 @@ pub fn record_active(
             tables.checkpoints,
             source,
             now,
+            spec.lesson_vectors,
         ],
     )
     .map_err(|e| StorageError::Database(format!("failed to write embedding_meta: {e}")))?;
@@ -468,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_install_with_matching_settings_passes() {
+    fn legacy_install_with_256_truncation_needs_lesson_reembed() {
         let dir = tempfile::tempdir().unwrap();
         let tok = tokenizer_json(
             dir.path(),
@@ -476,8 +520,85 @@ mod tests {
         );
         let db = legacy_db();
         db.with_conn(|conn| {
-            assert!(check_spec(conn, &tok)?.is_ok());
+            let msg = check_spec(conn, &tok)?.unwrap_err();
+            assert!(msg.contains("lesson_vectors=whole"), "{msg}");
             assert_eq!(active_tables(conn)?, LEGACY_TABLES);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn whole_lesson_index_must_be_rebuilt() {
+        // An index recorded before lesson_vectors existed: the column
+        // defaults to "whole", and the guard asks for a reembed.
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            migrate(conn)?;
+            create_vector_tables(conn, &MINILM256_WHOLE_TABLES)?;
+            let spec = EmbeddingSpec::current();
+            conn.execute(
+                "INSERT INTO embedding_meta (model_id, dim, max_len, special_tokens, query_prompt,
+                     doc_prompt, normalisation, chunk_table, lesson_table, checkpoint_table,
+                     active, source, recorded_at)
+                 VALUES (?, 384, 256, 'intact', '', '', 'l2', ?, ?, ?, 1, 'fresh', 0)",
+                params![
+                    spec.model_id,
+                    MINILM256_WHOLE_TABLES.chunks,
+                    MINILM256_WHOLE_TABLES.lessons,
+                    MINILM256_WHOLE_TABLES.checkpoints
+                ],
+            )
+            .unwrap();
+            let meta = active_meta(conn)?.unwrap();
+            assert_eq!(meta.spec.lesson_vectors, "whole");
+            assert_eq!(meta.tables, MINILM256_WHOLE_TABLES);
+            let msg = check_spec(conn, Path::new("/nonexistent/tokenizer.json"))?.unwrap_err();
+            assert!(msg.contains("lesson_vectors=whole"), "{msg}");
+            assert!(msg.contains("lesson_vectors=sections-200-40"), "{msg}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn section_table_has_owner_column() {
+        let db = Database::open_in_memory().unwrap();
+        init_storage(&db).unwrap();
+        db.with_conn(|conn| {
+            assert!(is_section_table(CURRENT_TABLES.lessons));
+            assert_eq!(owner_column(CURRENT_TABLES.lessons), "lesson_id");
+            assert_eq!(owner_column(CURRENT_TABLES.chunks), "id");
+            let blob: Vec<u8> = vec![0.1f32; EMBEDDING_DIM]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            for (id, owner) in [("a#0", "a"), ("a#1", "a"), ("b#0", "b")] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {LESSON_SECTIONS_TABLE} (id, embedding, lesson_id)
+                         VALUES (?, ?, ?)"
+                    ),
+                    params![id, blob, owner],
+                )
+                .unwrap();
+            }
+            let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+            assert_eq!(
+                count(&format!(
+                    "SELECT COUNT(*) FROM {LESSON_SECTIONS_TABLE} WHERE lesson_id = 'a'"
+                )),
+                2
+            );
+            conn.execute(
+                &format!("DELETE FROM {LESSON_SECTIONS_TABLE} WHERE lesson_id = 'a'"),
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                count(&format!("SELECT COUNT(*) FROM {LESSON_SECTIONS_TABLE}")),
+                1
+            );
             Ok(())
         })
         .unwrap();

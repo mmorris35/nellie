@@ -2303,7 +2303,7 @@ async fn reembed_command(
         );
         if r.orphans_removed > 0 || r.refreshed > 0 {
             println!(
-                "  {name:<11} caught up: {} deleted since the build started, {} edited and re-embedded",
+                "  {name:<11} caught up: {} vectors of rows deleted since the build started removed, {} edited and re-embedded",
                 r.orphans_removed, r.refreshed
             );
         }

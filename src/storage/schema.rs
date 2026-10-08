@@ -8,7 +8,7 @@ use crate::error::StorageError;
 use crate::Result;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Run all pending migrations.
 ///
@@ -55,6 +55,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     if current_version < 6 {
         migrate_v6(conn)?;
+    }
+
+    if current_version < 7 {
+        migrate_v7(conn)?;
     }
 
     Ok(())
@@ -413,6 +417,35 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Migration v7: record how lessons were turned into vectors.
+///
+/// Existing rows describe indexes with one vector per lesson (`whole`). The
+/// embedding guard compares this with the current spec, so an index built
+/// before per-section lesson vectors must be rebuilt with `nellie reembed`.
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    tracing::info!("Applying migration v7: Lesson vector layout in embedding_meta");
+
+    let has_column: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_meta')
+                           WHERE name = 'lesson_vectors')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Migration(format!("v7 migration failed: {e}")))?;
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE embedding_meta ADD COLUMN lesson_vectors TEXT NOT NULL DEFAULT 'whole';",
+        )
+        .map_err(|e| StorageError::Migration(format!("v7 migration failed: {e}")))?;
+    }
+
+    record_migration(conn, 7)?;
+    tracing::info!("Migration v7 complete");
+
+    Ok(())
+}
+
 /// Verify all expected tables exist.
 ///
 /// # Errors
@@ -756,7 +789,7 @@ mod tests {
 
             let version = get_current_version(conn)?;
             assert_eq!(version, SCHEMA_VERSION);
-            assert_eq!(version, 6);
+            assert_eq!(version, 7);
 
             verify_schema(conn)?;
             Ok(())

@@ -57,6 +57,8 @@ pub struct EmbeddingService {
 
 struct EmbeddingServiceInner {
     worker: RwLock<Option<EmbeddingWorker>>,
+    /// The embedding tokenizer without truncation, for measuring text length.
+    counter: std::sync::OnceLock<tokenizers::Tokenizer>,
     config: EmbeddingConfig,
     initialized: std::sync::atomic::AtomicBool,
 }
@@ -70,6 +72,7 @@ impl EmbeddingService {
         Self {
             inner: Arc::new(EmbeddingServiceInner {
                 worker: RwLock::new(None),
+                counter: std::sync::OnceLock::new(),
                 config,
                 initialized: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -103,6 +106,11 @@ impl EmbeddingService {
 
             // Load tokenizer (truncation/padding set by Nellie, not the file)
             let tokenizer = load_tokenizer(&config.tokenizer_path)?;
+            let mut counter = tokenizer.clone();
+            counter.with_truncation(None).map_err(|e| {
+                EmbeddingError::Tokenization(format!("failed to clear truncation: {e}"))
+            })?;
+            let _ = self.inner.counter.set(counter);
 
             // Create worker pool
             let worker = EmbeddingWorker::new(session, Arc::new(tokenizer), config.num_workers)?;
@@ -155,6 +163,48 @@ impl EmbeddingService {
                 .ok_or_else(|| EmbeddingError::WorkerPool("service not initialized".to_string()))?;
             worker.embed(texts).await
         }
+    }
+
+    /// Number of tokens in `text`, without special tokens or truncation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not initialized or tokenization fails.
+    pub fn count_tokens(&self, text: &str) -> Result<usize> {
+        let counter = self
+            .inner
+            .counter
+            .get()
+            .ok_or_else(|| EmbeddingError::WorkerPool("service not initialized".to_string()))?;
+        counter
+            .encode(text, false)
+            .map(|e| e.len())
+            .map_err(|e| EmbeddingError::Tokenization(format!("failed to tokenize: {e}")).into())
+    }
+
+    /// Texts to embed for a lesson, one per vector (see
+    /// [`lesson_section_texts`](super::lesson_section_texts)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not initialized or tokenization fails.
+    pub fn lesson_texts(&self, title: &str, content: &str) -> Result<Vec<String>> {
+        // Fail early rather than inside the closure. Should one text fail to
+        // tokenize anyway, its byte length is a safe over-estimate.
+        self.count_tokens("")?;
+        Ok(super::lesson_section_texts(title, content, |t| {
+            self.count_tokens(t).unwrap_or(t.len())
+        }))
+    }
+
+    /// Embed a lesson: one vector per section text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not initialized or embedding fails.
+    pub async fn embed_lesson(&self, title: &str, content: &str) -> Result<Vec<Vec<f32>>> {
+        let texts = self.lesson_texts(title, content)?;
+        self.embed_batch(texts).await
     }
 
     /// Generate embeddings for texts, returning results paired with original texts.
