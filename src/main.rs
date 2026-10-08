@@ -2205,18 +2205,24 @@ async fn reembed_command(
             db_path.display()
         )));
     }
-    let lock = match DbLock::exclusive(&db_path) {
+    // A pre-build only writes the new, inactive tables, so it runs beside a
+    // live server; the switching run needs the database to itself.
+    let lock = match if no_switch {
+        DbLock::prebuild(&db_path)
+    } else {
+        DbLock::exclusive(&db_path)
+    } {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    tracing::debug!(lock = %lock.lock_path().display(), "Holding exclusive database lock");
+    tracing::debug!(lock = %lock.lock_path().display(), no_switch, "Holding database lock");
 
     let db = Database::open(&db_path)?;
-    // An older Nellie may be writing (`--no-switch`): wait for its short
-    // write transactions rather than failing.
+    // A server may be writing (`--no-switch`): wait for its short write
+    // transactions rather than failing.
     db.with_conn(|conn| {
         conn.busy_timeout(Duration::from_secs(60))
             .map_err(|e| nellie::Error::internal(format!("failed to set busy timeout: {e}")))

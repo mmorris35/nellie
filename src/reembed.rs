@@ -766,12 +766,17 @@ fn drop_inactive_tables(db: &Database, active: &VectorTables) -> Result<Vec<&'st
 /// Advisory lock that keeps `nellie reembed` and servers off the same
 /// database at the same time.
 ///
-/// Servers hold a shared lock on `<database>.lock` for their lifetime;
-/// `nellie reembed` needs the exclusive lock. The OS releases the lock when
-/// the process exits, so a crash never leaves a stale lock behind.
+/// Servers hold a shared lock on `<database>.lock` for their lifetime; the
+/// switching `nellie reembed` needs the exclusive lock. A pre-build
+/// (`nellie reembed --no-switch`) only writes the new, inactive tables, so it
+/// shares `<database>.lock` with running servers and instead takes the
+/// exclusive lock on `<database>.reembed.lock`, which keeps two reembeds from
+/// running at once. The OS releases the locks when the process exits, so a
+/// crash never leaves a stale lock behind.
 #[derive(Debug)]
 pub struct DbLock {
     _file: File,
+    _reembed: Option<File>,
     path: PathBuf,
 }
 
@@ -785,7 +790,10 @@ impl DbLock {
     }
 
     fn open(db_path: &Path) -> Result<(File, PathBuf)> {
-        let path = Self::path_for(db_path);
+        Self::open_at(Self::path_for(db_path))
+    }
+
+    fn open_at(path: PathBuf) -> Result<(File, PathBuf)> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -809,7 +817,11 @@ impl DbLock {
     pub fn shared(db_path: &Path) -> Result<Self> {
         let (file, path) = Self::open(db_path)?;
         match file.try_lock_shared() {
-            Ok(()) => Ok(Self { _file: file, path }),
+            Ok(()) => Ok(Self {
+                _file: file,
+                _reembed: None,
+                path,
+            }),
             Err(TryLockError::WouldBlock) => Err(Error::internal(format!(
                 "`nellie reembed` is running against {}; wait for it to finish",
                 db_path.display()
@@ -827,9 +839,52 @@ impl DbLock {
     pub fn exclusive(db_path: &Path) -> Result<Self> {
         let (file, path) = Self::open(db_path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file, path }),
+            Ok(()) => Ok(Self {
+                _file: file,
+                _reembed: None,
+                path,
+            }),
             Err(TryLockError::WouldBlock) => Err(Error::internal(format!(
-                "a Nellie server is running against {}; stop it before running `nellie reembed`",
+                "a Nellie server or a `nellie reembed --no-switch` is running against {}; \
+                 stop it before running `nellie reembed`",
+                db_path.display()
+            ))),
+            Err(TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
+    /// Take the pre-build lock (`nellie reembed --no-switch`): shared on
+    /// `<database>.lock`, so running servers may stay up, and exclusive on
+    /// `<database>.reembed.lock`, so no other reembed runs at the same time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a switching reembed or another pre-build holds
+    /// the database, or locking fails.
+    #[allow(clippy::incompatible_msrv)]
+    pub fn prebuild(db_path: &Path) -> Result<Self> {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(".reembed.lock");
+        let (reembed, _) = Self::open_at(PathBuf::from(name))?;
+        match reembed.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::internal(format!(
+                    "another `nellie reembed` is running against {}; wait for it to finish",
+                    db_path.display()
+                )))
+            }
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let (file, path) = Self::open(db_path)?;
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Self {
+                _file: file,
+                _reembed: Some(reembed),
+                path,
+            }),
+            Err(TryLockError::WouldBlock) => Err(Error::internal(format!(
+                "`nellie reembed` is running against {}; wait for it to finish",
                 db_path.display()
             ))),
             Err(TryLockError::Error(e)) => Err(e.into()),
@@ -1430,7 +1485,7 @@ mod tests {
         // A second server may share the database.
         let second = DbLock::shared(&db_path).unwrap();
         let err = DbLock::exclusive(&db_path).unwrap_err();
-        assert!(err.to_string().contains("server is running"));
+        assert!(err.to_string().contains("Nellie server"));
         drop(server);
         drop(second);
         let reembed = DbLock::exclusive(&db_path).unwrap();
@@ -1439,5 +1494,37 @@ mod tests {
             .to_string()
             .contains("reembed"));
         drop(reembed);
+    }
+
+    #[test]
+    fn prebuild_runs_beside_servers_but_not_beside_another_reembed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nellie.db");
+        let server = DbLock::shared(&db_path).unwrap();
+        // A pre-build may run while a server serves.
+        let prebuild = DbLock::prebuild(&db_path).unwrap();
+        // A second server may still start during the pre-build.
+        let second = DbLock::shared(&db_path).unwrap();
+        // But not a second pre-build, and not the switching reembed.
+        assert!(DbLock::prebuild(&db_path)
+            .unwrap_err()
+            .to_string()
+            .contains("another"));
+        assert!(DbLock::exclusive(&db_path)
+            .unwrap_err()
+            .to_string()
+            .contains("--no-switch"));
+        drop(server);
+        drop(second);
+        // With the servers gone, the pre-build alone still blocks the switch.
+        assert!(DbLock::exclusive(&db_path).is_err());
+        drop(prebuild);
+        let switching = DbLock::exclusive(&db_path).unwrap();
+        // And the switching reembed blocks a pre-build.
+        assert!(DbLock::prebuild(&db_path)
+            .unwrap_err()
+            .to_string()
+            .contains("reembed"));
+        drop(switching);
     }
 }
