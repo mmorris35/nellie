@@ -733,7 +733,9 @@ async fn create_lesson(
 /// A live lesson is returned as 200. A deleted id with a live successor
 /// returns 301 with `Location` set to the successor and the pointer in the
 /// body; a deleted id with no live successor returns 410; an unknown id 404.
-/// If several prefix tombstones match, 409 lists them.
+/// An id of at least 8 characters also matches as a prefix, in both
+/// directions, against live ids and tombstones; one match is used, and more
+/// than one returns 409 listing them.
 async fn get_lesson_by_id(State(state): State<Arc<McpState>>, Path(id): Path<String>) -> Response {
     let resolution = match state
         .db()
@@ -786,12 +788,13 @@ async fn get_lesson_by_id(State(state): State<Arc<McpState>>, Path(id): Path<Str
             })),
         )
             .into_response(),
-        storage::LessonResolution::Ambiguous(candidates) => (
+        storage::LessonResolution::Ambiguous { live, tombstones } => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "id": id,
                 "status": "ambiguous",
-                "candidates": candidates,
+                "live_candidates": live,
+                "candidates": tombstones,
             })),
         )
             .into_response(),
@@ -807,7 +810,8 @@ async fn get_lesson_by_id(State(state): State<Arc<McpState>>, Path(id): Path<Str
 ///
 /// Records a tombstone for the id. With `?successor=<id>` the tombstone
 /// points at that lesson, which must resolve to a live lesson (else 400 and
-/// nothing is deleted); `?reason=<text>` is stored with it.
+/// nothing is deleted); `?reason=<text>` is stored with it. An unknown id
+/// returns 404.
 async fn delete_lesson(
     State(state): State<Arc<McpState>>,
     Path(id): Path<String>,
@@ -831,6 +835,11 @@ async fn delete_lesson(
                 "error": "successor does not resolve to another live lesson",
                 "successor": successor,
             })),
+        )
+            .into_response(),
+        Err(crate::Error::Storage(crate::error::StorageError::NotFound { .. })) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "id": id, "status": "not_found" })),
         )
             .into_response(),
         Err(e) => {
@@ -2007,6 +2016,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_lesson_short_prefix_of_live_and_deleted_ids() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "7811fa8b-1111-4aaa-8bbb-000000000001");
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/7811fa8b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], "7811fa8b-1111-4aaa-8bbb-000000000001");
+
+        // Deleted through DELETE: the tombstone holds the full id, the
+        // request is the short form.
+        insert_lesson_with_id(&state, "c0ffee00-2222-4aaa-8bbb-000000000002");
+        let (status, _, _) = send(
+            &state,
+            "DELETE",
+            "/api/v1/lessons/c0ffee00-2222-4aaa-8bbb-000000000002",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/c0ffee00").await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["status"], "deleted");
+
+        insert_lesson_with_id(&state, "d00dfeed-3333-4aaa-8bbb-000000000003");
+        let (status, _, _) = send(
+            &state,
+            "DELETE",
+            "/api/v1/lessons/d00dfeed-3333-4aaa-8bbb-000000000003?successor=7811fa8b",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/d00dfeed").await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(body["successor_id"], "7811fa8b-1111-4aaa-8bbb-000000000001");
+
+        // Shorter than the minimum prefix: no prefix matching.
+        let (status, _, _) = send(&state, "GET", "/api/v1/lessons/7811fa8").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_lesson_short_prefix_ambiguous() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "abcdef01-aaaa");
+        insert_lesson_with_id(&state, "abcdef01-bbbb");
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/abcdef01").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["live_candidates"].as_array().unwrap().len(), 2);
+
+        // One live lesson and one tombstone sharing the prefix.
+        insert_lesson_with_id(&state, "12345678-live");
+        tombstone(&state, "12345678-gone", None, "");
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/12345678").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["live_candidates"],
+            serde_json::json!(["12345678-live"])
+        );
+        assert_eq!(body["candidates"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_lesson_is_not_found() {
+        let state = create_test_state();
+        let (status, _, body) = send(&state, "DELETE", "/api/v1/lessons/no-such-lesson").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["status"], "not_found");
+        let tombstones = state.db().with_conn(storage::list_tombstones).unwrap();
+        assert!(tombstones.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_update_keeps_created_at_and_sets_updated_at() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "first-successor");
+        insert_lesson_with_id(&state, "second-successor");
+        tombstone(&state, "old-lesson-id", Some("first-successor"), "");
+        state
+            .db()
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE lesson_tombstones SET created_at = 1, updated_at = 1",
+                    [],
+                )
+                .map_err(|e| crate::Error::internal(e.to_string()))
+            })
+            .unwrap();
+        tombstone(
+            &state,
+            "old-lesson-id",
+            Some("second-successor"),
+            "re-pointed",
+        );
+        let t = state
+            .db()
+            .with_conn(|conn| storage::get_tombstone(conn, "old-lesson-id"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.successor_id.as_deref(), Some("second-successor"));
+        assert_eq!(t.created_at, 1);
+        assert!(t.updated_at > 1);
+    }
+
+    #[tokio::test]
     async fn test_deleted_lesson_leaves_search_and_tombstone_holds_no_content() {
         let state = create_test_state();
         let mut lesson = storage::LessonRecord::new(
@@ -2051,7 +2162,16 @@ mod tests {
                 Ok(names)
             })
             .unwrap();
-        assert_eq!(columns, ["old_id", "successor_id", "reason", "created_at"]);
+        assert_eq!(
+            columns,
+            [
+                "old_id",
+                "successor_id",
+                "reason",
+                "created_at",
+                "updated_at"
+            ]
+        );
     }
 
     #[tokio::test]

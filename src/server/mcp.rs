@@ -414,6 +414,14 @@ pub fn get_tools() -> Vec<ToolInfo> {
                     "id": {
                         "type": "string",
                         "description": "Lesson ID to delete"
+                    },
+                    "successor": {
+                        "type": "string",
+                        "description": "Optional ID of the lesson that replaces this one"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional reason recorded with the deletion"
                     }
                 },
                 "required": ["id"]
@@ -1916,17 +1924,28 @@ fn handle_delete_lesson(
     args: &serde_json::Value,
 ) -> std::result::Result<serde_json::Value, String> {
     let id = args["id"].as_str().ok_or("id is required")?;
+    let successor = args["successor"].as_str().filter(|s| !s.is_empty());
+    let reason = args["reason"].as_str().unwrap_or("");
 
-    // Leaves a tombstone so lookups by this id report it as deleted.
-    state
+    // Leaves a tombstone so lookups by this id report it as deleted, or as
+    // moved to the successor.
+    let outcome = state
         .db
-        .with_transaction(|conn| crate::storage::delete_lesson_with_tombstone(conn, id, None, ""))
+        .with_transaction(|conn| {
+            crate::storage::delete_lesson_with_tombstone(conn, id, successor, reason)
+        })
         .map_err(|e| e.to_string())?;
 
-    Ok(serde_json::json!({
-        "id": id,
-        "message": "Lesson deleted successfully"
-    }))
+    match outcome {
+        crate::storage::TombstoneDelete::Deleted { successor_id } => Ok(serde_json::json!({
+            "id": id,
+            "successor_id": successor_id,
+            "message": "Lesson deleted successfully"
+        })),
+        crate::storage::TombstoneDelete::InvalidSuccessor => {
+            Err("successor does not resolve to another live lesson; nothing deleted".to_string())
+        }
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -3847,6 +3866,41 @@ mod tests {
                 .expect("delete should leave a tombstone");
             assert_eq!(tombstone.successor_id, None);
         }
+    }
+
+    #[test]
+    fn test_delete_lesson_with_successor_and_reason() {
+        let db = crate::storage::Database::open_in_memory()
+            .expect("Failed to create in-memory database");
+        let (old, new) = db
+            .with_conn(|conn| -> crate::Result<(String, String)> {
+                crate::storage::migrate(conn)?;
+                let old = crate::storage::LessonRecord::new("Old title", "Body", vec![]);
+                let new = crate::storage::LessonRecord::new("New title", "Body", vec![]);
+                crate::storage::insert_lesson(conn, &old)?;
+                crate::storage::insert_lesson(conn, &new)?;
+                Ok((old.id, new.id))
+            })
+            .expect("Failed to setup");
+        let state = McpState::new(db);
+
+        let bad = serde_json::json!({"id": &old, "successor": "no-such-lesson"});
+        assert!(handle_delete_lesson(&state, &bad).is_err());
+        let still_live = state
+            .db
+            .with_conn(|conn| crate::storage::get_lesson(conn, &old));
+        assert!(still_live.is_ok(), "invalid successor must not delete");
+
+        let args = serde_json::json!({"id": &old, "successor": &new, "reason": "retitled"});
+        let response = handle_delete_lesson(&state, &args).expect("delete should succeed");
+        assert_eq!(response["successor_id"], serde_json::json!(&new));
+        let tombstone = state
+            .db
+            .with_conn(|conn| crate::storage::get_tombstone(conn, &old))
+            .unwrap()
+            .expect("delete should leave a tombstone");
+        assert_eq!(tombstone.successor_id.as_deref(), Some(new.as_str()));
+        assert_eq!(tombstone.reason, "retitled");
     }
 
     #[test]

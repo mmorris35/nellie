@@ -445,22 +445,28 @@ and a reason. Notes and docs that cite an old id keep working:
 | Live lesson | `200`, the lesson (same fields as list items) |
 | Deleted, replaced by a live lesson | `301`, `Location: /api/v1/lessons/<successor>`, body `{"id", "status": "moved", "successor_id", "chain", "reason"}` |
 | Deleted, no live successor | `410`, body `{"id", "status": "deleted", "reason", "chain", "broken"}` |
-| Several prefix tombstones match | `409`, body `{"id", "status": "ambiguous", "candidates"}` |
+| Prefix matches more than one lesson or tombstone | `409`, body `{"id", "status": "ambiguous", "live_candidates", "candidates"}` |
 | Unknown | `404`, body `{"id", "status": "not_found"}` |
 
 Successors can themselves be replaced; the lookup follows the chain (up to 10
 hops, stopping on a cycle) and `chain` lists the ids it passed through, ending
 at the live lesson. `broken` says why a chain stopped: `no_successor`,
 `dead_end`, `cycle` or `too_deep`. Clients that do not follow redirects still
-get the successor in the body. A tombstone's id may be a prefix of 8 or more
-characters, matching any id that starts with it. Search never returns
-deleted lessons.
+get the successor in the body. Ids of 8 or more characters also match as
+prefixes, in both directions: a short id such as `7811fa8b` finds the live
+lesson or tombstone whose id starts with it, and a tombstone recorded under a
+short id matches any longer id that starts with it. An exact match always
+wins; if a prefix matches more than one, the response is `409` and nothing is
+guessed. Each tombstone carries `created_at` and `updated_at`, which changes
+when its successor or reason is re-pointed. Search never returns deleted
+lessons.
 
 `DELETE /api/v1/lessons/{id}?successor=<id>&reason=<text>` records the
 successor, which must resolve to another live lesson (a unique id prefix of
 8+ characters is accepted), otherwise the request fails with `400` and
 nothing is deleted. Without `successor` the tombstone records a plain
-deletion; the MCP `delete_lesson` tool does the same.
+deletion. Deleting an unknown id returns `404`. The MCP `delete_lesson` tool
+takes the same optional `successor` and `reason` arguments.
 
 To record lessons deleted before tombstones existed, import a map:
 

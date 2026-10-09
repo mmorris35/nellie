@@ -431,7 +431,8 @@ fn migrate_v7(conn: &Connection) -> Result<()> {
             old_id TEXT PRIMARY KEY,
             successor_id TEXT NULL,
             reason TEXT NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         );
         ",
     )

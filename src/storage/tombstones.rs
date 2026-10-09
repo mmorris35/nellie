@@ -8,9 +8,11 @@
 //! instead of failing silently.
 //!
 //! Successors can themselves be tombstoned, so lookups follow the chain up to
-//! [`MAX_CHAIN_DEPTH`] hops and stop on a cycle. A tombstone's `old_id` may be
-//! an id prefix (at least [`MIN_PREFIX_LEN`] characters), because ids are
-//! often cited in shortened form.
+//! [`MAX_CHAIN_DEPTH`] hops and stop on a cycle. Ids are often cited in
+//! shortened form, so prefixes of at least [`MIN_PREFIX_LEN`] characters match
+//! in both directions: a tombstone's `old_id` may be a prefix of the requested
+//! id, and the requested id may be a prefix of a live id or a tombstone's
+//! `old_id`.
 
 use std::collections::HashSet;
 
@@ -29,6 +31,11 @@ pub const MAX_CHAIN_DEPTH: usize = 10;
 /// Shortest id prefix accepted as a tombstone `old_id` or successor reference.
 pub const MIN_PREFIX_LEN: usize = 8;
 
+/// Most live ids listed for an ambiguous prefix.
+pub const MAX_CANDIDATES: usize = 10;
+
+const TOMBSTONE_COLUMNS: &str = "old_id, successor_id, reason, created_at, updated_at";
+
 /// A recorded pointer from a deleted lesson id to its successor, if any.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Tombstone {
@@ -38,8 +45,10 @@ pub struct Tombstone {
     pub successor_id: Option<String>,
     /// Free-text explanation, possibly empty.
     pub reason: String,
-    /// Unix timestamp when the tombstone was recorded.
+    /// Unix timestamp when the tombstone was first recorded.
     pub created_at: i64,
+    /// Unix timestamp when the successor or reason last changed.
+    pub updated_at: i64,
 }
 
 /// Why a successor chain did not reach a live lesson.
@@ -77,8 +86,14 @@ pub enum LessonResolution {
         /// Why the chain stopped.
         broken: BrokenChain,
     },
-    /// Several prefix tombstones match the id; refusing to guess.
-    Ambiguous(Vec<Tombstone>),
+    /// The id is a prefix that matches more than one live lesson or
+    /// tombstone; refusing to guess.
+    Ambiguous {
+        /// Live lesson ids the id is a prefix of (at most [`MAX_CANDIDATES`]).
+        live: Vec<String>,
+        /// Tombstones matching the id as a prefix in either direction.
+        tombstones: Vec<Tombstone>,
+    },
     /// The id is neither live nor tombstoned.
     NotFound,
 }
@@ -114,6 +129,7 @@ fn row_to_tombstone(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tombstone> {
         successor_id: row.get(1)?,
         reason: row.get(2)?,
         created_at: row.get(3)?,
+        updated_at: row.get(4)?,
     })
 }
 
@@ -124,8 +140,7 @@ fn row_to_tombstone(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tombstone> {
 /// Returns an error if the database query fails.
 pub fn get_tombstone(conn: &Connection, id: &str) -> Result<Option<Tombstone>> {
     conn.query_row(
-        "SELECT old_id, successor_id, reason, created_at
-         FROM lesson_tombstones WHERE old_id = ?",
+        &format!("SELECT {TOMBSTONE_COLUMNS} FROM lesson_tombstones WHERE old_id = ?"),
         [id],
         row_to_tombstone,
     )
@@ -142,16 +157,42 @@ pub fn get_tombstone(conn: &Connection, id: &str) -> Result<Option<Tombstone>> {
 /// Returns an error if the database query fails.
 pub fn find_prefix_tombstones(conn: &Connection, id: &str) -> Result<Vec<Tombstone>> {
     let mut stmt = conn
-        .prepare(
-            "SELECT old_id, successor_id, reason, created_at
+        .prepare(&format!(
+            "SELECT {TOMBSTONE_COLUMNS}
              FROM lesson_tombstones
              WHERE length(old_id) >= ?1 AND length(old_id) < length(?2)
                AND substr(?2, 1, length(old_id)) = old_id
-             ORDER BY old_id",
-        )
+             ORDER BY old_id"
+        ))
         .map_err(db_err("failed to query tombstones"))?;
     let rows = stmt
         .query_map(params![MIN_PREFIX_LEN, id], row_to_tombstone)
+        .map_err(db_err("failed to query tombstones"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_err("failed to read tombstone"))
+}
+
+/// Fetch tombstones whose `old_id` starts with `prefix` and is longer than it.
+///
+/// Returns nothing for a prefix shorter than [`MIN_PREFIX_LEN`].
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub fn find_extending_tombstones(conn: &Connection, prefix: &str) -> Result<Vec<Tombstone>> {
+    if prefix.len() < MIN_PREFIX_LEN {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {TOMBSTONE_COLUMNS}
+             FROM lesson_tombstones
+             WHERE length(old_id) > length(?1) AND substr(old_id, 1, length(?1)) = ?1
+             ORDER BY old_id"
+        ))
+        .map_err(db_err("failed to query tombstones"))?;
+    let rows = stmt
+        .query_map([prefix], row_to_tombstone)
         .map_err(db_err("failed to query tombstones"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db_err("failed to read tombstone"))
@@ -164,10 +205,9 @@ pub fn find_prefix_tombstones(conn: &Connection, id: &str) -> Result<Vec<Tombsto
 /// Returns an error if the database query fails.
 pub fn list_tombstones(conn: &Connection) -> Result<Vec<Tombstone>> {
     let mut stmt = conn
-        .prepare(
-            "SELECT old_id, successor_id, reason, created_at
-             FROM lesson_tombstones ORDER BY old_id",
-        )
+        .prepare(&format!(
+            "SELECT {TOMBSTONE_COLUMNS} FROM lesson_tombstones ORDER BY old_id"
+        ))
         .map_err(db_err("failed to list tombstones"))?;
     let rows = stmt
         .query_map([], row_to_tombstone)
@@ -180,7 +220,7 @@ pub fn list_tombstones(conn: &Connection) -> Result<Vec<Tombstone>> {
 ///
 /// Returns `None` if an identical tombstone already existed, otherwise
 /// `Some(true)` for a new tombstone and `Some(false)` for a changed one.
-/// The original `created_at` is kept on update.
+/// The original `created_at` is kept on update; `updated_at` records the change.
 ///
 /// # Errors
 ///
@@ -199,11 +239,12 @@ pub fn upsert_tombstone(
     }
     retry_on_schema_change(conn, || {
         conn.execute(
-            "INSERT INTO lesson_tombstones (old_id, successor_id, reason, created_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO lesson_tombstones (old_id, successor_id, reason, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(old_id) DO UPDATE SET
                 successor_id = excluded.successor_id,
-                reason = excluded.reason",
+                reason = excluded.reason,
+                updated_at = excluded.updated_at",
             params![old_id, successor_id, reason, now()],
         )
     })
@@ -219,13 +260,13 @@ fn live_lesson(conn: &Connection, id: &str) -> Result<Option<LessonRecord>> {
     }
 }
 
-/// Ids of live lessons starting with `prefix` (at most two are returned).
+/// Ids of live lessons starting with `prefix` (at most [`MAX_CANDIDATES`]).
 fn live_ids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
     let mut stmt = conn
-        .prepare("SELECT id FROM lessons WHERE substr(id, 1, length(?1)) = ?1 LIMIT 2")
+        .prepare("SELECT id FROM lessons WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id LIMIT ?2")
         .map_err(db_err("failed to query lessons"))?;
     let rows = stmt
-        .query_map([prefix], |row| row.get(0))
+        .query_map(params![prefix, MAX_CANDIDATES], |row| row.get(0))
         .map_err(db_err("failed to query lessons"))?;
     rows.collect::<rusqlite::Result<Vec<String>>>()
         .map_err(db_err("failed to read lesson id"))
@@ -248,7 +289,8 @@ fn live_reference(conn: &Connection, reference: &str) -> Result<Option<String>> 
     Ok(None)
 }
 
-/// The tombstone that applies to `id`: exact match first, then a unique prefix.
+/// The tombstone that applies to `id`: exact match first, then a unique
+/// prefix match in either direction.
 enum TombstoneMatch {
     One(Tombstone),
     Many(Vec<Tombstone>),
@@ -260,6 +302,7 @@ fn match_tombstone(conn: &Connection, id: &str) -> Result<TombstoneMatch> {
         return Ok(TombstoneMatch::One(t));
     }
     let mut prefixes = find_prefix_tombstones(conn, id)?;
+    prefixes.extend(find_extending_tombstones(conn, id)?);
     Ok(match prefixes.len() {
         0 => TombstoneMatch::None,
         1 => TombstoneMatch::One(prefixes.remove(0)),
@@ -267,11 +310,44 @@ fn match_tombstone(conn: &Connection, id: &str) -> Result<TombstoneMatch> {
     })
 }
 
+/// The tombstone to start resolving `id` (not a live id) from, or the final
+/// answer when there is none: an exact tombstone first, then a unique prefix
+/// match against live ids and tombstones.
+fn first_tombstone(
+    conn: &Connection,
+    id: &str,
+) -> Result<std::result::Result<Tombstone, LessonResolution>> {
+    if let Some(t) = get_tombstone(conn, id)? {
+        return Ok(Ok(t));
+    }
+    let live = if id.len() >= MIN_PREFIX_LEN {
+        live_ids_with_prefix(conn, id)?
+    } else {
+        Vec::new()
+    };
+    let mut tombstones = match match_tombstone(conn, id)? {
+        TombstoneMatch::One(t) => vec![t],
+        TombstoneMatch::Many(ts) => ts,
+        TombstoneMatch::None => Vec::new(),
+    };
+    Ok(match (live.len(), tombstones.len()) {
+        (0, 0) => Err(LessonResolution::NotFound),
+        (1, 0) => {
+            Err(live_lesson(conn, &live[0])?
+                .map_or(LessonResolution::NotFound, LessonResolution::Live))
+        }
+        (0, 1) => Ok(tombstones.remove(0)),
+        _ => Err(LessonResolution::Ambiguous { live, tombstones }),
+    })
+}
+
 /// Look up a lesson id, following tombstones to a live successor.
 ///
-/// A live lesson always wins over a tombstone with the same id. Successors
-/// stored as id prefixes are accepted when they match exactly one live
-/// lesson.
+/// An exact live id wins, then an exact tombstone. Otherwise an id of at
+/// least [`MIN_PREFIX_LEN`] characters is matched as a prefix against live
+/// ids and tombstones (both directions); exactly one match is used, more than
+/// one is [`LessonResolution::Ambiguous`]. Successors stored as id prefixes
+/// are accepted when they match exactly one live lesson.
 ///
 /// # Errors
 ///
@@ -280,10 +356,9 @@ pub fn resolve_lesson_id(conn: &Connection, id: &str) -> Result<LessonResolution
     if let Some(lesson) = live_lesson(conn, id)? {
         return Ok(LessonResolution::Live(lesson));
     }
-    let first = match match_tombstone(conn, id)? {
-        TombstoneMatch::One(t) => t,
-        TombstoneMatch::Many(candidates) => return Ok(LessonResolution::Ambiguous(candidates)),
-        TombstoneMatch::None => return Ok(LessonResolution::NotFound),
+    let first = match first_tombstone(conn, id)? {
+        Ok(t) => t,
+        Err(resolution) => return Ok(resolution),
     };
 
     let reason = first.reason.clone();
@@ -602,7 +677,7 @@ mod tests {
             upsert_tombstone(conn, "12345678", None, "")?;
             upsert_tombstone(conn, "123456789", None, "")?;
             match resolve_lesson_id(conn, "1234567890-full")? {
-                LessonResolution::Ambiguous(c) => assert_eq!(c.len(), 2),
+                LessonResolution::Ambiguous { tombstones, .. } => assert_eq!(tombstones.len(), 2),
                 other => panic!("expected ambiguous, got {other:?}"),
             }
             Ok(())
