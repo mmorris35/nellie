@@ -19,6 +19,7 @@ mod lessons_search;
 mod models;
 mod schema;
 mod search;
+mod tombstones;
 mod vector;
 
 pub use agent_status::{
@@ -62,6 +63,12 @@ pub use lessons_search::{
 pub use models::{CheckpointRecord, ChunkRecord, FileState, LessonRecord, SearchResult};
 pub use schema::{migrate, verify_schema, SCHEMA_VERSION};
 pub use search::{search_chunks, search_chunks_by_text, SearchOptions};
+pub use tombstones::{
+    delete_lesson_with_tombstone, find_extending_tombstones, find_prefix_tombstones, get_tombstone,
+    import_tombstones, list_tombstones, resolve_lesson_id, resolve_successor, upsert_tombstone,
+    BrokenChain, ImportReport, LessonResolution, Tombstone, TombstoneDelete, MAX_CANDIDATES,
+    MAX_CHAIN_DEPTH, MIN_PREFIX_LEN,
+};
 pub use vector::{
     create_vec_table, delete_vector, init_sqlite_vec, insert_vector, load_extension,
     search_similar, EMBEDDING_DIM,

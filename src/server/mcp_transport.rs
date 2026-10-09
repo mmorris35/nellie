@@ -64,6 +64,12 @@ pub struct AddLessonRequest {
 pub struct DeleteLessonRequest {
     #[schemars(description = "Lesson ID to delete")]
     pub id: String,
+    #[schemars(description = "Optional ID of the lesson that replaces this one")]
+    #[serde(default)]
+    pub successor: Option<String>,
+    #[schemars(description = "Optional reason recorded with the deletion")]
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -313,13 +319,21 @@ impl NellieMcpHandler {
 
     #[tool(description = "Delete a lesson by ID")]
     fn delete_lesson(&self, Parameters(req): Parameters<DeleteLessonRequest>) -> String {
-        match self
-            .db
-            .with_conn(|conn| crate::storage::delete_lesson(conn, &req.id))
-        {
-            Ok(()) => serde_json::json!({
+        // Leaves a tombstone so lookups by this id report it as deleted, or
+        // as moved to the successor.
+        let successor = req.successor.as_deref().filter(|s| !s.is_empty());
+        let reason = req.reason.as_deref().unwrap_or("");
+        match self.db.with_transaction(|conn| {
+            crate::storage::delete_lesson_with_tombstone(conn, &req.id, successor, reason)
+        }) {
+            Ok(crate::storage::TombstoneDelete::Deleted { successor_id }) => serde_json::json!({
                 "id": req.id,
+                "successor_id": successor_id,
                 "message": "Lesson deleted successfully"
+            })
+            .to_string(),
+            Ok(crate::storage::TombstoneDelete::InvalidSuccessor) => serde_json::json!({
+                "error": "successor does not resolve to another live lesson; nothing deleted"
             })
             .to_string(),
             Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),

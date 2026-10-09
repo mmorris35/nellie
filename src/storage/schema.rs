@@ -8,7 +8,7 @@ use crate::error::StorageError;
 use crate::Result;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Run all pending migrations.
 ///
@@ -55,6 +55,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     if current_version < 6 {
         migrate_v6(conn)?;
+    }
+
+    if current_version < 7 {
+        migrate_v7(conn)?;
     }
 
     Ok(())
@@ -413,6 +417,33 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Migration v7: lesson tombstones.
+///
+/// A deleted lesson's id maps to the lesson that replaced it (or to nothing),
+/// so lookups by an old id can point at the successor. See
+/// `storage::tombstones`.
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    tracing::info!("Applying migration v7: Lesson tombstones");
+
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS lesson_tombstones (
+            old_id TEXT PRIMARY KEY,
+            successor_id TEXT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(|e| StorageError::Migration(format!("v7 migration failed: {e}")))?;
+
+    record_migration(conn, 7)?;
+    tracing::info!("Migration v7 complete");
+
+    Ok(())
+}
+
 /// Verify all expected tables exist.
 ///
 /// # Errors
@@ -433,6 +464,7 @@ pub fn verify_schema(conn: &Connection) -> Result<()> {
         "embedding_meta",
         "reembed_state",
         "lessons_fts",
+        "lesson_tombstones",
     ];
 
     for table in tables {
@@ -756,7 +788,7 @@ mod tests {
 
             let version = get_current_version(conn)?;
             assert_eq!(version, SCHEMA_VERSION);
-            assert_eq!(version, 6);
+            assert_eq!(version, 7);
 
             verify_schema(conn)?;
             Ok(())
@@ -836,6 +868,38 @@ mod tests {
                 .unwrap();
             assert_eq!(target, "callee");
 
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_tombstones_migration_on_existing_database() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            migrate(conn)?;
+            // Roll back to a v6 database holding a lesson.
+            conn.execute_batch(
+                "DROP TABLE lesson_tombstones;
+                 DELETE FROM schema_migrations WHERE version = 7;",
+            )
+            .unwrap();
+            crate::storage::insert_lesson(
+                conn,
+                &crate::storage::LessonRecord::new("Kept", "Content", vec![]),
+            )?;
+            assert_eq!(get_current_version(conn)?, 6);
+
+            migrate(conn)?;
+            assert_eq!(get_current_version(conn)?, 7);
+            verify_schema(conn)?;
+            assert_eq!(crate::storage::count_lessons(conn)?, 1);
+            let tombstones: i64 = conn
+                .query_row("SELECT COUNT(*) FROM lesson_tombstones", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(tombstones, 0);
             Ok(())
         })
         .unwrap();

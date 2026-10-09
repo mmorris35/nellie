@@ -956,7 +956,7 @@ mod tests {
                  DROP TRIGGER lessons_fts_update;
                  DROP TRIGGER lessons_fts_delete;
                  DROP TABLE lessons_fts;
-                 DELETE FROM schema_migrations WHERE version = 6;",
+                 DELETE FROM schema_migrations WHERE version >= 6;",
             )
             .unwrap();
             insert_lesson(conn, &LessonRecord::new("Old one", "persimmon", vec![]))?;

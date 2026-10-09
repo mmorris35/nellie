@@ -399,6 +399,28 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Manage lesson tombstones (pointers from deleted lesson ids)
+    Tombstones {
+        #[command(subcommand)]
+        action: TombstonesCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TombstonesCommand {
+    /// Import an old-id to successor-id map
+    ///
+    /// Reads a TSV file with the header `old_id<TAB>new_id<TAB>why`. An
+    /// empty new_id records a deletion with no successor; ids may be
+    /// shortened to an 8+ character prefix. Rows whose old_id is still a
+    /// live lesson are skipped. Safe to rerun: existing tombstones are
+    /// updated in place.
+    Import {
+        /// Path to the TSV map
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -524,6 +546,9 @@ async fn main() -> Result<()> {
             skip_model,
         }) => setup_command(&cli.data_dir, skip_runtime, skip_model).await,
         Some(Commands::Bootstrap { force }) => bootstrap_command(&cli.data_dir, force).await,
+        Some(Commands::Tombstones {
+            action: TombstonesCommand::Import { file },
+        }) => tombstones_import_command(&cli.data_dir, &file),
         Some(Commands::Reembed {
             drop_old,
             no_switch,
@@ -2109,6 +2134,50 @@ async fn bootstrap_command(data_dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Import a lesson tombstone map into the database.
+fn tombstones_import_command(data_dir: &Path, file: &Path) -> Result<()> {
+    let tsv = std::fs::read_to_string(file)
+        .map_err(|e| nellie::Error::config(format!("failed to read {}: {e}", file.display())))?;
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let db_path = config.database_path();
+    if !db_path.exists() {
+        return Err(nellie::Error::config(format!(
+            "no database at {}",
+            db_path.display()
+        )));
+    }
+    // Shares the lock with running servers; refuses while a reembed runs.
+    let _lock = nellie::reembed::DbLock::shared(&db_path)?;
+    let db = Database::open(&db_path)?;
+    init_storage(&db)?;
+
+    let report = db.with_transaction(|conn| nellie::storage::import_tombstones(conn, &tsv))?;
+
+    // Print summary to stdout (this is a CLI command, not library code)
+    println!(
+        "imported {}, updated {}, unchanged {}, skipped_live {}, unresolved_successor {}, invalid {}",
+        report.imported,
+        report.updated,
+        report.unchanged,
+        report.skipped_live.len(),
+        report.unresolved_successor.len(),
+        report.invalid.len()
+    );
+    for id in &report.skipped_live {
+        println!("skipped (still live): {id}");
+    }
+    for id in &report.unresolved_successor {
+        println!("successor does not resolve to a live lesson: {id}");
+    }
+    for line in &report.invalid {
+        println!("invalid: {line}");
+    }
+    Ok(())
+}
+
 /// Refuse to continue if the vector index was built with a different
 /// embedding spec than this binary uses. Records the spec of an index built
 /// by an earlier Nellie on first run.
@@ -2681,6 +2750,18 @@ mod tests {
         } else {
             panic!("Expected Setup command");
         }
+    }
+
+    #[test]
+    fn test_cli_parsing_tombstones_import() {
+        let cli = Cli::try_parse_from(["nellie", "tombstones", "import", "map.tsv"]).unwrap();
+        match cli.command {
+            Some(Commands::Tombstones {
+                action: TombstonesCommand::Import { file },
+            }) => assert_eq!(file, PathBuf::from("map.tsv")),
+            other => panic!("Expected tombstones import, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["nellie", "tombstones", "import"]).is_err());
     }
 
     #[test]
