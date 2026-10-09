@@ -126,6 +126,11 @@ pub fn lesson_search_limit(requested: usize, max_result_limit: Option<u32>) -> u
 }
 
 /// Maximum number of query words passed to the full-text index.
+///
+/// Only the FIRST 32 distinct, non-stopword words of a query reach keyword search; anything
+/// later is seen by the vector side only. A caller that builds a query from
+/// several parts (e.g. the current message plus earlier context) should put
+/// the most important part first.
 const MAX_KEYWORD_TERMS: usize = 32;
 
 /// Common English words left out of keyword queries. A query made only of

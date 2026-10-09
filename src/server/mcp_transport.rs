@@ -630,7 +630,16 @@ impl ServerHandler for NellieMcpHandler {
 /// MCP server configuration.
 #[derive(Debug, Clone)]
 pub struct McpTransportConfig {
-    /// Host to bind to
+    /// Host to bind to.
+    ///
+    /// rmcp >= 1.4 also checks the request's Host header, and its default
+    /// allowlist is only localhost, 127.0.0.1 and ::1. Binding to 0.0.0.0 or a
+    /// LAN/Tailscale address is not enough on its own: requests addressed to
+    /// that name are refused with 403, which looks like a dead server. This
+    /// struct has no allowlist field: widening means editing
+    /// `start_mcp_server` to call `StreamableHttpServerConfig::with_allowed_hosts`
+    /// with the names clients will use. That call REPLACES the defaults, so
+    /// list localhost, 127.0.0.1 and ::1 again too.
     pub host: String,
     /// Port for MCP server
     pub port: u16,
