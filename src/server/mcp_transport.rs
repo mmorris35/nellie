@@ -313,11 +313,11 @@ impl NellieMcpHandler {
 
     #[tool(description = "Delete a lesson by ID")]
     fn delete_lesson(&self, Parameters(req): Parameters<DeleteLessonRequest>) -> String {
-        match self
-            .db
-            .with_conn(|conn| crate::storage::delete_lesson(conn, &req.id))
-        {
-            Ok(()) => serde_json::json!({
+        // Leaves a tombstone so lookups by this id report it as deleted.
+        match self.db.with_transaction(|conn| {
+            crate::storage::delete_lesson_with_tombstone(conn, &req.id, None, "")
+        }) {
+            Ok(_) => serde_json::json!({
                 "id": req.id,
                 "message": "Lesson deleted successfully"
             })

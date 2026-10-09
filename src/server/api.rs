@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{sse::Event, IntoResponse, Sse},
-    routing::{delete, get, post},
+    http::{header, HeaderValue, StatusCode},
+    response::{sse::Event, IntoResponse, Response, Sse},
+    routing::{get, post},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -171,6 +171,17 @@ pub struct CreateLessonRequest {
 
 fn default_severity() -> String {
     "info".to_string()
+}
+
+/// Delete lesson query parameters.
+#[derive(Debug, Deserialize)]
+pub struct DeleteLessonQuery {
+    /// Id (or unique id prefix) of the lesson that replaces the deleted one.
+    #[serde(default)]
+    pub successor: Option<String>,
+    /// Why the lesson was deleted.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Tool metrics summary for the dashboard.
@@ -436,7 +447,10 @@ pub fn create_api_router(state: Arc<McpState>) -> Router {
             "/api/v1/lessons/backfill-embeddings",
             post(backfill_lesson_embeddings),
         )
-        .route("/api/v1/lessons/{id}", delete(delete_lesson))
+        .route(
+            "/api/v1/lessons/{id}",
+            get(get_lesson_by_id).delete(delete_lesson),
+        )
         .route("/api/v1/metrics", get(tool_metrics))
         .route("/api/v1/search/hybrid", get(hybrid_search))
         .route(
@@ -714,21 +728,116 @@ async fn create_lesson(
     ))
 }
 
+/// GET /api/v1/lessons/:id - Fetch a lesson, following tombstones.
+///
+/// A live lesson is returned as 200. A deleted id with a live successor
+/// returns 301 with `Location` set to the successor and the pointer in the
+/// body; a deleted id with no live successor returns 410; an unknown id 404.
+/// If several prefix tombstones match, 409 lists them.
+async fn get_lesson_by_id(State(state): State<Arc<McpState>>, Path(id): Path<String>) -> Response {
+    let resolution = match state
+        .db()
+        .with_conn(|conn| storage::resolve_lesson_id(conn, &id))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, lesson_id = %id, "Failed to resolve lesson");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match resolution {
+        storage::LessonResolution::Live(l) => Json(LessonEntry {
+            id: l.id,
+            title: l.title,
+            content: l.content,
+            severity: l.severity,
+            tags: l.tags,
+            created_at: l.created_at,
+        })
+        .into_response(),
+        storage::LessonResolution::Moved { chain, reason } => {
+            let successor = chain.last().cloned().unwrap_or_default();
+            let body = Json(serde_json::json!({
+                "id": id,
+                "status": "moved",
+                "successor_id": successor,
+                "chain": chain,
+                "reason": reason,
+            }));
+            let mut response = (StatusCode::MOVED_PERMANENTLY, body).into_response();
+            if let Ok(location) = HeaderValue::from_str(&format!("/api/v1/lessons/{successor}")) {
+                response.headers_mut().insert(header::LOCATION, location);
+            }
+            response
+        }
+        storage::LessonResolution::Deleted {
+            chain,
+            reason,
+            broken,
+        } => (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "id": id,
+                "status": "deleted",
+                "reason": reason,
+                "chain": chain,
+                "broken": broken,
+            })),
+        )
+            .into_response(),
+        storage::LessonResolution::Ambiguous(candidates) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "id": id,
+                "status": "ambiguous",
+                "candidates": candidates,
+            })),
+        )
+            .into_response(),
+        storage::LessonResolution::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "id": id, "status": "not_found" })),
+        )
+            .into_response(),
+    }
+}
+
 /// DELETE /api/v1/lessons/:id - Delete a lesson.
+///
+/// Records a tombstone for the id. With `?successor=<id>` the tombstone
+/// points at that lesson, which must resolve to a live lesson (else 400 and
+/// nothing is deleted); `?reason=<text>` is stored with it.
 async fn delete_lesson(
     State(state): State<Arc<McpState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    state
-        .db()
-        .with_conn(|conn| storage::delete_lesson(conn, &id))
-        .map_err(|e| {
-            tracing::error!(error = %e, lesson_id = %id, "Failed to delete lesson");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    Query(params): Query<DeleteLessonQuery>,
+) -> Response {
+    let successor = params.successor.as_deref().filter(|s| !s.is_empty());
+    let reason = params.reason.as_deref().unwrap_or("");
+    let outcome = state.db().with_transaction(|conn| {
+        storage::delete_lesson_with_tombstone(conn, &id, successor, reason)
+    });
 
-    tracing::info!(id = %id, "Lesson deleted via UI");
-    Ok(StatusCode::NO_CONTENT)
+    match outcome {
+        Ok(storage::TombstoneDelete::Deleted { .. }) => {
+            tracing::info!(id = %id, "Lesson deleted via UI");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(storage::TombstoneDelete::InvalidSuccessor) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "id": id,
+                "error": "successor does not resolve to another live lesson",
+                "successor": successor,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, lesson_id = %id, "Failed to delete lesson");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// GET /api/v1/lessons/search - Search over lessons.
@@ -1781,6 +1890,208 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    fn insert_lesson_with_id(state: &McpState, id: &str) {
+        let mut lesson = storage::LessonRecord::new(format!("Lesson {id}"), "Body", vec![]);
+        lesson.id = id.to_string();
+        state
+            .db()
+            .with_conn(|conn| storage::insert_lesson(conn, &lesson))
+            .unwrap();
+    }
+
+    fn tombstone(state: &McpState, old_id: &str, successor: Option<&str>, reason: &str) {
+        state
+            .db()
+            .with_conn(|conn| storage::upsert_tombstone(conn, old_id, successor, reason))
+            .unwrap();
+    }
+
+    async fn send(
+        state: &Arc<McpState>,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let response = create_api_router(Arc::clone(state))
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, headers, json)
+    }
+
+    #[tokio::test]
+    async fn test_get_lesson_live() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "live-lesson-1");
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/live-lesson-1").await;
+        assert_eq!(status, StatusCode::OK);
+        let lesson: LessonEntry = serde_json::from_value(body).unwrap();
+        assert_eq!(lesson.id, "live-lesson-1");
+        assert_eq!(lesson.title, "Lesson live-lesson-1");
+    }
+
+    #[tokio::test]
+    async fn test_get_lesson_moved_follows_chain() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "lesson-final");
+        tombstone(&state, "lesson-first", Some("lesson-middle"), "retitled");
+        tombstone(&state, "lesson-middle", Some("lesson-final"), "folded");
+        let (status, headers, body) = send(&state, "GET", "/api/v1/lessons/lesson-first").await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            headers.get(header::LOCATION).unwrap(),
+            "/api/v1/lessons/lesson-final"
+        );
+        assert_eq!(body["id"], "lesson-first");
+        assert_eq!(body["status"], "moved");
+        assert_eq!(body["successor_id"], "lesson-final");
+        assert_eq!(
+            body["chain"],
+            serde_json::json!(["lesson-middle", "lesson-final"])
+        );
+        assert_eq!(body["reason"], "retitled");
+    }
+
+    #[tokio::test]
+    async fn test_get_lesson_deleted_unknown_and_cycle() {
+        let state = create_test_state();
+        tombstone(&state, "lesson-gone", None, "obsolete");
+        tombstone(&state, "loop-one", Some("loop-two"), "");
+        tombstone(&state, "loop-two", Some("loop-one"), "");
+
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/lesson-gone").await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["status"], "deleted");
+        assert_eq!(body["reason"], "obsolete");
+
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/loop-one").await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["broken"], "cycle");
+
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/never-existed").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            serde_json::json!({"id": "never-existed", "status": "not_found"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_lesson_prefix_and_ambiguous_prefix() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "replacement");
+        tombstone(&state, "0a1b2c3d", Some("replacement"), "short id");
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/0a1b2c3d-full-id").await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(body["successor_id"], "replacement");
+
+        tombstone(&state, "9f8e7d6c", None, "");
+        tombstone(&state, "9f8e7d6c5", None, "");
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/9f8e7d6c5b-full-id").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "ambiguous");
+        assert_eq!(body["candidates"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_deleted_lesson_leaves_search_and_tombstone_holds_no_content() {
+        let state = create_test_state();
+        let mut lesson = storage::LessonRecord::new(
+            "Quokka zebra secret",
+            "token-like body text that must not survive",
+            vec![],
+        );
+        lesson.id = "purged".to_string();
+        state
+            .db()
+            .with_conn(|conn| storage::insert_lesson(conn, &lesson))
+            .unwrap();
+
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/search?q=Quokka").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 1);
+
+        let (status, _, _) = send(&state, "DELETE", "/api/v1/lessons/purged?reason=purged").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Gone from search, answered as deleted by GET.
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/search?q=Quokka").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 0);
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/purged").await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(!body.to_string().contains("Quokka"));
+        assert!(!body.to_string().contains("token-like"));
+
+        // The tombstone stores only ids, the caller's reason and a time.
+        let columns: Vec<String> = state
+            .db()
+            .with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT name FROM pragma_table_info('lesson_tombstones') ORDER BY cid")
+                    .map_err(|e| crate::Error::internal(e.to_string()))?;
+                let names = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| crate::Error::internal(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| crate::Error::internal(e.to_string()))?;
+                Ok(names)
+            })
+            .unwrap();
+        assert_eq!(columns, ["old_id", "successor_id", "reason", "created_at"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_lesson_records_tombstone() {
+        let state = create_test_state();
+        insert_lesson_with_id(&state, "to-retitle");
+        insert_lesson_with_id(&state, "retitled-copy");
+        insert_lesson_with_id(&state, "to-drop");
+
+        let (status, _, body) = send(
+            &state,
+            "DELETE",
+            "/api/v1/lessons/to-retitle?successor=does-not-exist",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["id"], "to-retitle");
+        let (status, _, _) = send(&state, "GET", "/api/v1/lessons/to-retitle").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = send(
+            &state,
+            "DELETE",
+            "/api/v1/lessons/to-retitle?successor=retitled-copy&reason=new%20title",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, headers, body) = send(&state, "GET", "/api/v1/lessons/to-retitle").await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            headers.get(header::LOCATION).unwrap(),
+            "/api/v1/lessons/retitled-copy"
+        );
+        assert_eq!(body["reason"], "new title");
+
+        let (status, _, _) = send(&state, "DELETE", "/api/v1/lessons/to-drop").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, body) = send(&state, "GET", "/api/v1/lessons/to-drop").await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["status"], "deleted");
     }
 
     #[tokio::test]

@@ -424,13 +424,56 @@ What the result fields mean:
 | `/api/v1/search/hybrid` | GET | Hybrid search (vector + graph) |
 | `/api/v1/lessons` | GET/POST | List or add lessons |
 | `/api/v1/lessons/search` | GET | Search lessons (`q`, `limit`; keyword + vector fusion) |
-| `/api/v1/lessons/{id}` | DELETE | Delete a lesson |
+| `/api/v1/lessons/{id}` | GET | Fetch a lesson; old ids point to their successor (see below) |
+| `/api/v1/lessons/{id}` | DELETE | Delete a lesson (`successor`, `reason` optional; leaves a tombstone) |
 | `/api/v1/checkpoints` | GET | List checkpoints |
 | `/api/v1/agents` | GET | List agents |
 | `/api/v1/graph` | GET | Knowledge graph query |
 | `/api/v1/metrics` | GET | Tool metrics |
 | `/api/v1/files` | GET | Indexed files |
 | `/api/v1/activity` | GET | Activity stream |
+
+### Lesson ids and tombstones
+
+Lessons cannot be edited in place, so retitling one means deleting it and
+adding a new lesson, which gets a new id. Deleting a lesson leaves a
+*tombstone*: its old id, optionally the id of the lesson that replaced it,
+and a reason. Notes and docs that cite an old id keep working:
+
+| `GET /api/v1/lessons/{id}` | Response |
+|----------------------------|----------|
+| Live lesson | `200`, the lesson (same fields as list items) |
+| Deleted, replaced by a live lesson | `301`, `Location: /api/v1/lessons/<successor>`, body `{"id", "status": "moved", "successor_id", "chain", "reason"}` |
+| Deleted, no live successor | `410`, body `{"id", "status": "deleted", "reason", "chain", "broken"}` |
+| Several prefix tombstones match | `409`, body `{"id", "status": "ambiguous", "candidates"}` |
+| Unknown | `404`, body `{"id", "status": "not_found"}` |
+
+Successors can themselves be replaced; the lookup follows the chain (up to 10
+hops, stopping on a cycle) and `chain` lists the ids it passed through, ending
+at the live lesson. `broken` says why a chain stopped: `no_successor`,
+`dead_end`, `cycle` or `too_deep`. Clients that do not follow redirects still
+get the successor in the body. A tombstone's id may be a prefix of 8 or more
+characters, matching any id that starts with it. Search never returns
+deleted lessons.
+
+`DELETE /api/v1/lessons/{id}?successor=<id>&reason=<text>` records the
+successor, which must resolve to another live lesson (a unique id prefix of
+8+ characters is accepted), otherwise the request fails with `400` and
+nothing is deleted. Without `successor` the tombstone records a plain
+deletion; the MCP `delete_lesson` tool does the same.
+
+To record lessons deleted before tombstones existed, import a map:
+
+```bash
+nellie tombstones import map.tsv
+```
+
+The file is TSV with the header `old_id<TAB>new_id<TAB>why`; leave `new_id`
+empty for a deletion with no successor. Rows whose `old_id` is still a live
+lesson are skipped, an 8+ character `new_id` prefix is expanded to the full
+id when it matches one live lesson, and rerunning the import updates rows in
+place. It prints counts (`imported`, `updated`, `unchanged`, `skipped_live`,
+`unresolved_successor`, `invalid`) and lists the skipped and unresolved ids.
 
 ## Configuration
 
@@ -459,6 +502,9 @@ nellie index <path> [--local]  # --local forces local embeddings (no server need
 # Re-embed — rebuild the vector index with the current embedding settings (Nellie stopped)
 nellie reembed [--drop-old] [--embedding-threads N] [--batch-size N]
 nellie reembed --no-switch     # build only; safe while the previous version still serves
+
+# Tombstones — record old lesson ids and their successors from a TSV map
+nellie tombstones import <file.tsv>
 
 # Deep Hooks — Claude Code native memory integration
 nellie sync [--rules] [--dry-run] [--budget N] [--server URL]

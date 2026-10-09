@@ -1917,9 +1917,10 @@ fn handle_delete_lesson(
 ) -> std::result::Result<serde_json::Value, String> {
     let id = args["id"].as_str().ok_or("id is required")?;
 
+    // Leaves a tombstone so lookups by this id report it as deleted.
     state
         .db
-        .with_conn(|conn| crate::storage::delete_lesson(conn, id))
+        .with_transaction(|conn| crate::storage::delete_lesson_with_tombstone(conn, id, None, ""))
         .map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
@@ -3838,6 +3839,13 @@ mod tests {
             let response = result.unwrap();
             assert!(response.get("id").is_some());
             assert!(response["message"].as_str().unwrap().contains("deleted"));
+
+            let tombstone = state
+                .db
+                .with_conn(|conn| crate::storage::get_tombstone(conn, &lesson.id))
+                .unwrap()
+                .expect("delete should leave a tombstone");
+            assert_eq!(tombstone.successor_id, None);
         }
     }
 
