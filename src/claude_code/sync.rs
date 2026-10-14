@@ -429,6 +429,14 @@ fn execute_sync_from_data(
 ///
 /// Returns an error if the rules directory cannot be resolved or
 /// file I/O operations fail.
+/// Maximum content size (bytes) for a single rule file. Lessons larger
+/// than this are skipped to avoid blowing the session context budget.
+const MAX_RULE_CONTENT_BYTES: usize = 4096;
+
+/// Total budget (bytes) for all always-on rule files combined. Once
+/// exceeded, remaining qualifying lessons are skipped with a warning.
+const TOTAL_RULES_BUDGET_BYTES: usize = 128 * 1024; // 128 KB
+
 fn sync_rules_from_lessons(
     lessons: &[LessonRecord],
     dry_run: bool,
@@ -445,11 +453,34 @@ fn sync_rules_from_lessons(
 
     // Collect IDs of lessons that qualify for rules
     let mut active_rule_ids: Vec<String> = Vec::new();
+    let mut total_bytes: usize = 0;
 
     for lesson in lessons {
         // Only critical and warning severity lessons become rules
         let sev = lesson.severity.to_lowercase();
         if sev != "critical" && sev != "warning" {
+            continue;
+        }
+
+        // Per-file size guard: skip oversized lessons
+        if lesson.content.len() > MAX_RULE_CONTENT_BYTES {
+            report.actions.push(format!(
+                "Skipped rule for '{}': content too large ({} bytes > {} max)",
+                lesson.title,
+                lesson.content.len(),
+                MAX_RULE_CONTENT_BYTES,
+            ));
+            continue;
+        }
+
+        // Total budget guard
+        if total_bytes + lesson.content.len() > TOTAL_RULES_BUDGET_BYTES {
+            report.actions.push(format!(
+                "Skipped rule for '{}': total rules budget exceeded ({} KB / {} KB)",
+                lesson.title,
+                total_bytes / 1024,
+                TOTAL_RULES_BUDGET_BYTES / 1024,
+            ));
             continue;
         }
 
@@ -471,6 +502,7 @@ fn sync_rules_from_lessons(
         }
 
         active_rule_ids.push(lesson.id.clone());
+        total_bytes += lesson.content.len();
 
         if dry_run {
             report.actions.push(format!(
