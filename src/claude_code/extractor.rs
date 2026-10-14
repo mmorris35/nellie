@@ -60,6 +60,38 @@ const CORRECTION_KEYWORDS: &[&str] = &[
     "should not",
 ];
 
+/// Markers indicating structural/harness content that should never be
+/// captured as a correction or feedback lesson.
+const STRUCTURAL_SKIP_MARKERS: &[&str] = &[
+    // Skill/slash-command prompt expansions
+    "<command-name>",
+    "<local-command-",
+    "## arguments",
+    "## steps",
+    "use this skill",
+    "use when the user",
+    "trigger when:",
+    // Compaction/continuation messages
+    "this session is being continued from a previous conversation",
+    "the conversation so far has been summarized",
+    // Task notifications (not user corrections)
+    "<task-notification>",
+];
+
+/// Tool failure outputs that are transient/environmental and not
+/// learnable patterns.
+const TRANSIENT_FAILURE_MARKERS: &[&str] = &[
+    "permission to use",
+    "file is in a directory that is denied",
+    "chromium was not found",
+    "network request for",
+    "connection closed",
+    "timed out",
+    "cancelled: parallel tool call",
+    "hunk #1 failed",
+    "no such tool available",
+];
+
 /// Keywords that signal the user wants to explicitly save a lesson.
 const SAVE_KEYWORDS: &[&str] = &[
     "remember",
@@ -156,6 +188,14 @@ fn extract_corrections(entries: &[TranscriptEntry], lessons: &mut Vec<ExtractedL
             continue;
         }
 
+        // Skip structural/harness content misidentified as corrections.
+        if STRUCTURAL_SKIP_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            continue;
+        }
+
         // There must be a preceding assistant entry to correct.
         if find_preceding_assistant(entries, i).is_none() {
             continue;
@@ -213,6 +253,15 @@ fn extract_tool_failures(entries: &[TranscriptEntry], lessons: &mut Vec<Extracte
         };
 
         if !is_error {
+            continue;
+        }
+
+        // Skip transient/environmental failures that aren't learnable.
+        let output_lower = output.to_lowercase();
+        if TRANSIENT_FAILURE_MARKERS
+            .iter()
+            .any(|marker| output_lower.contains(marker))
+        {
             continue;
         }
 
