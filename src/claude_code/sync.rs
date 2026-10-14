@@ -481,16 +481,27 @@ fn sync_rules_from_lessons(
                     .display(),
                 globs,
             ));
+            report.rules_written += 1;
         } else {
-            let path = write_rule_file(&rules_dir, lesson, &globs)?;
-            report.actions.push(format!(
-                "Wrote rule: '{}' -> {}",
-                lesson.title,
-                path.display(),
-            ));
+            match write_rule_file(&rules_dir, lesson, &globs)? {
+                Some(path) => {
+                    report.actions.push(format!(
+                        "Wrote rule: '{}' -> {}",
+                        lesson.title,
+                        path.display(),
+                    ));
+                    report.rules_written += 1;
+                }
+                None => {
+                    report.actions.push(format!(
+                        "SKIPPED rule for '{}': content {} chars exceeds {} char limit (lesson remains searchable in DB)",
+                        lesson.title,
+                        lesson.content.len(),
+                        crate::claude_code::rules::MAX_RULE_FILE_CHARS,
+                    ));
+                }
+            }
         }
-
-        report.rules_written += 1;
     }
 
     // Clean stale rules

@@ -368,6 +368,16 @@ fn sanitize_tag_for_glob(tag: &str) -> String {
         .to_string()
 }
 
+/// Maximum size of a generated rule file in characters.
+///
+/// Claude Code enforces a 150,000 character per-file limit on rules
+/// files. We cap at 10,000 characters to leave headroom and because
+/// a lesson larger than ~10KB is almost certainly a capture bug (e.g.,
+/// an entire skill definition saved as a "correction"). Oversized
+/// lessons remain searchable in the Nellie database — they are only
+/// excluded from automatic context injection.
+pub const MAX_RULE_FILE_CHARS: usize = 10_000;
+
 /// Length of the shortened lesson ID used in rule filenames.
 ///
 /// Lesson IDs have the form `lesson_<16-hex-chars>`. We take the
@@ -492,6 +502,11 @@ fn format_rule_content(lesson: &LessonRecord, globs: &[String]) -> String {
 /// renamed) to prevent corruption. The directory is created if it
 /// does not exist.
 ///
+/// If the formatted content exceeds [`MAX_RULE_FILE_CHARS`], the
+/// file is **not** written and `Ok(None)` is returned. The lesson
+/// remains searchable in the Nellie database — it is only excluded
+/// from automatic context injection via rules files.
+///
 /// # Arguments
 ///
 /// * `dir` - The directory to write the rule file into
@@ -501,7 +516,8 @@ fn format_rule_content(lesson: &LessonRecord, globs: &[String]) -> String {
 ///
 /// # Returns
 ///
-/// The full path to the written rule file.
+/// `Ok(Some(path))` on success, `Ok(None)` if the content exceeded
+/// the size cap, or `Err` on I/O failure.
 ///
 /// # Errors
 ///
@@ -511,14 +527,18 @@ pub fn write_rule_file(
     dir: &Path,
     lesson: &LessonRecord,
     globs: &[String],
-) -> crate::Result<PathBuf> {
+) -> crate::Result<Option<PathBuf>> {
+    let content = format_rule_content(lesson, globs);
+
+    if content.len() > MAX_RULE_FILE_CHARS {
+        return Ok(None);
+    }
+
     fs::create_dir_all(dir)?;
 
     let filename = rule_filename(&lesson.id);
     let final_path = dir.join(&filename);
     let tmp_path = dir.join(format!(".{filename}.tmp"));
-
-    let content = format_rule_content(lesson, globs);
 
     // Step 1: Write to temporary file
     fs::write(&tmp_path, &content)?;
@@ -530,7 +550,7 @@ pub fn write_rule_file(
         return Err(crate::error::Error::Io(e));
     }
 
-    Ok(final_path)
+    Ok(Some(final_path))
 }
 
 /// Removes Nellie-generated rule files that are no longer active.
@@ -1521,7 +1541,7 @@ mod tests {
         );
         let globs = vec!["src/storage/**/*.rs".to_string()];
 
-        let path = write_rule_file(dir.path(), &lesson, &globs).expect("write_rule_file failed");
+        let path = write_rule_file(dir.path(), &lesson, &globs).expect("write_rule_file failed").expect("rule was skipped");
 
         assert!(path.exists());
         assert_eq!(
@@ -1542,7 +1562,7 @@ mod tests {
         );
         let globs = vec!["src/server/**/*.rs".to_string()];
 
-        let path = write_rule_file(dir.path(), &lesson, &globs).expect("write_rule_file failed");
+        let path = write_rule_file(dir.path(), &lesson, &globs).expect("write_rule_file failed").expect("rule was skipped");
 
         let content = fs::read_to_string(&path).expect("failed to read rule file");
 
@@ -1573,7 +1593,7 @@ mod tests {
         );
         let globs = vec!["tests/**/*.rs".to_string()];
 
-        let path = write_rule_file(&nested, &lesson, &globs).expect("write_rule_file failed");
+        let path = write_rule_file(&nested, &lesson, &globs).expect("write_rule_file failed").expect("rule was skipped");
 
         assert!(path.exists());
         assert!(nested.is_dir());
@@ -1584,7 +1604,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let lesson = make_test_lesson("lesson_aa7e7cd91332a55f", "Test", "Version 1", "info", &[]);
 
-        write_rule_file(dir.path(), &lesson, &[]).expect("first write failed");
+        write_rule_file(dir.path(), &lesson, &[]).expect("first write failed").expect("rule was skipped");
 
         let lesson_v2 = make_test_lesson(
             "lesson_aa7e7cd91332a55f",
@@ -1594,7 +1614,7 @@ mod tests {
             &[],
         );
 
-        let path = write_rule_file(dir.path(), &lesson_v2, &[]).expect("second write failed");
+        let path = write_rule_file(dir.path(), &lesson_v2, &[]).expect("second write failed").expect("rule was skipped");
 
         let content = fs::read_to_string(&path).expect("failed to read");
         assert!(content.contains("Version 2"));
@@ -1606,7 +1626,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let lesson = make_test_lesson("lesson_1234abcd", "Test", "Content.", "info", &[]);
 
-        write_rule_file(dir.path(), &lesson, &[]).expect("write failed");
+        write_rule_file(dir.path(), &lesson, &[]).expect("write failed").expect("rule was skipped");
 
         let entries: Vec<_> = fs::read_dir(dir.path()).expect("read_dir failed").collect();
         for entry in &entries {
@@ -1624,7 +1644,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let lesson = make_test_lesson("lesson_deadbeef12345678", "Test", "Content.", "info", &[]);
 
-        let path = write_rule_file(dir.path(), &lesson, &[]).expect("write failed");
+        let path = write_rule_file(dir.path(), &lesson, &[]).expect("write failed").expect("rule was skipped");
 
         assert_eq!(path, dir.path().join("nellie-deadbeef.md"));
     }
@@ -1659,7 +1679,7 @@ mod tests {
             &["sqlite"],
         );
         let globs = vec!["src/storage/**/*.rs".to_string()];
-        write_rule_file(dir.path(), &lesson, &globs).expect("write failed");
+        write_rule_file(dir.path(), &lesson, &globs).expect("write failed").expect("rule was skipped");
 
         // Clean with the lesson still active
         let active = vec!["lesson_aa7e7cd91332a55f".to_string()];
@@ -1689,8 +1709,8 @@ mod tests {
             &[],
         );
 
-        write_rule_file(dir.path(), &lesson_a, &[]).expect("write a failed");
-        write_rule_file(dir.path(), &lesson_b, &[]).expect("write b failed");
+        write_rule_file(dir.path(), &lesson_a, &[]).expect("write a failed").expect("rule was skipped");
+        write_rule_file(dir.path(), &lesson_b, &[]).expect("write b failed").expect("rule was skipped");
 
         // Only lesson_a is active
         let active = vec!["lesson_aa7e7cd91332a55f".to_string()];
@@ -1706,7 +1726,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
 
         let lesson = make_test_lesson("lesson_1234abcd5678ef90", "Test", "Content.", "info", &[]);
-        write_rule_file(dir.path(), &lesson, &[]).expect("write failed");
+        write_rule_file(dir.path(), &lesson, &[]).expect("write failed").expect("rule was skipped");
 
         let removed = clean_stale_rules(dir.path(), &[]).expect("clean failed");
 
@@ -1726,7 +1746,7 @@ mod tests {
 
         // Create a Nellie rule file
         let lesson = make_test_lesson("lesson_aa7e7cd91332a55f", "Test", "Content.", "info", &[]);
-        write_rule_file(dir.path(), &lesson, &[]).expect("write failed");
+        write_rule_file(dir.path(), &lesson, &[]).expect("write failed").expect("rule was skipped");
 
         // Clean with no active lessons
         let removed = clean_stale_rules(dir.path(), &[]).expect("clean failed");
@@ -1782,7 +1802,7 @@ mod tests {
 
         for lesson in &lessons {
             let globs = tags_to_globs(&lesson.tags);
-            write_rule_file(dir.path(), lesson, &globs).expect("write failed");
+            write_rule_file(dir.path(), lesson, &globs).expect("write failed").expect("rule was skipped");
         }
 
         // All 3 files should exist
@@ -1815,7 +1835,7 @@ mod tests {
         );
         let globs = vec!["src/storage/**/*.rs".to_string(), "**/*sqlite*".to_string()];
 
-        let path = write_rule_file(dir.path(), &lesson, &globs).expect("write failed");
+        let path = write_rule_file(dir.path(), &lesson, &globs).expect("write failed").expect("rule was skipped");
         let content = fs::read_to_string(&path).expect("read failed");
 
         // Extract frontmatter between --- delimiters
@@ -1840,11 +1860,51 @@ mod tests {
         let lesson = make_test_lesson("lesson_aa7e7cd91332a55f", "Test", "Content.", "info", &[]);
 
         // Write twice
-        write_rule_file(dir.path(), &lesson, &[]).expect("first write failed");
-        write_rule_file(dir.path(), &lesson, &[]).expect("second write failed");
+        write_rule_file(dir.path(), &lesson, &[]).expect("first write failed").expect("rule was skipped");
+        write_rule_file(dir.path(), &lesson, &[]).expect("second write failed").expect("rule was skipped");
 
         // Only one file should exist
         let count = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(count, 1);
+    }
+
+    // ---- Size cap ----
+
+    #[test]
+    fn test_write_rule_file_skips_oversized_lesson() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let huge_content = "x".repeat(MAX_RULE_FILE_CHARS + 1);
+        let lesson = make_test_lesson(
+            "lesson_oversized00000000",
+            "Oversized Lesson",
+            &huge_content,
+            "critical",
+            &["sqlite"],
+        );
+        let globs = vec!["src/storage/**/*.rs".to_string()];
+
+        let result = write_rule_file(dir.path(), &lesson, &globs).expect("should not error");
+        assert!(result.is_none(), "oversized lesson should be skipped");
+
+        let count = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(count, 0, "no file should be written");
+    }
+
+    #[test]
+    fn test_write_rule_file_accepts_lesson_at_limit() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        // Content that, with frontmatter, stays just under the limit
+        let content_size = MAX_RULE_FILE_CHARS - 200;
+        let content = "y".repeat(content_size);
+        let lesson = make_test_lesson(
+            "lesson_justunder00000000",
+            "OK",
+            &content,
+            "info",
+            &[],
+        );
+
+        let result = write_rule_file(dir.path(), &lesson, &[]).expect("should not error");
+        assert!(result.is_some(), "lesson under limit should be written");
     }
 }
