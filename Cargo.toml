@@ -12,7 +12,7 @@ categories = ["development-tools", "database"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "=1.50.0", features = ["full"] }
+tokio = { version = "=1.51.6", features = ["full"] }
 
 # Random
 rand = "=0.8.5"
