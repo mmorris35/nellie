@@ -165,8 +165,10 @@ pub fn find_prefix_tombstones(conn: &Connection, id: &str) -> Result<Vec<Tombsto
              ORDER BY old_id"
         ))
         .map_err(db_err("failed to query tombstones"))?;
+    // rusqlite >= 0.41 binds usize only with its `fallible_uint` feature; bind an i64.
+    let min_prefix_len = i64::try_from(MIN_PREFIX_LEN).unwrap_or(i64::MAX);
     let rows = stmt
-        .query_map(params![MIN_PREFIX_LEN, id], row_to_tombstone)
+        .query_map(params![min_prefix_len, id], row_to_tombstone)
         .map_err(db_err("failed to query tombstones"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db_err("failed to read tombstone"))
@@ -265,8 +267,9 @@ fn live_ids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> 
     let mut stmt = conn
         .prepare("SELECT id FROM lessons WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id LIMIT ?2")
         .map_err(db_err("failed to query lessons"))?;
+    let max_candidates = i64::try_from(MAX_CANDIDATES).unwrap_or(0);
     let rows = stmt
-        .query_map(params![prefix, MAX_CANDIDATES], |row| row.get(0))
+        .query_map(params![prefix, max_candidates], |row| row.get(0))
         .map_err(db_err("failed to query lessons"))?;
     rows.collect::<rusqlite::Result<Vec<String>>>()
         .map_err(db_err("failed to read lesson id"))

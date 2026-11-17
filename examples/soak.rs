@@ -178,10 +178,10 @@ fn count_lessons(db: &Database) -> usize {
         let mut stmt = conn
             .prepare("SELECT COUNT(*) FROM lessons")
             .map_err(|e| nellie::Error::internal(e.to_string()))?;
-        let count: usize = stmt
+        let count: i64 = stmt
             .query_row([], |row| row.get(0))
             .map_err(|e| nellie::Error::internal(e.to_string()))?;
-        Ok::<usize, nellie::Error>(count)
+        Ok::<usize, nellie::Error>(usize::try_from(count).unwrap_or(0))
     })
     .unwrap_or(0)
 }
@@ -192,10 +192,10 @@ fn count_checkpoints(db: &Database) -> usize {
         let mut stmt = conn
             .prepare("SELECT COUNT(*) FROM checkpoints")
             .map_err(|e| nellie::Error::internal(e.to_string()))?;
-        let count: usize = stmt
+        let count: i64 = stmt
             .query_row([], |row| row.get(0))
             .map_err(|e| nellie::Error::internal(e.to_string()))?;
-        Ok::<usize, nellie::Error>(count)
+        Ok::<usize, nellie::Error>(usize::try_from(count).unwrap_or(0))
     })
     .unwrap_or(0)
 }
