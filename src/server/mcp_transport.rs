@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     schemars, tool, tool_router, ServerHandler,
 };
 use serde::Deserialize;
@@ -537,8 +537,8 @@ impl NellieMcpHandler {
 }
 
 impl ServerHandler for NellieMcpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Nellie is a semantic code memory system. Use search_code to find code, \
              search_lessons/add_lesson for lessons learned, and checkpoint tools for \
              agent state recovery.",
@@ -556,6 +556,10 @@ impl ServerHandler for NellieMcpHandler {
             meta: None,
             tools: self.tool_router.list_all(),
             next_cursor: None,
+            // rmcp >= 3 (protocol 2026-07-28) cache hints; none advertised.
+            result_type: None,
+            ttl_ms: None,
+            cache_scope: None,
         }))
     }
 
@@ -563,7 +567,7 @@ impl ServerHandler for NellieMcpHandler {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
            + Send
            + '_ {
         async move {
@@ -599,17 +603,22 @@ impl ServerHandler for NellieMcpHandler {
             let latency = start.elapsed();
 
             match &result {
-                Ok(call_result) => {
-                    // Estimate response size from content text
-                    let response_bytes: usize = call_result
-                        .content
-                        .iter()
-                        .map(|c| {
-                            // Content items are typically RawContent::Text
-                            // Serialize to get a size estimate
-                            serde_json::to_string(c).map_or(0, |s| s.len())
-                        })
-                        .sum();
+                Ok(response) => {
+                    // Estimate response size from content text. rmcp >= 3 wraps the
+                    // result in CallToolResponse; the tool router only produces
+                    // Complete here (no tasks or elicitation), other variants count 0.
+                    let response_bytes: usize = match response {
+                        rmcp::model::CallToolResponse::Complete(call_result) => call_result
+                            .content
+                            .iter()
+                            .map(|c| {
+                                // Content items are typically RawContent::Text
+                                // Serialize to get a size estimate
+                                serde_json::to_string(c).map_or(0, |s| s.len())
+                            })
+                            .sum(),
+                        _ => 0,
+                    };
 
                     crate::server::metrics::record_tool_call(
                         &tool_name,
@@ -699,7 +708,7 @@ pub async fn start_mcp_server(
     // the default allows only localhost, 127.0.0.1 and ::1, matching the
     // 127.0.0.1 default bind.
     let mcp_config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(true)
+        .with_legacy_session_mode(true)
         .with_cancellation_token(ct.child_token());
 
     let service: StreamableHttpService<NellieMcpHandler, LocalSessionManager> =

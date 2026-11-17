@@ -23,7 +23,7 @@ tokio-stream = "=0.1.18"
 async-stream = "=0.3.6"
 
 # MCP Protocol
-rmcp = { version = "=1.8.0", features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "=3.9.0", features = ["server", "transport-streamable-http-server"] }
 
 # HTTP Server
 axum = { version = "=0.8.8", features = ["macros"] }
