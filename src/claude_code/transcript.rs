@@ -317,7 +317,7 @@ pub fn parse_transcript_str(contents: &str) -> Vec<TranscriptEntry> {
             timestamp,
             session_id,
             cwd: raw.cwd.clone(),
-            git_branch: raw.git_branch.clone(),
+            git_branch: raw.git_branch,
             content,
         });
     }

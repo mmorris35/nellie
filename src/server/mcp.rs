@@ -31,10 +31,7 @@ fn should_index_file(path: &std::path::Path) -> bool {
         }
     }
     // Check default ignore patterns (node_modules, target, evidence dirs, etc.)
-    if is_default_ignored_path(path) {
-        return false;
-    }
-    true
+    !is_default_ignored_path(path)
 }
 
 /// Check if a path matches default ignore patterns.
