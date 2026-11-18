@@ -199,11 +199,7 @@ impl FileFilter {
 
         // Default ignores (check relative to base_path to avoid false positives
         // from system temp dirs like /tmp/.tmpXXXXXX)
-        if Self::is_default_ignored_relative(path, Some(&self.base_path)) {
-            return false;
-        }
-
-        true
+        !Self::is_default_ignored_relative(path, Some(&self.base_path))
     }
 
     /// Check if a path is a code file based on extension.

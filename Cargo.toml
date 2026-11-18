@@ -12,7 +12,7 @@ categories = ["development-tools", "database"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "=1.50.0", features = ["full"] }
+tokio = { version = "=1.51.6", features = ["full"] }
 
 # Random
 rand = "=0.8.5"
@@ -23,7 +23,7 @@ tokio-stream = "=0.1.18"
 async-stream = "=0.3.6"
 
 # MCP Protocol
-rmcp = { version = "=1.8.0", features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "=3.9.0", features = ["server", "transport-streamable-http-server"] }
 
 # HTTP Server
 axum = { version = "=0.8.8", features = ["macros"] }
@@ -31,7 +31,7 @@ tower = { version = "=0.5.3", features = ["util"] }
 tower-http = { version = "=0.6.8", features = ["cors", "trace"] }
 
 # Database
-rusqlite = { version = "=0.32.1", features = ["bundled", "blob"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "blob"] }
 sqlite-vec = "=0.1.9"
 
 # Embeddings (ONNX Runtime)
