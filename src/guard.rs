@@ -12,17 +12,21 @@
 //! `storage::insert_checkpoint`, so REST, both MCP transports and every
 //! in-process writer go through the same check. Clients keep no copy.
 //!
-//! What it matches (design v1c, 2026-11-17):
+//! What it matches (design v1c, 2026-11-17; fix round 1, 2026-11-18):
 //!
 //! * refuse: an at-sign not preceded by a word char or dot, followed by
-//!   `~`, `/` or `.`, by a token containing `/` or `\`, or by a
-//!   file-name-shaped token (`name.ext`, extension 1 to 8 alphanumerics);
+//!   `~`, `/` or `.`, by a token containing `/` or `\` (other than a scoped
+//!   package name, below), or by a file-name-shaped token (`name.ext`,
+//!   extension a letter then 0 to 7 alphanumerics);
 //! * flag: the same at-sign followed by a bare name (`[A-Za-z0-9_-]+`) with
-//!   no dot or slash;
+//!   no dot or slash, or by a scoped package name `scope/name`
+//!   (`[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*`, no dot, no `..`, no
+//!   backslash, no second slash);
 //! * never: an at-sign preceded by a word char or dot, which covers email
 //!   addresses and the scp form `user@host:/path`.
 //!
-//! The reference pattern is `(?<![\w.])@(?:[~/.]|[^\s@]*[/\\]|[^\s@]+\.[A-Za-z0-9]{1,8}\b)`.
+//! The reference pattern is `(?<![\w.])@(?:[~/.]|[^\s@]*[/\\]|[^\s@]+\.[A-Za-z][A-Za-z0-9]{0,7}\b)`,
+//! with the scoped package shape carved out of the slash alternative.
 //! The `regex` crate is not a dependency and has no look-behind, so the
 //! scanner is written by hand; the "not preceded by `[\w.]`" test is in
 //! [`scan`].
@@ -40,6 +44,9 @@ pub const ERROR_CODE: &str = "mention_refused";
 /// Warning kind carried by a flagged bare name.
 pub const BARE_AT_NAME: &str = "bare_at_name";
 
+/// Warning kind carried by a flagged scoped package name (`scope/name`).
+pub const SCOPED_AT_NAME: &str = "scoped_at_name";
+
 /// What an at-sign introduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -47,6 +54,8 @@ pub enum Class {
     Path,
     /// A bare name with no dot or slash: flagged.
     BareName,
+    /// A scoped package name, `scope/name` with no dot: flagged.
+    ScopedName,
 }
 
 /// One at-sign hit in a text: the byte offset of the at-sign and its class.
@@ -89,7 +98,7 @@ pub struct Warning {
     pub field: String,
     /// Byte offset (UTF-8) of the at-sign in that field.
     pub offset: usize,
-    /// Always `bare_at_name`.
+    /// `bare_at_name` or `scoped_at_name`.
     pub kind: &'static str,
 }
 
@@ -97,19 +106,21 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// `name.ext`: a dot at byte index 1 or later, then 1 to 8 ASCII
-/// alphanumerics, then a word boundary (end, or a non-word char).
+/// `name.ext`: a dot at byte index 1 or later, then an ASCII letter and 0 to
+/// 7 more ASCII alphanumerics, then a word boundary (end, or a non-word
+/// char). An extension that starts with a digit (`93.2%`, `1.2.3`, `v1.2`)
+/// is a number, not a file name.
 fn is_file_name(token: &str) -> bool {
     let bytes = token.as_bytes();
     for (dot, _) in token.match_indices('.') {
-        if dot == 0 {
+        if dot == 0 || !bytes.get(dot + 1).is_some_and(u8::is_ascii_alphabetic) {
             continue;
         }
         let ext_len = bytes[dot + 1..]
             .iter()
             .take_while(|b| b.is_ascii_alphanumeric())
             .count();
-        if !(1..=8).contains(&ext_len) {
+        if ext_len > 8 {
             continue;
         }
         let after = token[dot + 1 + ext_len..].chars().next();
@@ -120,10 +131,46 @@ fn is_file_name(token: &str) -> bool {
     false
 }
 
+/// Length of the longest `[a-z0-9][a-z0-9_-]*` prefix of `s` (0 if none).
+fn segment_len(s: &str) -> usize {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit() => {}
+        _ => return 0,
+    }
+    1 + bytes
+        .take_while(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+        .count()
+}
+
+/// `scope/name`, a scoped package name: no dot and no backslash anywhere in
+/// the token, exactly one slash, the scope a whole `[a-z0-9][a-z0-9_-]*`
+/// segment, the name one such segment followed by the end of the token or a
+/// non-word char.
+fn is_scoped_name(token: &str) -> bool {
+    if token.contains(['.', '\\']) {
+        return false;
+    }
+    let Some((scope, rest)) = token.split_once('/') else {
+        return false;
+    };
+    if rest.contains('/') || scope.is_empty() || segment_len(scope) != scope.len() {
+        return false;
+    }
+    let name_len = segment_len(rest);
+    name_len > 0 && !rest[name_len..].chars().next().is_some_and(is_word)
+}
+
 /// Classify the token that follows an at-sign.
 fn classify(token: &str) -> Option<Class> {
     let first = token.chars().next()?;
-    if matches!(first, '~' | '/' | '.') || token.contains(['/', '\\']) || is_file_name(token) {
+    if matches!(first, '~' | '/' | '.') {
+        return Some(Class::Path);
+    }
+    if is_scoped_name(token) {
+        return Some(Class::ScopedName);
+    }
+    if token.contains(['/', '\\']) || is_file_name(token) {
         return Some(Class::Path);
     }
     if first.is_ascii_alphanumeric() || first == '_' || first == '-' {
@@ -180,6 +227,11 @@ where
                     field: field.clone(),
                     offset: hit.offset,
                     kind: BARE_AT_NAME,
+                }),
+                Class::ScopedName => warnings.push(Warning {
+                    field: field.clone(),
+                    offset: hit.offset,
+                    kind: SCOPED_AT_NAME,
                 }),
             }
         }
@@ -469,6 +521,85 @@ mod tests {
     fn relative_file_name_is_refused() {
         assert_eq!(class_of("@README.md"), Some(Class::Path));
         assert_eq!(class_of("see @notes.txt."), Some(Class::Path));
+    }
+
+    /// Fix round 1 (Bilby, 2026-11-18): a scoped package name, `scope/name`
+    /// with no dot, no `..`, no backslash and no second slash, is a flag.
+    const SCOPED: &[&str] = &[
+        "@anthropic-ai/sdk",
+        "@anthropic-ai/claude-agent-sdk",
+        "@modelcontextprotocol/sdk",
+        "@types/node",
+        "use @types/node, then",
+        "(@types/node)",
+    ];
+
+    #[test]
+    fn scoped_package_names_are_flagged() {
+        for t in SCOPED {
+            assert_eq!(class_of(t), Some(Class::ScopedName), "{t:?}");
+        }
+    }
+
+    /// Mutant 4: the dot exclusion dropped from the scoped rule. The run.sh
+    /// twin (a dotted name segment) is the one that fails.
+    #[test]
+    fn dotted_scoped_name_is_refused() {
+        assert_eq!(class_of("@scripts/run.sh"), Some(Class::Path));
+        assert_eq!(class_of("@config/x.env"), Some(Class::Path));
+        assert_eq!(class_of("@types/node.js"), Some(Class::Path));
+    }
+
+    #[test]
+    fn scoped_shapes_with_dotdot_or_second_slash_are_refused() {
+        for t in [
+            "@a/../b",
+            "@a/b/c",
+            "@a/b\\c",
+            "@a/",
+            "@/a/b",
+            "@Types/node",
+            "@types/Node",
+            "@a_b-c/d_e-f/",
+        ] {
+            assert_eq!(class_of(t), Some(Class::Path), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_package_is_stored_with_a_scoped_warning() {
+        use crate::storage::{get_lesson, insert_lesson, migrate, Database};
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            migrate(conn)?;
+            let lesson = LessonRecord::new("pkg", "pin @types/node", vec![]);
+            let w = insert_lesson(conn, &lesson)?;
+            assert_eq!(w.len(), 1);
+            assert_eq!(w[0].field, "content");
+            assert_eq!(w[0].offset, 4);
+            assert_eq!(w[0].kind, SCOPED_AT_NAME);
+            assert_eq!(get_lesson(conn, &lesson.id)?.content, "pin @types/node");
+            assert!(insert_lesson(
+                conn,
+                &LessonRecord::new("pkg", "run @scripts/run.sh", vec![])
+            )
+            .is_err());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Mutant 5: the leading-letter rule dropped from `name.ext`. The numeric
+    /// twins are the ones that fail: under the unchanged flag rule they are
+    /// bare names (`93`, `1`, `v1`, stopping before the dot), never a path.
+    #[test]
+    fn numeric_extension_is_not_a_file_name() {
+        for t in ["@93.2%", "@1.2.3", "@v1.2", "hit @93.2% today", "@a.1b"] {
+            assert_eq!(class_of(t), Some(Class::BareName), "{t:?}");
+        }
+        assert_eq!(class_of("@README.md"), Some(Class::Path));
+        assert_eq!(class_of("@notes.txt"), Some(Class::Path));
+        assert_eq!(class_of("@a.b1"), Some(Class::Path));
     }
 
     #[test]
