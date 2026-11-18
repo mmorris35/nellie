@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn nested_state_path_mention_is_refused() {
         let db = crate::storage::Database::open_in_memory().unwrap();
+        db.with_conn(crate::storage::migrate).unwrap();
         db.with_conn(|conn| {
-            crate::storage::migrate(conn)?;
             let cp = CheckpointRecord::new(
                 "kahuna",
                 "clean text",

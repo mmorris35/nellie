@@ -1878,7 +1878,8 @@ async fn handle_add_lesson(
     // The graph-only fields are not part of the record, so the guard reads
     // them here, before anything is stored; the record itself is guarded
     // inside insert_lesson.
-    let mut warnings = crate::guard::json_keys(args, LESSON_GRAPH_FIELDS).map_err(refusal_error)?;
+    let mut warnings =
+        crate::guard::json_keys(args, LESSON_GRAPH_FIELDS).map_err(|r| refusal_error(&r))?;
 
     // Store lesson in database
     warnings.extend(
@@ -1937,7 +1938,7 @@ const CHECKPOINT_GRAPH_FIELDS: &[&str] = &["tools_used", "problems_encountered",
 
 /// The MCP error text for a mention-guard refusal: the refusal body as JSON
 /// (`error`, `field`, `offset`, `fix`), so a client can parse it.
-fn refusal_error(r: crate::guard::Refusal) -> String {
+fn refusal_error(r: &crate::guard::Refusal) -> String {
     r.body().to_string()
 }
 
@@ -1945,7 +1946,7 @@ fn refusal_error(r: crate::guard::Refusal) -> String {
 /// else its message, as before.
 fn write_error(e: crate::Error) -> String {
     match e {
-        crate::Error::MentionRefused(r) => refusal_error(r),
+        crate::Error::MentionRefused(r) => refusal_error(&r),
         e => e.to_string(),
     }
 }
@@ -1998,7 +1999,7 @@ async fn handle_add_checkpoint(
     // Graph-only fields first (see handle_add_lesson); the record is guarded
     // inside insert_checkpoint.
     let mut warnings =
-        crate::guard::json_keys(args, CHECKPOINT_GRAPH_FIELDS).map_err(refusal_error)?;
+        crate::guard::json_keys(args, CHECKPOINT_GRAPH_FIELDS).map_err(|r| refusal_error(&r))?;
 
     // Store checkpoint in database
     warnings.extend(
@@ -2175,11 +2176,15 @@ async fn handle_add_checkpoint(
     }
     // --- End graph enrichment ---
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "id": id,
         "message": "Checkpoint saved successfully",
         "graph": graph_info,
-    }))
+    });
+    if !warnings.is_empty() {
+        response["warnings"] = serde_json::json!(warnings);
+    }
+    Ok(response)
 }
 
 #[allow(clippy::redundant_closure, clippy::cast_possible_truncation)]

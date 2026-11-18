@@ -775,7 +775,7 @@ mod tests {
 
     fn test_db() -> Database {
         let db = Database::open_in_memory().unwrap();
-        db.with_conn(|conn| crate::storage::migrate(conn)).unwrap();
+        db.with_conn(crate::storage::migrate).unwrap();
         db
     }
 

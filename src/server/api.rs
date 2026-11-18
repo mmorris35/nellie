@@ -709,7 +709,7 @@ fn created_body(id: &str, warnings: &[crate::guard::Warning]) -> serde_json::Val
 async fn create_lesson(
     State(state): State<Arc<McpState>>,
     Json(body): Json<CreateLessonRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), Response> {
+) -> Response {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
 
@@ -726,10 +726,13 @@ async fn create_lesson(
         updated_at: now,
     };
 
-    let warnings = state
+    let warnings = match state
         .db()
         .with_conn(|conn| storage::insert_lesson(conn, &lesson))
-        .map_err(|e| write_error("lesson", &e))?;
+    {
+        Ok(w) => w,
+        Err(e) => return write_error("lesson", &e),
+    };
 
     // Generate and store embedding if service available
     if let Some(ref embedding_service) = state.embeddings {
@@ -748,7 +751,7 @@ async fn create_lesson(
 
     tracing::info!(id = %id, "Lesson created via UI");
 
-    Ok((StatusCode::CREATED, Json(created_body(&id, &warnings))))
+    (StatusCode::CREATED, Json(created_body(&id, &warnings))).into_response()
 }
 
 /// GET /api/v1/lessons/:id - Fetch a lesson, following tombstones.
@@ -1276,14 +1279,17 @@ async fn list_checkpoints(
 async fn create_checkpoint(
     State(state): State<Arc<McpState>>,
     Json(body): Json<CreateCheckpointRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), Response> {
+) -> Response {
     let checkpoint = storage::CheckpointRecord::new(&body.agent, &body.working_on, body.state);
     let id = checkpoint.id.clone();
 
-    let warnings = state
+    let warnings = match state
         .db()
         .with_conn(|conn| storage::insert_checkpoint(conn, &checkpoint))
-        .map_err(|e| write_error("checkpoint", &e))?;
+    {
+        Ok(w) => w,
+        Err(e) => return write_error("checkpoint", &e),
+    };
 
     if let Some(ref embedding_service) = state.embeddings {
         if embedding_service.is_initialized() {
@@ -1304,7 +1310,7 @@ async fn create_checkpoint(
 
     tracing::info!(id = %id, agent = %checkpoint.agent, "Checkpoint created via REST");
 
-    Ok((StatusCode::CREATED, Json(created_body(&id, &warnings))))
+    (StatusCode::CREATED, Json(created_body(&id, &warnings))).into_response()
 }
 
 /// GET /api/v1/checkpoints/search - Semantic search over checkpoints.
@@ -1903,7 +1909,10 @@ mod tests {
         assert_eq!(body["offset"], 5);
         assert_eq!(body["fix"], crate::guard::FIX);
         assert_eq!(
-            state.db().with_conn(storage::count_all_checkpoints).unwrap(),
+            state
+                .db()
+                .with_conn(storage::count_all_checkpoints)
+                .unwrap(),
             0
         );
 
@@ -1917,7 +1926,10 @@ mod tests {
         assert_eq!(body["status"], "created");
         assert_eq!(body["warnings"][0]["field"], "working_on");
         assert_eq!(
-            state.db().with_conn(storage::count_all_checkpoints).unwrap(),
+            state
+                .db()
+                .with_conn(storage::count_all_checkpoints)
+                .unwrap(),
             1
         );
     }

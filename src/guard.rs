@@ -187,11 +187,17 @@ where
     Ok(warnings)
 }
 
-/// Every string anywhere inside a JSON value, walked recursively through
-/// objects and arrays, named `prefix`, `prefix.key`, `prefix[i]`. Object
-/// keys are scanned too; a key that itself contains an at-sign is named by
-/// ordinal (`prefix.key[n]`) so the name does not echo it.
-pub fn json_fields<'a>(prefix: &str, value: &'a serde_json::Value, out: &mut Vec<(String, &'a str)>) {
+/// Every string anywhere inside a JSON value.
+///
+/// Walked recursively through objects and arrays, named `prefix`,
+/// `prefix.key`, `prefix[i]`. Object keys are scanned too; a key that itself
+/// contains an at-sign is named by ordinal (`prefix.key[n]`) so the name
+/// does not echo it.
+pub fn json_fields<'a>(
+    prefix: &str,
+    value: &'a serde_json::Value,
+    out: &mut Vec<(String, &'a str)>,
+) {
     match value {
         serde_json::Value::String(s) => out.push((prefix.to_string(), s.as_str())),
         serde_json::Value::Array(items) => {
@@ -273,10 +279,12 @@ pub fn checkpoint(checkpoint: &CheckpointRecord) -> Result<Vec<Warning>, Refusal
     mentions(checkpoint_fields(checkpoint))
 }
 
-/// Guard the free-text fields of a JSON request body that are not part of
-/// the stored record (the MCP graph fields: `solved_problem`, `used_tools`,
+/// Guard request fields that are not part of the stored record.
+///
+/// These are the MCP graph fields (`solved_problem`, `used_tools`,
 /// `related_concepts`, `learned_from`, `tools_used`, `problems_encountered`,
-/// `solutions_found`). Only the named keys are read.
+/// `solutions_found`), which become graph entity names. Only the named keys
+/// are read.
 ///
 /// # Errors
 ///
@@ -323,8 +331,7 @@ where
 pub fn scan_counts(conn: &rusqlite::Connection) -> rusqlite::Result<ScanCounts> {
     let mut counts = ScanCounts::default();
 
-    let mut stmt =
-        conn.prepare("SELECT title, content, tags, agent, repo FROM lessons")?;
+    let mut stmt = conn.prepare("SELECT title, content, tags, agent, repo FROM lessons")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -403,7 +410,17 @@ mod tests {
         "@a\\b",
         "@Makefile.in,",
     ];
-    const FLAG: &[&str] = &["@skippy", "@mmorris35", "hi @skippy!", "@Makefile", "@a_b-c"];
+    // A bare name followed by a dot that starts no 1-8 char extension is still a
+    // bare name: the flag pattern `@[A-Za-z0-9_-]+` stops before the dot.
+    const FLAG: &[&str] = &[
+        "@skippy",
+        "@mmorris35",
+        "hi @skippy!",
+        "@Makefile",
+        "@a_b-c",
+        "@foo.",
+        "@foo.toolongext1",
+    ];
     const CLEAN: &[&str] = &[
         "liam@example.com",
         "user@host:/path",
@@ -414,8 +431,6 @@ mod tests {
         "@",
         "@@",
         "@(foo)",
-        "@foo.",
-        "@foo.toolongext1",
         "",
     ];
 
@@ -444,9 +459,9 @@ mod tests {
     /// are the ones that fail.
     #[test]
     fn look_behind_email_and_scp_are_clean() {
-        assert!(scan("liam@example.com").is_empty());
-        assert!(scan("user@host:/path").is_empty());
-        assert!(scan("v1.@/x").is_empty());
+        assert_eq!(scan("liam@example.com"), []);
+        assert_eq!(scan("user@host:/path"), []);
+        assert_eq!(scan("v1.@/x"), []);
     }
 
     /// Mutant 2: the relative (name.ext) alternative removed. This twin fails.
@@ -509,7 +524,10 @@ mod tests {
         l.agent = Some("ag".into());
         l.repo = Some("rp".into());
         let names: Vec<String> = lesson_fields(&l).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["title", "content", "tags[0]", "tags[1]", "agent", "repo"]);
+        assert_eq!(
+            names,
+            ["title", "content", "tags[0]", "tags[1]", "agent", "repo"]
+        );
     }
 
     /// Mutant 3: the checkpoint walk limited to top-level fields. The nested
@@ -543,7 +561,11 @@ mod tests {
         let cp = CheckpointRecord::new("kahuna", "@/etc/x", serde_json::json!({}));
         assert_eq!(checkpoint(&cp).unwrap_err().field, "working_on");
 
-        let cp = CheckpointRecord::new("kahuna", "ping @skippy", serde_json::json!({"a": [1, null, true]}));
+        let cp = CheckpointRecord::new(
+            "kahuna",
+            "ping @skippy",
+            serde_json::json!({"a": [1, null, true]}),
+        );
         let w = checkpoint(&cp).unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].field, "working_on");
@@ -560,7 +582,7 @@ mod tests {
         assert_eq!(r.field, "used_tools[0]");
         let w = json_keys(&args, &["solved_problem"]).unwrap();
         assert_eq!(w.len(), 1);
-        assert!(json_keys(&args, &["learned_from"]).unwrap().is_empty());
+        assert_eq!(json_keys(&args, &["learned_from"]).unwrap(), []);
     }
 
     #[test]
@@ -589,7 +611,10 @@ mod tests {
                 [],
             )
             .map_err(|e| crate::error::StorageError::Database(e.to_string()))?;
-            insert_checkpoint(conn, &CheckpointRecord::new("a", "w", serde_json::json!({})))?;
+            insert_checkpoint(
+                conn,
+                &CheckpointRecord::new("a", "w", serde_json::json!({})),
+            )?;
             let counts = scan_counts(conn)
                 .map_err(|e| crate::error::StorageError::Database(e.to_string()))?;
             assert_eq!(

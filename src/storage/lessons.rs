@@ -372,7 +372,7 @@ mod tests {
 
         db.with_conn(|conn| {
             let mut lesson = LessonRecord::new("Original", "Content", vec!["t".to_string()]);
-            assert!(insert_lesson(conn, &lesson)?.is_empty());
+            assert_eq!(insert_lesson(conn, &lesson)?, []);
 
             lesson.title = "Changed".to_string();
             lesson.content = "see @/etc/x".to_string();
