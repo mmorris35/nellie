@@ -433,6 +433,27 @@ What the result fields mean:
 | `/api/v1/files` | GET | Indexed files |
 | `/api/v1/activity` | GET | Activity stream |
 
+### Mention guard (lessons and checkpoints)
+
+Lesson and checkpoint text is quoted into prompts, and Claude Code expands an
+at-sign file mention in a prompt into a file read. So every lesson and
+checkpoint write runs through one server-side guard (`nellie::guard`, called
+from the storage layer, below REST and both MCP transports):
+
+| Text | Result |
+|---|---|
+| an at-sign introduces a path: `~`, `/`, `.`, a token with `/` or `\`, or a file name (`name.ext`) | refused: `422` (MCP: an error result) with `{"error":"mention_refused","field":"content","offset":12,"fix":"write 'at-sign /path' in words"}`; nothing stored, no embedding |
+| an at-sign introduces a bare name (`skippy`, no dot or slash) | stored; the success body gains `"warnings":[{"field":"content","offset":4,"kind":"bare_at_name"}]` |
+| an at-sign preceded by a word char or dot (`liam@example.com`, `user@host:/path`) | not a mention; stored as usual |
+
+`field` names the request field (`title`, `content`, `tags[1]`, `working_on`,
+`state.done[1]`: every string inside a checkpoint's `state` is walked), and
+`offset` is the byte offset of the at-sign in it. The matched text is not
+echoed. Every string field is scanned, including the MCP graph fields
+(`solved_problem`, `used_tools`, ...). Clients must check the HTTP status: a
+`422` means the write did not land. `nellie scan-mentions` prints read-only
+counts of stored rows the guard would refuse or flag.
+
 ### Lesson ids and tombstones
 
 Lessons cannot be edited in place, so retitling one means deleting it and
