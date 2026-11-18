@@ -1875,11 +1875,18 @@ async fn handle_add_lesson(
     let lesson = crate::storage::LessonRecord::new(title, content, tags).with_severity(severity);
     let id = lesson.id.clone();
 
+    // The graph-only fields are not part of the record, so the guard reads
+    // them here, before anything is stored; the record itself is guarded
+    // inside insert_lesson.
+    let mut warnings = crate::guard::json_keys(args, LESSON_GRAPH_FIELDS).map_err(refusal_error)?;
+
     // Store lesson in database
-    state
-        .db
-        .with_conn(|conn| crate::storage::insert_lesson(conn, &lesson))
-        .map_err(|e| e.to_string())?;
+    warnings.extend(
+        state
+            .db
+            .with_conn(|conn| crate::storage::insert_lesson(conn, &lesson))
+            .map_err(write_error)?,
+    );
 
     // Generate and store embedding for semantic search
     if let Some(ref embeddings) = state.embeddings {
@@ -1911,8 +1918,36 @@ async fn handle_add_lesson(
     if graph_info != serde_json::Value::Null {
         response["graph"] = graph_info;
     }
+    if !warnings.is_empty() {
+        response["warnings"] = serde_json::json!(warnings);
+    }
 
     Ok(response)
+}
+
+/// MCP request fields the guard reads that are not part of the stored
+/// record: they become graph entity names.
+const LESSON_GRAPH_FIELDS: &[&str] = &[
+    "solved_problem",
+    "used_tools",
+    "related_concepts",
+    "learned_from",
+];
+const CHECKPOINT_GRAPH_FIELDS: &[&str] = &["tools_used", "problems_encountered", "solutions_found"];
+
+/// The MCP error text for a mention-guard refusal: the refusal body as JSON
+/// (`error`, `field`, `offset`, `fix`), so a client can parse it.
+fn refusal_error(r: crate::guard::Refusal) -> String {
+    r.body().to_string()
+}
+
+/// Map a failed write: a guard refusal becomes [`refusal_error`], anything
+/// else its message, as before.
+fn write_error(e: crate::Error) -> String {
+    match e {
+        crate::Error::MentionRefused(r) => refusal_error(r),
+        e => e.to_string(),
+    }
 }
 
 #[allow(clippy::redundant_closure)]
@@ -1960,11 +1995,18 @@ async fn handle_add_checkpoint(
     let checkpoint = crate::storage::CheckpointRecord::new(agent, working_on, checkpoint_state);
     let id = checkpoint.id.clone();
 
+    // Graph-only fields first (see handle_add_lesson); the record is guarded
+    // inside insert_checkpoint.
+    let mut warnings =
+        crate::guard::json_keys(args, CHECKPOINT_GRAPH_FIELDS).map_err(refusal_error)?;
+
     // Store checkpoint in database
-    state
-        .db
-        .with_conn(|conn| crate::storage::insert_checkpoint(conn, &checkpoint))
-        .map_err(|e| e.to_string())?;
+    warnings.extend(
+        state
+            .db
+            .with_conn(|conn| crate::storage::insert_checkpoint(conn, &checkpoint))
+            .map_err(write_error)?,
+    );
 
     // Generate and store embedding for semantic search
     if let Some(ref embeddings) = state.embeddings {
@@ -2991,6 +3033,87 @@ async fn handle_full_reindex(
 mod tests {
     use super::*;
     use crate::config::GraphConfig;
+
+    /// Check 2: the MCP-only graph field `solved_problem` is scanned by the
+    /// same guard, before the record is stored.
+    #[tokio::test]
+    async fn add_lesson_refuses_path_mention_in_solved_problem() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        db.with_conn(|conn| crate::storage::migrate(conn)).unwrap();
+        let state = McpState::new(db.clone());
+
+        let err = handle_add_lesson(
+            &state,
+            &serde_json::json!({
+                "title": "t", "content": "c", "tags": [],
+                "solved_problem": "the @docs/a.md loop"
+            }),
+        )
+        .await
+        .unwrap_err();
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(body["error"], crate::guard::ERROR_CODE);
+        assert_eq!(body["field"], "solved_problem");
+        assert_eq!(body["offset"], 4);
+        assert_eq!(body["fix"], crate::guard::FIX);
+        assert_eq!(db.with_conn(crate::storage::count_lessons).unwrap(), 0);
+
+        let err = handle_add_lesson(
+            &state,
+            &serde_json::json!({
+                "title": "t", "content": "c", "tags": [],
+                "used_tools": ["cargo", "@~/bin/x"]
+            }),
+        )
+        .await
+        .unwrap_err();
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(body["field"], "used_tools[1]");
+        assert_eq!(db.with_conn(crate::storage::count_lessons).unwrap(), 0);
+
+        // Bare names in the record and in a graph field are both reported.
+        let ok = handle_add_lesson(
+            &state,
+            &serde_json::json!({
+                "title": "ask @skippy", "content": "c", "tags": [],
+                "learned_from": "@bilby"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["message"], "Lesson recorded successfully");
+        assert!(ok["id"].is_string());
+        let fields: Vec<&str> = ok["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["field"].as_str().unwrap())
+            .collect();
+        assert_eq!(fields, ["learned_from", "title"]);
+        assert_eq!(db.with_conn(crate::storage::count_lessons).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_checkpoint_refuses_path_mention_in_problems_encountered() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        db.with_conn(|conn| crate::storage::migrate(conn)).unwrap();
+        let state = McpState::new(db.clone());
+        let err = handle_add_checkpoint(
+            &state,
+            &serde_json::json!({
+                "agent": "kahuna", "working_on": "w", "state": {},
+                "problems_encountered": ["@README.md missing"]
+            }),
+        )
+        .await
+        .unwrap_err();
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(body["field"], "problems_encountered[0]");
+        assert_eq!(
+            db.with_conn(crate::storage::count_all_checkpoints).unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn test_tools_defined() {

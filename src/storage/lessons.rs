@@ -5,14 +5,21 @@ use rusqlite::{params, Connection};
 use super::lessons_search::retry_on_schema_change;
 use super::models::LessonRecord;
 use crate::error::StorageError;
+use crate::guard;
 use crate::Result;
 
 /// Insert a new lesson.
 ///
+/// The mention guard runs first: an at-sign that introduces a path refuses
+/// the write with [`crate::Error::MentionRefused`] and nothing is stored; a
+/// bare at-name is stored and returned as a warning.
+///
 /// # Errors
 ///
-/// Returns an error if JSON serialization or database insertion fails.
-pub fn insert_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
+/// Returns an error if the guard refuses, or if JSON serialization or
+/// database insertion fails.
+pub fn insert_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<Vec<guard::Warning>> {
+    let warnings = guard::lesson(lesson)?;
     let tags_json = serde_json::to_string(&lesson.tags)
         .map_err(|e| StorageError::Database(format!("failed to serialize tags: {e}")))?;
 
@@ -36,7 +43,7 @@ pub fn insert_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
     .map_err(|e| StorageError::Database(format!("failed to insert lesson: {e}")))?;
 
     tracing::trace!(id = %lesson.id, "Inserted lesson");
-    Ok(())
+    Ok(warnings)
 }
 
 /// Get a lesson by ID.
@@ -79,10 +86,15 @@ pub fn get_lesson(conn: &Connection, id: &str) -> Result<LessonRecord> {
 
 /// Update an existing lesson.
 ///
+/// The mention guard runs first, as in [`insert_lesson`]: a refused update
+/// leaves the stored row unchanged.
+///
 /// # Errors
 ///
-/// Returns an error if the lesson is not found, JSON serialization fails, or database update fails.
-pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
+/// Returns an error if the guard refuses, the lesson is not found, JSON
+/// serialization fails, or database update fails.
+pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<Vec<guard::Warning>> {
+    let warnings = guard::lesson(lesson)?;
     let tags_json = serde_json::to_string(&lesson.tags)
         .map_err(|e| StorageError::Database(format!("failed to serialize tags: {e}")))?;
 
@@ -116,7 +128,7 @@ pub fn update_lesson(conn: &Connection, lesson: &LessonRecord) -> Result<()> {
         .into());
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 /// Delete a lesson by ID.
@@ -346,6 +358,64 @@ mod tests {
             let retrieved = get_lesson(conn, &lesson.id)?;
             assert_eq!(retrieved.title, "Updated");
 
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Check 6: an update that adds a path mention is refused and the stored
+    /// row is unchanged. (Fixture: the at-sign before a path is the thing
+    /// under test.)
+    #[test]
+    fn update_adding_path_mention_is_refused_and_row_unchanged() {
+        let db = setup_db();
+
+        db.with_conn(|conn| {
+            let mut lesson = LessonRecord::new("Original", "Content", vec!["t".to_string()]);
+            assert!(insert_lesson(conn, &lesson)?.is_empty());
+
+            lesson.title = "Changed".to_string();
+            lesson.content = "see @/etc/x".to_string();
+            let err = update_lesson(conn, &lesson).unwrap_err();
+            match err {
+                crate::Error::MentionRefused(r) => {
+                    assert_eq!(r.field, "content");
+                    assert_eq!(r.offset, 4);
+                }
+                other => panic!("expected MentionRefused, got {other:?}"),
+            }
+
+            let stored = get_lesson(conn, &lesson.id)?;
+            assert_eq!(stored.title, "Original");
+            assert_eq!(stored.content, "Content");
+            assert_eq!(stored.tags, vec!["t"]);
+
+            // A tag is a scanned field too.
+            lesson.content = "Content".to_string();
+            lesson.tags = vec!["@docs/a.md".to_string()];
+            assert!(update_lesson(conn, &lesson).is_err());
+            assert_eq!(get_lesson(conn, &lesson.id)?.tags, vec!["t"]);
+
+            // A bare name updates and is flagged.
+            lesson.tags = vec!["@skippy".to_string()];
+            let warnings = update_lesson(conn, &lesson)?;
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].field, "tags[0]");
+            assert_eq!(get_lesson(conn, &lesson.id)?.title, "Changed");
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn insert_with_path_mention_stores_nothing() {
+        let db = setup_db();
+        db.with_conn(|conn| {
+            let lesson = LessonRecord::new("t", "@README.md", vec![]);
+            assert!(insert_lesson(conn, &lesson).is_err());
+            assert_eq!(count_lessons(conn)?, 0);
+            assert!(get_lesson(conn, &lesson.id).is_err());
             Ok(())
         })
         .unwrap();

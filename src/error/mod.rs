@@ -38,6 +38,11 @@ pub enum Error {
     /// Generic internal error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A lesson or checkpoint write refused by the mention guard
+    /// (an at-sign introduces a path). REST maps it to 422.
+    #[error("{0}")]
+    MentionRefused(#[from] crate::guard::Refusal),
 }
 
 /// Storage-specific errors.

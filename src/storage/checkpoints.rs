@@ -4,14 +4,24 @@ use rusqlite::{params, Connection};
 
 use super::models::CheckpointRecord;
 use crate::error::StorageError;
+use crate::guard;
 use crate::Result;
 
 /// Insert a new checkpoint.
 ///
+/// The mention guard runs first over `working_on` and every string inside
+/// `state`: an at-sign that introduces a path refuses the write with
+/// [`crate::Error::MentionRefused`] and nothing is stored; a bare at-name is
+/// stored and returned as a warning.
+///
 /// # Errors
 ///
-/// Returns an error if the database operation fails.
-pub fn insert_checkpoint(conn: &Connection, checkpoint: &CheckpointRecord) -> Result<()> {
+/// Returns an error if the guard refuses or the database operation fails.
+pub fn insert_checkpoint(
+    conn: &Connection,
+    checkpoint: &CheckpointRecord,
+) -> Result<Vec<guard::Warning>> {
+    let warnings = guard::checkpoint(checkpoint)?;
     let state_json = serde_json::to_string(&checkpoint.state)
         .map_err(|e| StorageError::Database(format!("failed to serialize state: {e}")))?;
 
@@ -31,7 +41,7 @@ pub fn insert_checkpoint(conn: &Connection, checkpoint: &CheckpointRecord) -> Re
     .map_err(|e| StorageError::Database(format!("failed to insert checkpoint: {e}")))?;
 
     tracing::trace!(id = %checkpoint.id, agent = %checkpoint.agent, "Inserted checkpoint");
-    Ok(())
+    Ok(warnings)
 }
 
 /// Get a checkpoint by ID.
@@ -342,6 +352,39 @@ pub fn cleanup_old_checkpoints(conn: &Connection, agent: &str, keep: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Check 2 twin: an at-sign path nested in state.done (an array inside
+    /// an object) is refused at the storage boundary; nothing is stored.
+    #[test]
+    fn nested_state_path_mention_is_refused() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            crate::storage::migrate(conn)?;
+            let cp = CheckpointRecord::new(
+                "kahuna",
+                "clean text",
+                serde_json::json!({"done": ["step one", "read @/etc/x"]}),
+            );
+            let err = insert_checkpoint(conn, &cp).unwrap_err();
+            match err {
+                crate::Error::MentionRefused(r) => {
+                    assert_eq!(r.field, "state.done[1]");
+                    assert_eq!(r.offset, 5);
+                }
+                other => panic!("expected MentionRefused, got {other:?}"),
+            }
+            assert_eq!(count_all_checkpoints(conn)?, 0);
+            assert!(get_checkpoint(conn, &cp.id).is_err());
+
+            let flagged = CheckpointRecord::new("kahuna", "ping @skippy", serde_json::json!({}));
+            let warnings = insert_checkpoint(conn, &flagged)?;
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].field, "working_on");
+            assert_eq!(count_all_checkpoints(conn)?, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
     use crate::storage::{migrate, Database};
 
     fn setup_db() -> Database {
