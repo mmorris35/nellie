@@ -54,7 +54,8 @@ pub enum Class {
     Path,
     /// A bare name with no dot or slash: flagged.
     BareName,
-    /// A scoped package name, `scope/name` with no dot: flagged.
+    /// A scoped package name, `scope/name` with no dot (one token-final dot
+    /// allowed): flagged.
     ScopedName,
 }
 
@@ -146,8 +147,11 @@ fn segment_len(s: &str) -> usize {
 /// `scope/name`, a scoped package name: no dot and no backslash anywhere in
 /// the token, exactly one slash, the scope a whole `[a-z0-9][a-z0-9_-]*`
 /// segment, the name one such segment followed by the end of the token or a
-/// non-word char.
+/// non-word char. Exactly one token-final dot (`scope/name.` ending a
+/// sentence) is dropped first; the rest must pass unchanged (Bilby,
+/// 2026-11-18), so `scope/name..` and `scope/name.x.` stay paths.
 fn is_scoped_name(token: &str) -> bool {
+    let token = token.strip_suffix('.').unwrap_or(token);
     if token.contains(['.', '\\']) {
         return false;
     }
@@ -584,6 +588,53 @@ mod tests {
                 &LessonRecord::new("pkg", "run @scripts/run.sh", vec![])
             )
             .is_err());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Fix round 2 (Bilby ruling 1, 2026-11-18): a token whose last char is
+    /// exactly one `.` after a clean `scope/name` is that scoped name at a
+    /// sentence end: flagged, kind `scoped_at_name`.
+    #[test]
+    fn scoped_name_with_one_final_dot_is_flagged() {
+        for t in [
+            "@types/node.",
+            "pin @types/node.",
+            "@anthropic-ai/sdk.",
+            "use @modelcontextprotocol/sdk.",
+        ] {
+            assert_eq!(class_of(t), Some(Class::ScopedName), "{t:?}");
+        }
+    }
+
+    /// Mutant 6: every trailing dot stripped instead of exactly one. The `..`
+    /// twin is the one that fails; the rest stay refused under both.
+    #[test]
+    fn scoped_name_with_two_final_dots_or_an_extension_is_refused() {
+        for t in [
+            "@types/node..",
+            "@types/node.js",
+            "@types/node.x.",
+            "run @scripts/run.sh.",
+        ] {
+            assert_eq!(class_of(t), Some(Class::Path), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_name_with_one_final_dot_is_stored_with_a_scoped_warning() {
+        use crate::storage::{insert_lesson, migrate, Database};
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            migrate(conn)?;
+            let w = insert_lesson(conn, &LessonRecord::new("pkg", "pin @types/node.", vec![]))?;
+            assert_eq!(w.len(), 1);
+            assert_eq!(w[0].kind, SCOPED_AT_NAME);
+            assert!(
+                insert_lesson(conn, &LessonRecord::new("pkg", "pin @types/node..", vec![]))
+                    .is_err()
+            );
             Ok(())
         })
         .unwrap();

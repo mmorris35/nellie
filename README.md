@@ -442,8 +442,9 @@ from the storage layer, below REST and both MCP transports):
 
 | Text | Result |
 |---|---|
-| an at-sign introduces a path: `~`, `/`, `.`, a token with `/` or `\`, or a file name (`name.ext`) | refused: `422` (MCP: an error result) with `{"error":"mention_refused","field":"content","offset":12,"fix":"write 'at-sign /path' in words"}`; nothing stored, no embedding |
+| an at-sign introduces a path: `~`, `/`, `.`, a token with `\`, a slash-token that is not a scoped package name (`scripts/run.sh`, `a/b/c`, `a/../b`, `Types/node`), or a file name (`name.ext`, the extension starting with a letter) | refused: `422` (MCP: an error result) with `{"error":"mention_refused","field":"content","offset":12,"fix":"write 'at-sign /path' in words"}`; nothing stored, no embedding |
 | an at-sign introduces a bare name (`skippy`, no dot or slash) | stored; the success body gains `"warnings":[{"field":"content","offset":4,"kind":"bare_at_name"}]` |
+| an at-sign introduces a scoped package name (`scope/name`: one slash, lowercase `[a-z0-9_-]` segments, no dot except one that ends the token, as in `types/node.` at a sentence end) | stored; the success body gains a warning with `"kind":"scoped_at_name"` |
 | an at-sign preceded by a word char or dot (`liam@example.com`, `user@host:/path`) | not a mention; stored as usual |
 
 `field` names the request field (`title`, `content`, `tags[1]`, `working_on`,
