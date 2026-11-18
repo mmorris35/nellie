@@ -676,11 +676,40 @@ async fn list_lessons(
     })
 }
 
+/// Map a failed lesson or checkpoint write to a response: a mention-guard
+/// refusal is 422 with the refusal body (`error`, `field`, `offset`,
+/// `fix`); anything else is 500, as before.
+fn write_error(what: &str, e: &crate::Error) -> Response {
+    match e {
+        crate::Error::MentionRefused(r) => {
+            tracing::warn!(field = %r.field, offset = r.offset, "{what} refused by the mention guard");
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(r.body())).into_response()
+        }
+        e => {
+            tracing::error!(error = %e, "Failed to create {what}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `{"id", "status": "created"}` plus `warnings` when the guard flagged a
+/// bare at-name. The documented success fields are unchanged.
+fn created_body(id: &str, warnings: &[crate::guard::Warning]) -> serde_json::Value {
+    let mut body = serde_json::json!({ "id": id, "status": "created" });
+    if !warnings.is_empty() {
+        body["warnings"] = serde_json::json!(warnings);
+    }
+    body
+}
+
 /// POST /api/v1/lessons - Create a new lesson.
+///
+/// 422 with `{"error":"mention_refused","field","offset","fix"}` when an
+/// at-sign in the text introduces a path (see [`crate::guard`]).
 async fn create_lesson(
     State(state): State<Arc<McpState>>,
     Json(body): Json<CreateLessonRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+) -> Response {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
 
@@ -697,13 +726,13 @@ async fn create_lesson(
         updated_at: now,
     };
 
-    state
+    let warnings = match state
         .db()
         .with_conn(|conn| storage::insert_lesson(conn, &lesson))
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to create lesson");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    {
+        Ok(w) => w,
+        Err(e) => return write_error("lesson", &e),
+    };
 
     // Generate and store embedding if service available
     if let Some(ref embedding_service) = state.embeddings {
@@ -722,10 +751,7 @@ async fn create_lesson(
 
     tracing::info!(id = %id, "Lesson created via UI");
 
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "id": id, "status": "created" })),
-    ))
+    (StatusCode::CREATED, Json(created_body(&id, &warnings))).into_response()
 }
 
 /// GET /api/v1/lessons/:id - Fetch a lesson, following tombstones.
@@ -1247,20 +1273,23 @@ async fn list_checkpoints(
 }
 
 /// POST /api/v1/checkpoints - Create a new checkpoint with optional embedding.
+///
+/// 422 with the mention-guard refusal body when an at-sign in `working_on`
+/// or anywhere inside `state` introduces a path (see [`crate::guard`]).
 async fn create_checkpoint(
     State(state): State<Arc<McpState>>,
     Json(body): Json<CreateCheckpointRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+) -> Response {
     let checkpoint = storage::CheckpointRecord::new(&body.agent, &body.working_on, body.state);
     let id = checkpoint.id.clone();
 
-    state
+    let warnings = match state
         .db()
         .with_conn(|conn| storage::insert_checkpoint(conn, &checkpoint))
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to create checkpoint");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    {
+        Ok(w) => w,
+        Err(e) => return write_error("checkpoint", &e),
+    };
 
     if let Some(ref embedding_service) = state.embeddings {
         if embedding_service.is_initialized() {
@@ -1281,10 +1310,7 @@ async fn create_checkpoint(
 
     tracing::info!(id = %id, agent = %checkpoint.agent, "Checkpoint created via REST");
 
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "id": id, "status": "created" })),
-    ))
+    (StatusCode::CREATED, Json(created_body(&id, &warnings))).into_response()
 }
 
 /// GET /api/v1/checkpoints/search - Semantic search over checkpoints.
@@ -1750,6 +1776,162 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.with_conn(|conn| migrate(conn)).unwrap();
         Arc::new(McpState::new(db))
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
+    }
+
+    /// Checks 3, 4, 5 over REST: refuse set 422 with the refusal body and
+    /// nothing stored; flag set 201 with warnings; clean set 201 with the
+    /// documented body and no warnings key. (Fixtures: the at-sign before a
+    /// path is the thing under test.)
+    #[tokio::test]
+    async fn rest_create_lesson_refuses_flags_and_passes() {
+        let state = create_test_state();
+
+        for text in [
+            "@/etc/x",
+            "@~/.ssh/x",
+            "@./x",
+            "@../x",
+            "@docs/a.md",
+            "@README.md",
+            "@.bashrc",
+            "(@/etc/x)",
+            "`@/etc/x`",
+            "line\n@/etc/x",
+        ] {
+            let (status, body) = post_json(
+                create_api_router(state.clone()),
+                "/api/v1/lessons",
+                serde_json::json!({"title": "t", "content": text, "tags": ["a"]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text:?}");
+            assert_eq!(body["error"], crate::guard::ERROR_CODE, "{text:?}");
+            assert_eq!(body["field"], "content", "{text:?}");
+            assert!(body["offset"].is_u64(), "{text:?}");
+            assert_eq!(body["fix"], crate::guard::FIX, "{text:?}");
+            assert!(!body.to_string().contains("etc"), "{text:?}: {body}");
+        }
+        // A tag is scanned too, and named by index.
+        let (status, body) = post_json(
+            create_api_router(state.clone()),
+            "/api/v1/lessons",
+            serde_json::json!({"title": "t", "content": "c", "tags": ["a", "@docs/a.md"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["field"], "tags[1]");
+        assert_eq!(
+            state.db().with_conn(storage::count_lessons).unwrap(),
+            0,
+            "a refused lesson must not be stored"
+        );
+
+        for text in ["@skippy", "@mmorris35", "ping @skippy now"] {
+            let (status, body) = post_json(
+                create_api_router(state.clone()),
+                "/api/v1/lessons",
+                serde_json::json!({"title": "t", "content": text, "tags": []}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{text:?}");
+            assert_eq!(body["status"], "created");
+            assert!(body["id"].is_string());
+            assert_eq!(body["warnings"][0]["field"], "content", "{text:?}");
+            assert_eq!(body["warnings"][0]["kind"], crate::guard::BARE_AT_NAME);
+        }
+        assert_eq!(state.db().with_conn(storage::count_lessons).unwrap(), 3);
+
+        for text in [
+            "liam@example.com",
+            "user@host:/path",
+            "a@b",
+            "write at-sign /path in words",
+        ] {
+            let (status, body) = post_json(
+                create_api_router(state.clone()),
+                "/api/v1/lessons",
+                serde_json::json!({"title": "t", "content": text, "tags": []}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{text:?}");
+            assert_eq!(body["status"], "created");
+            assert!(body["id"].is_string());
+            assert!(body.get("warnings").is_none(), "{text:?}: {body}");
+        }
+        assert_eq!(state.db().with_conn(storage::count_lessons).unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn rest_create_checkpoint_refuses_nested_state_and_flags_working_on() {
+        let state = create_test_state();
+
+        let (status, body) = post_json(
+            create_api_router(state.clone()),
+            "/api/v1/checkpoints",
+            serde_json::json!({
+                "agent": "kahuna",
+                "working_on": "clean",
+                "state": {"done": ["ok", "read @/etc/x"], "steps": [{"n": 1}]}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], crate::guard::ERROR_CODE);
+        assert_eq!(body["field"], "state.done[1]");
+        assert_eq!(body["offset"], 5);
+        assert_eq!(body["fix"], crate::guard::FIX);
+        assert_eq!(
+            state
+                .db()
+                .with_conn(storage::count_all_checkpoints)
+                .unwrap(),
+            0
+        );
+
+        let (status, body) = post_json(
+            create_api_router(state.clone()),
+            "/api/v1/checkpoints",
+            serde_json::json!({"agent": "kahuna", "working_on": "ask @skippy", "state": {}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], "created");
+        assert_eq!(body["warnings"][0]["field"], "working_on");
+        assert_eq!(
+            state
+                .db()
+                .with_conn(storage::count_all_checkpoints)
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

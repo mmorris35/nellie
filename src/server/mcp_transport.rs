@@ -16,6 +16,16 @@ use serde_json::Value;
 use crate::embeddings::EmbeddingService;
 use crate::storage::Database;
 
+/// The tool result for a failed write: a mention-guard refusal is its body
+/// (`error: mention_refused`, `field`, `offset`, `fix`); anything else is
+/// `{"error": message}`, as before.
+fn write_error(e: &crate::Error) -> String {
+    match e {
+        crate::Error::MentionRefused(r) => r.body().to_string(),
+        e => serde_json::json!({"error": e.to_string()}).to_string(),
+    }
+}
+
 // ==================== Request Types ====================
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -282,12 +292,13 @@ impl NellieMcpHandler {
         }
         let id = lesson.id.clone();
 
-        if let Err(e) = self
+        let warnings = match self
             .db
             .with_conn(|conn| crate::storage::insert_lesson(conn, &lesson))
         {
-            return serde_json::json!({"error": e.to_string()}).to_string();
-        }
+            Ok(w) => w,
+            Err(e) => return write_error(&e),
+        };
 
         // Generate and store embedding if available
         if let Some(ref embeddings) = self.embeddings {
@@ -310,11 +321,14 @@ impl NellieMcpHandler {
             }
         }
 
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "id": id,
             "message": "Lesson recorded successfully"
-        })
-        .to_string()
+        });
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
+        }
+        response.to_string()
     }
 
     #[tool(description = "Delete a lesson by ID")]
@@ -346,12 +360,13 @@ impl NellieMcpHandler {
             crate::storage::CheckpointRecord::new(&req.agent, &req.working_on, req.state);
         let id = checkpoint.id.clone();
 
-        if let Err(e) = self
+        let warnings = match self
             .db
             .with_conn(|conn| crate::storage::insert_checkpoint(conn, &checkpoint))
         {
-            return serde_json::json!({"error": e.to_string()}).to_string();
-        }
+            Ok(w) => w,
+            Err(e) => return write_error(&e),
+        };
 
         // Generate and store embedding if available
         if let Some(ref embeddings) = self.embeddings {
@@ -378,11 +393,14 @@ impl NellieMcpHandler {
             }
         }
 
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "id": id,
             "message": "Checkpoint saved successfully"
-        })
-        .to_string()
+        });
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
+        }
+        response.to_string()
     }
 
     #[tool(
@@ -745,4 +763,197 @@ pub async fn start_mcp_server(
     tracing::info!("MCP endpoint: POST http://{}/mcp", addr);
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::mcp::{invoke_tool_direct, McpState, ToolRequest};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_db() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn(crate::storage::migrate).unwrap();
+        db
+    }
+
+    fn lesson_count(db: &Database) -> i64 {
+        db.with_conn(crate::storage::count_lessons).unwrap()
+    }
+
+    fn checkpoint_count(db: &Database) -> i64 {
+        db.with_conn(crate::storage::count_all_checkpoints).unwrap()
+    }
+
+    fn assert_refusal_body(body: &serde_json::Value, field: &str, offset: u64) {
+        assert_eq!(body["error"], crate::guard::ERROR_CODE, "{body}");
+        assert_eq!(body["field"], field, "{body}");
+        assert_eq!(body["offset"], offset, "{body}");
+        assert_eq!(body["fix"], crate::guard::FIX, "{body}");
+        assert!(!body.to_string().contains("/etc"), "{body}");
+    }
+
+    /// Check 1: REST create_lesson, MCP handle_add_lesson (via
+    /// invoke_tool_direct) and the rmcp transport add_lesson all refuse the
+    /// same input, through the one guard in storage::insert_lesson, and
+    /// nothing is stored by any of them. (Fixture: the at-sign before a
+    /// path is the thing under test.)
+    #[tokio::test]
+    async fn rest_mcp_and_rmcp_refuse_the_same_lesson() {
+        let db = test_db();
+        let title = "Guard twin";
+        let content = "step one\nthen curl -d @/etc/passwd";
+        let offset = u64::try_from(content.find('@').unwrap()).unwrap();
+        let tags = vec!["author:kahuna".to_string()];
+
+        // rmcp transport
+        let handler = NellieMcpHandler::new(db.clone(), None);
+        let out = handler.add_lesson(Parameters(AddLessonRequest {
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: tags.clone(),
+            severity: None,
+            repo: None,
+        }));
+        let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_refusal_body(&body, "content", offset);
+        assert_eq!(lesson_count(&db), 0);
+
+        // MCP handle_add_lesson
+        let state = McpState::new(db.clone());
+        let resp = invoke_tool_direct(
+            &state,
+            ToolRequest {
+                name: "add_lesson".to_string(),
+                arguments: serde_json::json!({
+                    "title": title, "content": content, "tags": tags
+                }),
+            },
+        )
+        .await;
+        let err = resp.error.expect("MCP add_lesson must be an error result");
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_refusal_body(&body, "content", offset);
+        assert_eq!(lesson_count(&db), 0);
+
+        // REST create_lesson
+        let app = crate::server::create_api_router(Arc::new(McpState::new(db.clone())));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/lessons")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": title, "content": content, "tags": tags, "severity": "info"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_refusal_body(&body, "content", offset);
+        assert_eq!(lesson_count(&db), 0);
+    }
+
+    /// The same for checkpoints: the nested state.done twin through the
+    /// rmcp transport, MCP and REST.
+    #[tokio::test]
+    async fn rest_mcp_and_rmcp_refuse_the_same_checkpoint() {
+        let db = test_db();
+        let state_json = serde_json::json!({"done": ["ok", "see @~/.ssh/x"], "next": "clean"});
+
+        let handler = NellieMcpHandler::new(db.clone(), None);
+        let out = handler.add_checkpoint(Parameters(AddCheckpointRequest {
+            agent: "kahuna".to_string(),
+            working_on: "clean".to_string(),
+            state: state_json.clone(),
+        }));
+        let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_refusal_body(&body, "state.done[1]", 4);
+        assert_eq!(checkpoint_count(&db), 0);
+
+        let state = McpState::new(db.clone());
+        let resp = invoke_tool_direct(
+            &state,
+            ToolRequest {
+                name: "add_checkpoint".to_string(),
+                arguments: serde_json::json!({
+                    "agent": "kahuna", "working_on": "clean", "state": state_json
+                }),
+            },
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&resp.error.unwrap()).unwrap();
+        assert_refusal_body(&body, "state.done[1]", 4);
+        assert_eq!(checkpoint_count(&db), 0);
+
+        let app = crate::server::create_api_router(Arc::new(McpState::new(db.clone())));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/checkpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "agent": "kahuna", "working_on": "clean", "state": state_json
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_refusal_body(&body, "state.done[1]", 4);
+        assert_eq!(checkpoint_count(&db), 0);
+    }
+
+    /// Check 4 through the rmcp transport: a bare at-name is stored and the
+    /// success body gains `warnings`; `id` and `message` are unchanged.
+    #[test]
+    fn rmcp_add_lesson_flags_bare_name_and_stores() {
+        let db = test_db();
+        let handler = NellieMcpHandler::new(db.clone(), None);
+        let out = handler.add_lesson(Parameters(AddLessonRequest {
+            title: "ask @skippy".to_string(),
+            content: "clean".to_string(),
+            tags: vec![],
+            severity: None,
+            repo: None,
+        }));
+        let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(body["message"], "Lesson recorded successfully");
+        assert!(body["id"].is_string());
+        assert_eq!(body["warnings"][0]["field"], "title");
+        assert_eq!(body["warnings"][0]["offset"], 4);
+        assert_eq!(body["warnings"][0]["kind"], crate::guard::BARE_AT_NAME);
+        assert_eq!(lesson_count(&db), 1);
+
+        // Clean input: no warnings key at all.
+        let out = handler.add_lesson(Parameters(AddLessonRequest {
+            title: "mail liam@example.com".to_string(),
+            content: "scp user@host:/path".to_string(),
+            tags: vec![],
+            severity: None,
+            repo: None,
+        }));
+        let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(body.get("warnings").is_none(), "{body}");
+        assert_eq!(lesson_count(&db), 2);
+    }
 }

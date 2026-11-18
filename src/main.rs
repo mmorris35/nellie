@@ -405,6 +405,14 @@ enum Commands {
         #[command(subcommand)]
         action: TombstonesCommand,
     },
+
+    /// Count stored lessons and checkpoints the mention guard would refuse
+    /// or flag (read-only, counts only; rewrites nothing)
+    ///
+    /// Opens the database read-only, runs no migration, and prints one
+    /// JSON object: lessons_total, lessons_refuse, lessons_flag,
+    /// checkpoints_total, checkpoints_refuse, checkpoints_flag.
+    ScanMentions,
 }
 
 #[derive(Subcommand, Debug)]
@@ -549,6 +557,7 @@ async fn main() -> Result<()> {
         Some(Commands::Tombstones {
             action: TombstonesCommand::Import { file },
         }) => tombstones_import_command(&cli.data_dir, &file),
+        Some(Commands::ScanMentions) => scan_mentions_command(&cli.data_dir),
         Some(Commands::Reembed {
             drop_old,
             no_switch,
@@ -2135,6 +2144,35 @@ async fn bootstrap_command(data_dir: &Path, force: bool) -> Result<()> {
 }
 
 /// Import a lesson tombstone map into the database.
+/// Read-only, counts-only scan of stored lessons and checkpoints for
+/// at-sign mentions (see `nellie::guard`). Opens the database with
+/// `SQLITE_OPEN_READ_ONLY`, runs no migration and takes no lock.
+fn scan_mentions_command(data_dir: &Path) -> Result<()> {
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    let db_path = config.database_path();
+    if !db_path.exists() {
+        return Err(nellie::Error::config(format!(
+            "no database at {}",
+            db_path.display()
+        )));
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| nellie::Error::internal(format!("failed to open database read-only: {e}")))?;
+    let counts = nellie::guard::scan_counts(&conn)
+        .map_err(|e| nellie::Error::internal(format!("scan failed: {e}")))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&counts).unwrap_or_default()
+    );
+    Ok(())
+}
+
 fn tombstones_import_command(data_dir: &Path, file: &Path) -> Result<()> {
     let tsv = std::fs::read_to_string(file)
         .map_err(|e| nellie::Error::config(format!("failed to read {}: {e}", file.display())))?;
@@ -2761,6 +2799,8 @@ mod tests {
             }) => assert_eq!(file, PathBuf::from("map.tsv")),
             other => panic!("Expected tombstones import, got {other:?}"),
         }
+        let cli = Cli::try_parse_from(["nellie", "scan-mentions"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::ScanMentions)));
         assert!(Cli::try_parse_from(["nellie", "tombstones", "import"]).is_err());
     }
 
