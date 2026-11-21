@@ -322,4 +322,51 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not initialized"));
     }
+
+    /// 2026-11-16: a query must not wait behind a big indexing batch (minidev Nellie stalled for hours).
+    #[tokio::test]
+    async fn test_query_not_starved_by_big_batch() {
+        let Some(service) = real_service().await else {
+            return;
+        };
+        let service = std::sync::Arc::new(service);
+        let big: Vec<String> = (0..400).map(|i| format!("{} {i}", words(200))).collect();
+        let s2 = std::sync::Arc::clone(&service);
+        let batch = tokio::spawn(async move {
+            let t = std::time::Instant::now();
+            s2.embed_batch(big).await.unwrap();
+            t.elapsed()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let t = std::time::Instant::now();
+        service.embed_one("hello world").await.unwrap();
+        let query = t.elapsed();
+        let batch = batch.await.unwrap();
+        assert!(
+            query < batch / 4,
+            "query took {query:?} while the batch took {batch:?}: the query waited behind it"
+        );
+    }
+
+    /// Cutting a request into runs must not change any vector (padding is per run now).
+    #[tokio::test]
+    async fn test_runs_match_single_embeddings() {
+        let Some(service) = real_service().await else {
+            return;
+        };
+        let texts: Vec<String> = (0..40)
+            .map(|i| format!("text number {i} {}", words(i * 5)))
+            .collect();
+        let batch = service.embed_batch(texts.clone()).await.unwrap();
+        assert_eq!(batch.len(), 40);
+        for i in [0usize, 15, 16, 17, 39] {
+            let one = service.embed_one(texts[i].clone()).await.unwrap();
+            let diff: f32 = one
+                .iter()
+                .zip(&batch[i])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(diff < 1e-4, "text {i}: max diff {diff}");
+        }
+    }
 }

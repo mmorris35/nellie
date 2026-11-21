@@ -14,6 +14,16 @@ use super::model::{EMBEDDING_DIM, MAX_SEQ_LENGTH};
 use crate::error::EmbeddingError;
 use crate::Result;
 
+/// Most texts one ONNX run embeds. A bigger request is cut into runs of this size, and the session lock is
+/// handed on (fairly) between runs, so one big indexing batch can't hold the model for minutes while every
+/// search and lesson write waits (2026-11-16: minidev Nellie stalled for hours this way, RSS 9-18 GB from one
+/// giant padded batch).
+pub const MAX_INFER_BATCH: usize = 16;
+
+/// Requests with at most this many texts (a search query, one lesson) go on the priority path: their own
+/// worker and channel, so they never queue behind indexing batches.
+pub const PRIORITY_MAX_TEXTS: usize = 4;
+
 /// Request to generate embeddings.
 struct EmbeddingRequest {
     /// Texts to embed.
@@ -25,6 +35,7 @@ struct EmbeddingRequest {
 /// Worker pool for embedding generation.
 pub struct EmbeddingWorker {
     request_tx: Sender<EmbeddingRequest>,
+    priority_tx: Sender<EmbeddingRequest>,
     _workers: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -81,10 +92,30 @@ impl EmbeddingWorker {
             workers.push(handle);
         }
 
-        tracing::info!(num_workers, "Embedding worker pool started");
+        // One dedicated worker for small requests (queries, single lessons).
+        let (priority_tx, priority_rx): (Sender<EmbeddingRequest>, Receiver<EmbeddingRequest>) =
+            bounded(100);
+        {
+            let session = Arc::clone(&session);
+            let tokenizer = Arc::clone(&tokenizer);
+            let rx = Arc::new(Mutex::new(priority_rx));
+            let handle = std::thread::Builder::new()
+                .name("embedding-worker-priority".to_string())
+                .spawn(move || {
+                    worker_loop(session, tokenizer, rx);
+                })
+                .map_err(|e| EmbeddingError::WorkerPool(format!("failed to spawn worker: {e}")))?;
+            workers.push(handle);
+        }
+
+        tracing::info!(
+            num_workers,
+            "Embedding worker pool started (plus one priority worker)"
+        );
 
         Ok(Self {
             request_tx,
+            priority_tx,
             _workers: workers,
         })
     }
@@ -99,8 +130,12 @@ impl EmbeddingWorker {
 
         let request = EmbeddingRequest { texts, response_tx };
 
-        self.request_tx
-            .send(request)
+        let tx = if request.texts.len() <= PRIORITY_MAX_TEXTS {
+            &self.priority_tx
+        } else {
+            &self.request_tx
+        };
+        tx.send(request)
             .map_err(|_| EmbeddingError::WorkerPool("worker pool closed".to_string()))?;
 
         response_rx
@@ -147,8 +182,23 @@ fn worker_loop(
     }
 }
 
-/// Process a batch of texts and generate embeddings via ONNX inference.
+/// Process a request in runs of at most [`MAX_INFER_BATCH`] texts, each run taking the session lock on its own.
 fn process_request(
+    session: &Arc<Mutex<Session>>,
+    tokenizer: &Tokenizer,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::with_capacity(texts.len());
+    for run in texts.chunks(MAX_INFER_BATCH) {
+        out.extend(process_run(session, tokenizer, run)?);
+    }
+    Ok(out)
+}
+
+/// Embed one run of texts via ONNX inference.
+// The guard is released early with MutexGuard::unlock_fair, which clippy does not count as a drop.
+#[allow(clippy::significant_drop_tightening)]
+fn process_run(
     session: &Arc<Mutex<Session>>,
     tokenizer: &Tokenizer,
     texts: &[String],
@@ -235,7 +285,9 @@ fn process_request(
 
     // Drop outputs and session lock before post-processing
     drop(outputs);
-    drop(session_guard);
+    // Fair unlock: a waiting worker (the priority one included) gets the session next, instead of this worker
+    // re-taking it for its next run.
+    parking_lot::MutexGuard::unlock_fair(session_guard);
 
     // Mean pool each item in the batch
     let mut embeddings = Vec::with_capacity(batch_size);
